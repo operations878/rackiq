@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+backend/.venv/
+*.egg-info/
+.pytest_cache/
+
+# DuckDB data store (regenerable)
+backend/data/*.duckdb
+backend/data/*.duckdb.wal
+
+# Node / Vite
+frontend/node_modules/
+frontend/dist/
+node_modules/
+
+# Env
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

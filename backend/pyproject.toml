@@ -1,0 +1,29 @@
+[project]
+name = "rackiq-backend"
+version = "0.1.0"
+description = "RackIQ — customer demand & margin intelligence for wholesale fuel terminals"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "duckdb>=1.1",
+    "pandas>=2.2",
+    "numpy>=1.26,<2.5",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[project.scripts]
+rackiq-generate = "app.cli:generate_main"
+rackiq-serve = "app.cli:serve_main"
+rackiq-info = "app.cli:info_main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

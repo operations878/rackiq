@@ -1,0 +1,166 @@
+"""Canonical schema — the single source of truth for RackIQ.
+
+Everything (DDL, the synthetic generator, capability detection, and the API) derives
+from the declarations in this module. A *canonical field* is a unit of customer/terminal
+data RackIQ knows how to ingest. There are three REQUIRED core fields and a set of
+OPTIONAL fields; the presence (or absence) of the optional fields is what makes
+capabilities "flex with the data provided."
+
+Each canonical field is assigned a single *primary table* — the table whose presence of
+that field gates the related capability. Some field names also appear physically in other
+tables as dimensional/foreign keys (e.g. ``terminal``/``product`` on inventory & market,
+``customer_id`` on invoices); those copies are declared as STRUCTURAL columns and are not
+re-counted as canonical fields.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+
+class DType(str, Enum):
+    VARCHAR = "VARCHAR"
+    DOUBLE = "DOUBLE"
+    INTEGER = "INTEGER"
+    TIMESTAMP = "TIMESTAMP"
+    DATE = "DATE"
+
+
+@dataclass(frozen=True)
+class Field:
+    """A canonical data field RackIQ can ingest."""
+
+    name: str
+    table: str
+    dtype: DType
+    required: bool
+    description: str
+
+
+# ---- Table names ----------------------------------------------------------------
+CUSTOMERS = "customers"
+LIFTS = "lifts"
+INVENTORY = "inventory_snapshots"
+INVOICES = "invoices"
+MARKET = "market_prices"
+
+# Canonical data tables whose contents drive capability detection.
+CANONICAL_TABLES = [LIFTS, INVENTORY, INVOICES, MARKET]
+# All physical tables (customers is a supporting dimension).
+ALL_TABLES = [CUSTOMERS, LIFTS, INVENTORY, INVOICES, MARKET]
+
+
+# ---- Canonical field registry (3 required + 23 optional) ------------------------
+CANONICAL_FIELDS: list[Field] = [
+    # --- lifts: required core ---
+    Field("customer_id", LIFTS, DType.VARCHAR, True, "Customer identifier (core)."),
+    Field("lift_datetime", LIFTS, DType.TIMESTAMP, True, "Timestamp of the lift / load event (core)."),
+    Field("net_gallons", LIFTS, DType.DOUBLE, True, "Temperature-corrected (net) gallons lifted (core)."),
+    # --- lifts: optional ---
+    Field("terminal", LIFTS, DType.VARCHAR, False, "Terminal where the lift occurred."),
+    Field("product", LIFTS, DType.VARCHAR, False, "Product lifted (RBOB / ULSD / ULSHO)."),
+    Field("gross_gallons", LIFTS, DType.DOUBLE, False, "Gross (observed) gallons before temperature correction."),
+    Field("observed_temp", LIFTS, DType.DOUBLE, False, "Observed product temperature (deg F)."),
+    Field("api_gravity", LIFTS, DType.DOUBLE, False, "API gravity of the product."),
+    Field("unit_price", LIFTS, DType.DOUBLE, False, "Price charged to the customer ($/gal)."),
+    Field("unit_cost", LIFTS, DType.DOUBLE, False, "Terminal cost of goods ($/gal)."),
+    # --- inventory_snapshots: optional ---
+    Field("tank_id", INVENTORY, DType.VARCHAR, False, "Tank identifier."),
+    Field("tank_capacity", INVENTORY, DType.DOUBLE, False, "Tank shell capacity (gallons)."),
+    Field("min_heel", INVENTORY, DType.DOUBLE, False, "Minimum operational heel (gallons)."),
+    Field("inventory_snapshot", INVENTORY, DType.DOUBLE, False, "Book inventory at the snapshot (gallons)."),
+    Field("physical_inventory", INVENTORY, DType.DOUBLE, False, "Physically gauged inventory (gallons)."),
+    Field("receipts", INVENTORY, DType.DOUBLE, False, "Receipts (barge / pipeline) since prior snapshot (gallons)."),
+    # --- invoices (AR): optional ---
+    Field("invoice_date", INVOICES, DType.DATE, False, "Invoice issue date."),
+    Field("due_date", INVOICES, DType.DATE, False, "Payment due date (per terms)."),
+    Field("paid_date", INVOICES, DType.DATE, False, "Date paid (NULL = still open)."),
+    Field("invoice_amount", INVOICES, DType.DOUBLE, False, "Invoice amount ($)."),
+    Field("credit_limit", INVOICES, DType.DOUBLE, False, "Customer credit limit ($)."),
+    # --- market_prices: optional ---
+    Field("market_price", MARKET, DType.DOUBLE, False, "Benchmark market price ($/gal)."),
+    Field("nyh_basis", MARKET, DType.DOUBLE, False, "NY Harbor basis differential ($/gal)."),
+    Field("street_rack", MARKET, DType.DOUBLE, False, "Posted street rack price ($/gal)."),
+    Field("committed_buys", MARKET, DType.DOUBLE, False, "Committed buy volume / long position (gallons)."),
+    Field("committed_sells", MARKET, DType.DOUBLE, False, "Committed sell volume / short position (gallons)."),
+]
+
+FIELDS_BY_NAME: dict[str, Field] = {f.name: f for f in CANONICAL_FIELDS}
+
+
+# ---- Structural / dimensional columns (NOT canonical I/O fields) -----------------
+# (name, dtype) pairs that are physical keys or dimension attributes. They precede the
+# canonical columns in each table's physical layout.
+STRUCTURAL_COLUMNS: dict[str, list[tuple[str, DType]]] = {
+    CUSTOMERS: [
+        ("customer_id", DType.VARCHAR),
+        ("name", DType.VARCHAR),
+        ("archetype", DType.VARCHAR),
+        ("home_terminal", DType.VARCHAR),
+    ],
+    LIFTS: [],
+    INVENTORY: [
+        ("snapshot_datetime", DType.TIMESTAMP),
+        ("terminal", DType.VARCHAR),
+        ("product", DType.VARCHAR),
+    ],
+    INVOICES: [
+        ("customer_id", DType.VARCHAR),
+    ],
+    MARKET: [
+        ("price_date", DType.DATE),
+        ("product", DType.VARCHAR),
+        ("terminal", DType.VARCHAR),
+    ],
+}
+
+
+# ---- Derived physical layout ----------------------------------------------------
+def physical_columns(table: str) -> list[tuple[str, DType, bool]]:
+    """Ordered (name, dtype, required) for a table's physical layout.
+
+    Structural columns first (in declared order), then canonical fields whose primary
+    table is ``table`` (in registry order). This ordering is authoritative for DDL.
+    """
+    cols: list[tuple[str, DType, bool]] = []
+    for name, dt in STRUCTURAL_COLUMNS.get(table, []):
+        cols.append((name, dt, False))
+    for f in CANONICAL_FIELDS:
+        if f.table == table:
+            cols.append((f.name, f.dtype, f.required))
+    return cols
+
+
+def column_names(table: str) -> list[str]:
+    return [name for name, _, _ in physical_columns(table)]
+
+
+def column_types(table: str) -> dict[str, DType]:
+    return {name: dt for name, dt, _ in physical_columns(table)}
+
+
+def ddl_for_table(table: str) -> str:
+    lines = []
+    for name, dt, required in physical_columns(table):
+        suffix = " NOT NULL" if required else ""
+        lines.append(f"    {name} {dt.value}{suffix}")
+    body = ",\n".join(lines)
+    return f"CREATE TABLE IF NOT EXISTS {table} (\n{body}\n)"
+
+
+def all_ddl() -> list[str]:
+    return [ddl_for_table(t) for t in ALL_TABLES]
+
+
+# ---- Convenience accessors ------------------------------------------------------
+def required_field_names() -> list[str]:
+    return [f.name for f in CANONICAL_FIELDS if f.required]
+
+
+def optional_field_names() -> list[str]:
+    return [f.name for f in CANONICAL_FIELDS if not f.required]
+
+
+def optional_fields_for_table(table: str) -> list[str]:
+    return [f.name for f in CANONICAL_FIELDS if f.table == table and not f.required]
