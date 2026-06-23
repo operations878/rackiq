@@ -73,7 +73,7 @@ export default function UploadStep({
         >
           <option value="core">core (4 features)</option>
           <option value="lite">lite (6 features)</option>
-          <option value="full">full (17 features)</option>
+          <option value="full">full (21 features)</option>
         </select>
         <button
           onClick={() => onLoadDemo(demoProfile)}
