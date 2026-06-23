@@ -11,12 +11,15 @@ dependencies = [
     "numpy>=1.26,<2.5",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    "python-multipart>=0.0.9",
+    "openpyxl>=3.1",
 ]
 
 [project.scripts]
 rackiq-generate = "app.cli:generate_main"
 rackiq-serve = "app.cli:serve_main"
 rackiq-info = "app.cli:info_main"
+rackiq-export-samples = "app.cli:export_samples_main"
 
 [tool.uv]
 package = true

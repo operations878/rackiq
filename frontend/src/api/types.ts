@@ -8,6 +8,11 @@ export interface Summary {
   total_net_gallons: number;
   profile: string;
   generated_at: string | null;
+  last_import?: {
+    filename: string | null;
+    table: string | null;
+    at: string | null;
+  };
 }
 
 export interface FieldPresence {
@@ -79,4 +84,107 @@ export interface MarketPrices {
   available: boolean;
   products: string[];
   points: MarketPoint[];
+}
+
+// ---- Data Studio ----------------------------------------------------------------
+export interface SourceColumn {
+  name: string;
+  samples: string[];
+  null_rate: number;
+  dtype_guess: string;
+}
+
+export interface ImportTarget {
+  name: string;
+  dtype: string;
+  canonical: boolean;
+  required: boolean;
+  description: string;
+}
+
+export interface Suggestion {
+  target: string;
+  confidence: number;
+}
+
+export interface MatchedProfile {
+  name: string;
+  target_table: string;
+  mapping: Record<string, string>;
+}
+
+export interface InspectResponse {
+  upload_id: string;
+  filename: string;
+  n_rows: number;
+  n_columns: number;
+  columns: SourceColumn[];
+  suggested_table: string;
+  suggestions_by_table: Record<string, Record<string, Suggestion>>;
+  targets_by_table: Record<string, ImportTarget[]>;
+  table_labels: Record<string, string>;
+  required_keys: Record<string, string[]>;
+  matched_profile: MatchedProfile | null;
+}
+
+export interface ValidateFieldReport {
+  source: string;
+  target: string;
+  null_rate: number;
+  parse_errors: number;
+}
+
+export interface ValidateResponse {
+  table: string;
+  table_label: string;
+  n_rows: number;
+  importable_rows: number;
+  date_range: { start: string | null; end: string | null; column: string | null };
+  duplicate_rows: number;
+  droppable_rows: number;
+  total_parse_errors: number;
+  fields: ValidateFieldReport[];
+  missing_required: string[];
+  warnings: string[];
+  errors: string[];
+  can_commit: boolean;
+}
+
+export interface HygieneStep {
+  step: string;
+  detail: string;
+  rows_affected: number;
+}
+
+export interface CommitResponse {
+  ok: boolean;
+  table: string;
+  mode: string;
+  rows_written: number;
+  rows_in_file: number;
+  hygiene: HygieneStep[];
+  saved_profile: string | null;
+  summary: Summary;
+  capabilities: Capabilities;
+}
+
+export interface SavedProfile {
+  name: string;
+  target_table: string;
+  mapping: Record<string, string>;
+  source_columns: string[];
+  created_at: string;
+}
+
+export interface StudioState {
+  summary: Summary;
+  capabilities: Capabilities;
+}
+
+export interface ImportLogEntry {
+  imported_at: string;
+  target_table: string;
+  filename: string;
+  rows: number;
+  mode: string;
 }
