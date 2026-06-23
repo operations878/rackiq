@@ -398,8 +398,9 @@ computed over the shared connection with a data-signature cache (`api/reconcilia
 
 All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
 live in `api/routes.py`; `/api/studio/*` write/upload endpoints in `api/studio.py`; the
-`/api/scores/*` scoring endpoints in `api/scores.py` and `/api/reconciliation/*` in
-`api/reconciliation.py` (both live-compute with a data-signature cache).
+`/api/scores/*` scoring endpoints in `api/scores.py`, `/api/reconciliation/*` in
+`api/reconciliation.py` (both live-compute with a data-signature cache), and the
+**daily-operating / regime / scorecard / playbook** endpoints in `api/daily.py`.
 
 | Endpoint | Purpose |
 |---|---|
@@ -419,27 +420,82 @@ live in `api/routes.py`; `/api/studio/*` write/upload endpoints in `api/studio.p
 | `GET /api/reconciliation?period=month` | the full loss-control payload: network totals + mechanism split, ranked worst-offender tanks (control chart series), net-recon by meter/terminal, receipt basis, loss-tracking series, meter-drift ranking (`available:false` + missing feeds when locked) |
 | `GET /api/reconciliation/config` | the reconciliation config (control limits, thresholds) + period grains |
 | `POST /api/reconciliation/recompute` | recompute with optional `{overrides, period}` (busts the cache) |
+| `GET /api/regime/config` | the regime axes + states + the full **V1 regime-multiplier matrix** + posture (the frontend mirrors this) |
+| `GET /api/daily?terminal=&inventory=&market=&capacity=&credit=&window=` | the **nine ranked panels** for one terminal under a regime (Blueprint C) |
+| `POST /api/daily/persist` | recompute every terminal under a regime and write the `daily_recommendations` table (§14) |
+| `GET /api/daily/recommendations?run_date=&terminal=` | read back the persisted §14 worklist |
+| `GET /api/scorecards?terminal=&<regime axes>&window=` | per-customer **scorecards** with the regime-adjusted score + the **flip-side** line (Blueprint E) |
+| `GET /api/playbook?terminal=&window=` | the **Sales Playbook**: per-archetype plays + regime cheat-sheets + morning routine (Blueprint G) |
 
 Interactive docs at `http://localhost:8000/docs`.
 
 ---
 
+## Daily operating layer — regime re-ranking · nine panels · scorecards · playbook
+
+On top of the standing scores sits the **operating layer** people live in day-to-day:
+
+- **`backend/app/regime_config.py`** — the **V1 regime-multiplier matrix**. A *regime* is the
+  day's operating context on four axes: **inventory** (long/balanced/tight/tank-constrained),
+  **market** (rising/falling/flat/volatile), **capacity** (ample/normal/constrained), **credit**
+  (easy/normal/tight). `REGIME_MULTIPLIER[archetype][axis][state]` (neutral 1.0) feeds
+  `regime_score = clamp(base_value · Π_axis multiplier, 0, 100)`. Every multiplier is a config
+  number (mirrors `scoring_config`). The frontend re-implements the same math in `lib/regime.ts`'s
+  spirit via the matrix it fetches, but live re-ranking calls the backend.
+- **`backend/app/regime.py`** — builds the **nine ranked, actionable panels** per terminal
+  (Today's Actions · Customer Rankings · Inventory Actions · Pricing Opportunities · Credit Alerts
+  · Churn Alerts · Contract Candidates · Discount Opportunities · Strategic Accounts). Every row
+  carries an **action**, a one-line **why-now**, and an **expected impact**. `persist_daily` writes
+  the `daily_recommendations` table (§14: `run_date · terminal · regime · panel · rank · customer ·
+  action · why_now · expected_impact · base_value · regime_score`). `scorecards` returns one-page
+  per-customer cards including the **flip side** (how score + action change under the *opposite*
+  inventory/market regime, via `regime_config.opposite_regime`).
+- **`backend/app/playbook.py`** — one source of truth for the **Sales Playbook** (Blueprint G):
+  per-archetype plays (what to say / when to call / what to quote / what terms / what NOT to do),
+  regime cheat-sheets, and the morning routine. Powers both `GET /api/playbook` and the generated
+  `docs/playbook.md` (`uv run rackiq-export-playbook`).
+- **`backend/app/api/daily.py`** — the endpoints above. `daily_recommendations` is a derived cache
+  (created by `regime.ensure_tables`, like `customer_scores`), not a canonical table.
+
+---
+
 ## Frontend
 
-Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A top nav switches
-between five pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`):
+Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A **left-nav dashboard
+shell** (`App.tsx`) switches between modules via a tiny dependency-free hash router
+(`lib/useHashRoute.ts`), grouped into **Operate** / **Analyze** / **Data**. The app **HOME** is
+the Daily Operating Dashboard.
 
-- **Dashboard** (`pages/Dashboard.tsx`) — the "Connected — N customers loaded" banner, the live
+**Operate**
+- **Daily Operating Dashboard** (`pages/DailyOps.tsx`, route `""`/home) — Blueprint C. One view per
+  terminal, the **nine ranked panels** (lists, not charts), and the **regime selector**
+  (`components/RegimeSelector.tsx`) that re-ranks everything live by calling `/api/daily`. A
+  "Persist worklist (§14)" button writes `daily_recommendations`. Rows deep-link to the scorecard.
+- **Scorecards** (`pages/Scorecards.tsx`, routes `scorecards` / `scorecard/{id}`) — Blueprint E.
+  One-page per-customer cards: sub-scores, Base Value, today's Regime-Adjusted Score (+ per-axis
+  multiplier breakdown), archetype(s), why-now, recommended action, posture, expected impact, and
+  the **flip-side** panel. An exemplar gallery covers every archetype present.
+- **Sales Playbook** (`pages/Playbook.tsx`) — Blueprint G. The morning routine, regime cheat-sheets,
+  and per-archetype plays (toggle to only archetypes in the current book).
+
+**Analyze**
+- **Book Overview** (`pages/BookOverview.tsx`) — the sortable/filterable customer table (VAR, Base
+  Value, archetypes, volume, trend arrow, margin & Account Value greyed when unavailable, recency
+  gap, churn flag, credit/quadrant — credit greyed until **P9**). Filter by terminal/product/grade/
+  archetype. Row → drill-down with the **base-range chart**, in-band rate, base volume & cadence,
+  recency, and an auto-generated **scouting note**.
+- **Early-Warning Radar** (`pages/Radar.tsx`) — a ranked worklist: **Overdue** (recency > 1.5×
+  cadence), **Fading** (volume trend ≤ −12%), **Erratic** (VAR dropped ≥ 8 vs all-time, 90-day vs
+  all-time). Shows why each is flagged, sorts by **volume-at-risk**, and **exports CSV**.
+- **Scores & Quadrant** (`pages/Scores.tsx`) — the original ranked table + quadrant + drill-down.
+- **Capabilities** (`pages/Dashboard.tsx`) — the live
   **capability-matrix grid** (enabled = green with coverage bar; disabled = grey with the missing
   fields; *feed* features show an indigo "collecting — N logged" pill), a monthly-volume bar chart,
   a market-price line chart, and a top-customers table (margin/DSO columns appear only when
-  enabled). With no data it shows an empty state that points to Data Studio.
-- **Scores** (`pages/Scores.tsx`) — the ranked customer table (VAR + grade, base value + grade,
-  primary/secondary archetype, volume, trend), a window selector (30/90/365/all) + recompute,
-  a capability-gated **metric availability** strip, the **Explainability × Profitability quadrant**
-  scatter (`components/scores/QuadrantScatter.tsx`), and a per-customer drill-down rendering the
-  **base-range chart** (`components/scores/BaseRangeChart.tsx`) with the VAR explanation, sub-score
-  bars (greyed when unavailable), base-value breakdown, and archetype posture.
+  enabled). With no data it shows an empty state that points to Data Studio. (The **Scores &
+  Quadrant** page above renders the window selector + recompute, the metric-availability strip, the
+  Explainability × Profitability scatter (`components/scores/QuadrantScatter.tsx`), and the
+  base-range drill-down — `components/scores/BaseRangeChart.tsx`.)
 - **Reconciliation** (`pages/Reconciliation.tsx`) — the P8 loss-control screen: network KPIs (net &
   gross loss, $ loss & recoverable/yr, tanks out of control), the **loss-mechanism split** bar
   (`components/reconciliation/MechanismBar.tsx`), a ranked **worst-offenders** table, a **meter-drift**
@@ -447,13 +503,16 @@ between five pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`
   (`components/reconciliation/ControlChart.tsx`), the **loss-tracking** trend
   (`components/reconciliation/LossTrendChart.tsx`), the **net-recon cross-check** table, and the
   **receipt measurement basis** (VEF / shrink). A clear lock + "Feed me &lt;field&gt;" when gated.
+
+**Data**
 - **Data Studio** (`pages/DataStudio.tsx`) — the upload → map → **clean** → validate → commit
   wizard with its live "Feed me &lt;field&gt;" capability panel (see **Data Studio** above).
 - **Data Health** (`pages/DataHealth.tsx`) — the standing quality score + drift alerts + quarantine
   review + crosswalk browser + audit log. The nav shows a quarantine-count badge when rows are held.
 
-`App.tsx` owns `summary` + `capabilities`; Data Studio returns fresh copies on every write so the
-header badge and panels update without a reload.
+Shared score UI (pills, grade tones, bars, archetype tags, trend arrows) lives in
+`lib/scoreui.tsx`. `App.tsx` owns `summary` + `capabilities`; Data Studio returns fresh copies on
+every write so the sidebar badge and panels update without a reload.
 
 Tailwind v4 is wired via `@tailwindcss/vite`; `src/index.css` is just `@import "tailwindcss";`
 — there is intentionally **no** `tailwind.config.js` or `postcss.config.js`.
@@ -473,6 +532,7 @@ uv run rackiq-serve                       # FastAPI on http://localhost:8000
 # Optional: pre-seed the book from the CLI before serving:
 uv run rackiq-generate --seed 42 --profile full
 uv run rackiq-export-samples              # write sample CSV/XLSX (+ dirty demo files) into ../samples/
+uv run rackiq-export-playbook             # (re)generate ../docs/playbook.md from the archetype plays
 uv run pytest                             # run the test suite (units + e2e API flow)
 # rackiq-info  -> print row counts + enabled capability count
 ```
@@ -505,6 +565,9 @@ backend/
     reconciliation.py       # ★ P8 loss-control engine: book vs physical, BOL-grouped disbursements,
                             #   net-recon cross-check, mechanism split, meter-drift control charts, $loss
     reconciliation_config.py# ★ ReconConfig — control limits / thresholds / period grain as parameters
+    regime.py               # ★ daily operating engine: regime re-rank + the nine ranked panels + scorecards
+    regime_config.py        # ★ the V1 regime-multiplier matrix (axes/states/multipliers — every value a param)
+    playbook.py             # ★ Sales Playbook source (archetype plays + regime cheat-sheets + routine) + md render
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping, inspect (+profiling), validate, coerce
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -512,25 +575,27 @@ backend/
     validation.py           # validation rule engine with row-level drill-down + quarantine index
     hygiene.py              # configurable cleaning pipeline (HygieneOptions, apply_fixes, ASTM D1250 vcf)
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
-    cli.py                  # rackiq-generate / rackiq-serve / rackiq-info / rackiq-export-samples (+dirty)
+    cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook
     config.py               # settings (db path, CORS, host/port)
-    main.py                 # FastAPI app factory (routes + studio routers)
+    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily routers)
     api/{routes,queries}.py # read endpoints + SQL
     api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
     api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / config / recompute
     api/reconciliation.py   # /api/reconciliation/* loss-control payload / config / recompute (cached)
-  tests/                    # pytest: test_hygiene_studio.py + test_studio_api.py + test_early_feeds.py + test_scoring.py + test_reconciliation.py
+    api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_early_feeds + test_scoring + test_regime + test_reconciliation
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
+docs/playbook.md            # generated Sales Playbook (rackiq-export-playbook)
 frontend/
   vite.config.ts            # react + tailwindcss plugins; /api dev proxy
   src/
-    App.tsx, main.tsx, index.css
-    lib/{useHashRoute,format}.ts
+    App.tsx, main.tsx, index.css       # App.tsx = the left-nav dashboard shell (Operate/Analyze/Data)
+    lib/{useHashRoute,format}.ts, lib/scoreui.tsx
     api/{client,types}.ts
-    pages/{Dashboard,Scores,Reconciliation,DataStudio,DataHealth}.tsx
-    components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel}.tsx
+    pages/{DailyOps,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx
+    components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
     components/scores/{BaseRangeChart,QuadrantScatter}.tsx
     components/reconciliation/{MechanismBar,ControlChart,LossTrendChart}.tsx
     components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds}.tsx
@@ -544,6 +609,12 @@ CLAUDE.md
   sub-scores (margin, elasticity, EVR, market, quotes, credit) report `available:false` on a thin
   book and the UI greys them out. `customer_scores`/`customer_lane` are *derived caches* recomputed
   from canonical data (live-computed on read with a data-signature cache; persisted by `recompute`).
+- **Regime re-ranking is config-driven**: `regime_config.REGIME_MULTIPLIER[archetype][axis][state]`
+  (neutral 1.0) → `regime_score = clamp(base_value · Π multipliers, 0, 100)`. The matrix is exposed at
+  `/api/regime/config` so the selector re-ranks live (the backend recomputes via the scoring cache).
+  The scorecard **flip side** uses `opposite_regime` (inverts inventory + market). `daily_recommendations`
+  is a derived cache created by `regime.ensure_tables` (NOT in `init_db`), so it survives like
+  `customer_scores`; `persist_daily` rewrites the current `run_date`.
 - **`window` is a reserved word in DuckDB** (window functions) — the scoring tables use
   `score_window` for the column (the JSON/API still exposes `window`), like the `at`→`ts` rule.
 - The **VARIABILITY** "VAR" score (steadiness, 0–100) is deliberately distinct from any financial

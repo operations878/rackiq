@@ -21,6 +21,7 @@ rackiq-generate = "app.cli:generate_main"
 rackiq-serve = "app.cli:serve_main"
 rackiq-info = "app.cli:info_main"
 rackiq-export-samples = "app.cli:export_samples_main"
+rackiq-export-playbook = "app.cli:export_playbook_main"
 
 [dependency-groups]
 dev = [

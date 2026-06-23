@@ -712,3 +712,142 @@ export interface Reconciliation {
   meter_drift: { ranked: ReconDrift[]; n_out_of_control: number };
   note?: string;
 }
+
+// ---- Regime / Daily operating dashboard (Blueprint C) ---------------------------
+export interface RegimeState {
+  label: string;
+  hint: string;
+}
+export interface RegimeAxis {
+  label: string;
+  states: Record<string, RegimeState>;
+  default: string;
+}
+export type Regime = Record<string, string>;
+
+export interface RegimeConfig {
+  axes: Record<string, RegimeAxis>;
+  default: Regime;
+  multiplier: Record<string, Record<string, Record<string, number>>>;
+  archetypes: string[];
+  posture: Record<string, Record<string, string>>;
+}
+
+export interface DailyRow {
+  customer_id: string;
+  name: string;
+  archetype: string;
+  secondary_archetype: string;
+  home_terminal: string | null;
+  action: string;
+  why_now: string;
+  expected_impact: string;
+  impact_value: number;
+  base_value: number;
+  regime_score: number | null;
+  regime_delta: number | null;
+  source?: string;
+}
+
+export interface DailyPanel {
+  key: string;
+  label: string;
+  description: string;
+  rows: DailyRow[];
+  total: number;
+}
+
+export interface DailyResponse {
+  as_of: string | null;
+  window: string;
+  regime: Regime;
+  regime_label: string;
+  terminal: string | null;
+  terminals: string[];
+  n_customers: number;
+  availability: Record<string, Availability>;
+  panels: DailyPanel[];
+}
+
+// ---- Scorecards (Blueprint E) ---------------------------------------------------
+export interface ScorecardFlip {
+  regime: Regime;
+  regime_label: string;
+  regime_score: number | null;
+  delta: number | null;
+  action: string;
+  line: string;
+}
+
+export interface Scorecard {
+  customer_id: string;
+  name: string;
+  home_terminal: string | null;
+  archetype: ArchetypeBlock;
+  base_value: BaseValueBlock;
+  var: VarBlock;
+  subscores: Record<string, SubScore>;
+  quadrant: QuadrantBlock;
+  monthly_volume: number;
+  trend_pct: number;
+  recency_gap: number;
+  facts?: Record<string, number | string | null | Record<string, number>>;
+  regime_score: number | null;
+  regime_multiplier: number;
+  regime_breakdown: Record<string, number>;
+  why_now: string;
+  recommended_action: string;
+  expected_impact: string;
+  flip: ScorecardFlip;
+}
+
+export interface ScorecardsResponse {
+  as_of: string | null;
+  window: string;
+  regime: Regime;
+  regime_label: string;
+  flip_regime_label: string;
+  terminal: string | null;
+  terminals: string[];
+  availability: Record<string, Availability>;
+  n: number;
+  archetypes_present: string[];
+  exemplars: Scorecard[];
+  cards: Scorecard[];
+}
+
+// ---- Playbook (Blueprint G) -----------------------------------------------------
+export interface ArchetypePlay {
+  archetype: string;
+  present: boolean;
+  posture: Record<string, string>;
+  play: {
+    say?: string;
+    call_when?: string;
+    quote?: string;
+    terms?: string;
+    avoid?: string;
+  };
+}
+export interface RegimeCheatState {
+  state: string;
+  label: string;
+  hint: string;
+  do?: string;
+  dont?: string;
+}
+export interface RegimeCheat {
+  axis: string;
+  label: string;
+  states: RegimeCheatState[];
+}
+export interface MorningStep {
+  step: string;
+  detail: string;
+}
+export interface PlaybookResponse {
+  archetypes: ArchetypePlay[];
+  present_archetypes: string[];
+  regime_cheatsheet: RegimeCheat[];
+  morning_routine: MorningStep[];
+}
