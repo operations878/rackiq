@@ -254,7 +254,11 @@ REQUIRED_IMPORT_KEYS: dict[str, list[str]] = {
     MARKET: ["price_date", "product"],
     QUOTES: ["customer_id", "quote_time", "product", "quoted_price", "outcome"],
     RECEIPTS: ["receipt_datetime", "terminal", "product", "receipt_source"],
-    BOL: ["bol_number", "bol_datetime", "terminal", "product", "tank_id", "compartment_net_gallons"],
+    # A meaningful compartment row needs only its disbursement identity (bol_number), when it
+    # left the rack (bol_datetime), and the billed volume (compartment_net_gallons). terminal /
+    # product / tank_id are dimensional keys that sharpen reconciliation but are optional and
+    # defaultable — so a partial BOL feed is stored and used, not quarantined wholesale.
+    BOL: ["bol_number", "bol_datetime", "compartment_net_gallons"],
 }
 
 # The single datetime/date column that defines a table's time axis (for date-range stats).

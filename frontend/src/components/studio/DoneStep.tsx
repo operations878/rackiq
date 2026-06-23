@@ -32,6 +32,11 @@ export default function DoneStep({
             ⚠ {result.quarantined.toLocaleString()} row(s) quarantined — review in Data Health →
           </button>
         )}
+        {result.dropped != null && result.dropped > 0 && (
+          <p className="mt-2 text-xs font-medium text-red-600">
+            ✕ {result.dropped.toLocaleString()} invalid row(s) were dropped (quarantine disabled).
+          </p>
+        )}
       </div>
 
       <div className="rounded-lg border border-slate-200 bg-white p-4">
