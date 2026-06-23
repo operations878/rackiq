@@ -19,6 +19,10 @@ import type {
   RackBenchmarkEntry,
   QuoteEntry,
   FeedWriteResponse,
+  ScoresResponse,
+  QuadrantResponse,
+  CustomerScoreResponse,
+  BacktestResponse,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -132,5 +136,18 @@ export const api = {
     quarantineDiscard: (body: { ids?: string[] }) =>
       postJSON<{ ok: boolean; discarded: number }>("/studio/quarantine/discard", body),
     audit: (limit = 100) => getJSON<{ audit: AuditEntry[] }>(`/studio/audit?limit=${limit}`),
+  },
+
+  // ---- Customer scoring ----
+  scores: {
+    list: (window = "all") => getJSON<ScoresResponse>(`/scores?window=${window}`),
+    customer: (id: string, window = "all") =>
+      getJSON<CustomerScoreResponse>(`/scores/customer/${encodeURIComponent(id)}?window=${window}`),
+    quadrant: (window = "all") => getJSON<QuadrantResponse>(`/scores/quadrant?window=${window}`),
+    backtest: () => getJSON<BacktestResponse>("/scores/backtest"),
+    config: () => getJSON<{ config: Record<string, number | string>; windows: string[]; archetypes: string[] }>("/scores/config"),
+    recompute: (overrides?: Record<string, number | string>) =>
+      postJSON<{ ok: boolean; computed_at: string; windows: Record<string, number> }>(
+        "/scores/recompute", { overrides: overrides ?? null }),
   },
 };

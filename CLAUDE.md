@@ -306,11 +306,53 @@ recent invoices left **open** (`paid_date` NULL); inventory book rolls forward
 
 ---
 
+## Customer scoring — VAR lane · sub-scores · base value · archetypes
+
+`backend/app/scoring.py` (engine) + `scoring_config.py` (**every weight/threshold/window is a
+config parameter**) read the **resolved** customer master (ids already rewritten to master at
+commit), compute everything over rolling **30/90/365-day windows + all-time**, flag
+**data-sufficiency** per customer, and **capability-gate every metric** (each carries
+`available: true/false + reason`). DuckDB views back the SQL-friendly facts
+(`v_customer_facts`); Python (pandas/numpy/statsmodels/scipy) does STL, regressions, and
+percentile ranking. Results persist to `customer_scores` + `customer_lane`.
+
+- **Part 1 — VAR base-range (lane) model** on net volume (weekly buckets; monthly for sporadic
+  accounts). *Base volume* = seasonally-aware STL trend+seasonal fitted value (robust
+  seasonal-median fallback for short history). *Base range* = base ± 1 robust σ of the
+  de-seasonalized residual (or a fixed `±%`). *Variability range* = base ± 2σ. **VAR score** =
+  `0.45·in_band + 0.35·tightness + 0.20·(1 − excursion)` (weights configurable),
+  grade A≥80/B/C/D, guard ≥8 lifts over ≥12 weeks. A **cadence lane** scores inter-lift timing;
+  headline VAR blends volume/cadence **70/30**. *(This VARIABILITY score is distinct from any
+  financial VaR — never conflated.)* The per-period base / base-range / variability-range series
+  is persisted and drawn as the **base-range chart** (the leadership screen).
+- **Part 2 — Layer-1 behavioral facts**: order size mean/median/CV, monthly volume, frequency,
+  days-between mean & CV, margin/gal mean & CV, days-since-last, product mix + HHI,
+  rush/split/small-order/cancel rates + friction-tag count, payment terms, days-to-pay mean & CV,
+  credit utilization.
+- **Part 3 — Layer-2 sub-scores** (0–100, percentile-ranked across the active book unless noted):
+  Volume/Timing Steadiness (= VAR lanes), Price Sensitivity (β of accept-incidence vs price−reference,
+  gated on quotes/rack benchmark), **EVR** (demand model vs naive-calendar baseline — the
+  useful-vs-dangerous separator), Discount Efficiency (`incremental_GP / GP_given_up`), Market
+  Sensitivity (signed corr profile), Weather Sensitivity (HDD/CDD β; NOAA fetch pending → seasonal
+  proxy), Quote Score (accept/negotiate/latency/lowest-only), Churn Risk. Plus the **Variability
+  Quality Quadrant** (Explainability = EVR × Profitability) → Strategic Lever / Premium Spot /
+  Managed Cost / Dangerous Noise.
+- **Part 4 — Layer-3 Base Value**: `EGP = annual_gal·margin`; friction & credit costs; `RFAP =
+  EGP − friction − credit`; profit per gallon/rack-hour/credit-$/order; strategic uplift
+  (0.8–1.5); **Base Value** = `100·[0.50·pct(RFAP) + 0.30·pct(profit-per-constraint) +
+  0.20·pct(strategic)] × uplift`, grade A/B/C/D.
+- **Part 5 — Archetype classifier**: a **primary + secondary** of the 12 archetypes from
+  *sub-score signatures* (not hard-coded names), each with a confidence and the standing posture
+  (pricing/terms/allocation) it triggers; ambiguous cases (small top-1/top-2 gap) are flagged.
+- Plus **Account Value** (volume×margin×VAR/100, percentile), **Recency gap** (days since last ÷
+  base cadence), and a **backtest** helper (per-customer one-step MAE by method: naive-last,
+  seasonal, lane-base).
+
 ## API endpoints
 
 All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
-live in `api/routes.py`; the `/api/studio/*` write/upload endpoints are in `api/studio.py`
-(see **Data Studio** above).
+live in `api/routes.py`; `/api/studio/*` write/upload endpoints in `api/studio.py`; the
+`/api/scores/*` scoring endpoints in `api/scores.py` (live-compute with a data-signature cache).
 
 | Endpoint | Purpose |
 |---|---|
@@ -321,6 +363,12 @@ live in `api/routes.py`; the `/api/studio/*` write/upload endpoints are in `api/
 | `GET /api/customers` | per-customer rollups; `avg_margin_per_gal`/`dso_days` are `null` when those capabilities are off — the API itself honors the matrix |
 | `GET /api/market-prices?product=ULSD` | market vs street-rack time series (`available:false` when absent) |
 | `GET /api/monthly-volume` | monthly net gallons (needs only required fields; survives `core`) |
+| `GET /api/scores?window=all` | ranked customers (VAR+grade, base value+grade, archetype, volume, trend) + per-metric `availability` |
+| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, VAR explanation, sub-scores, base value, archetype posture |
+| `GET /api/scores/quadrant?window=` | Explainability × Profitability scatter points with archetype tags |
+| `GET /api/scores/backtest` | per-customer one-step forecast error by method |
+| `GET /api/scores/config` | the scoring config (every weight) + windows + archetypes/posture |
+| `POST /api/scores/recompute` | recompute all windows (+ optional `{overrides}`) and write `customer_scores`/`customer_lane` |
 
 Interactive docs at `http://localhost:8000/docs`.
 
@@ -329,13 +377,19 @@ Interactive docs at `http://localhost:8000/docs`.
 ## Frontend
 
 Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A top nav switches
-between three pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`):
+between four pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`):
 
 - **Dashboard** (`pages/Dashboard.tsx`) — the "Connected — N customers loaded" banner, the live
   **capability-matrix grid** (enabled = green with coverage bar; disabled = grey with the missing
-  fields), a monthly-volume bar chart, a market-price line chart, and a top-customers table
-  (margin/DSO columns appear only when enabled). With no data it shows an empty state that points
-  to Data Studio.
+  fields; *feed* features show an indigo "collecting — N logged" pill), a monthly-volume bar chart,
+  a market-price line chart, and a top-customers table (margin/DSO columns appear only when
+  enabled). With no data it shows an empty state that points to Data Studio.
+- **Scores** (`pages/Scores.tsx`) — the ranked customer table (VAR + grade, base value + grade,
+  primary/secondary archetype, volume, trend), a window selector (30/90/365/all) + recompute,
+  a capability-gated **metric availability** strip, the **Explainability × Profitability quadrant**
+  scatter (`components/scores/QuadrantScatter.tsx`), and a per-customer drill-down rendering the
+  **base-range chart** (`components/scores/BaseRangeChart.tsx`) with the VAR explanation, sub-score
+  bars (greyed when unavailable), base-value breakdown, and archetype posture.
 - **Data Studio** (`pages/DataStudio.tsx`) — the upload → map → **clean** → validate → commit
   wizard with its live "Feed me &lt;field&gt;" capability panel (see **Data Studio** above).
 - **Data Health** (`pages/DataHealth.tsx`) — the standing quality score + drift alerts + quarantine
@@ -387,7 +441,10 @@ backend/
   app/
     schema.py               # ★ canonical field registry + DDL + import targets + hygiene metadata
     db.py                   # DuckDB lifecycle, shared r/w connection + lock, studio + crosswalk/audit/quarantine tables
-    capabilities.py         # ★ FEATURES registry + runtime matrix
+                            #   (scoring caches customer_scores/customer_lane are managed in scoring.ensure_tables)
+    capabilities.py         # ★ FEATURES registry + runtime matrix (incl. "feed" collecting state)
+    scoring.py              # ★ scoring engine: VAR lane, sub-scores, base value, archetypes, backtest
+    scoring_config.py       # ★ ScoringConfig — every weight/threshold/window as a parameter
     generator.py            # parameterized Soundview synthetic data + profiles
     ingest.py               # Data Studio: parse, fuzzy mapping, inspect (+profiling), validate, coerce
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -399,8 +456,9 @@ backend/
     config.py               # settings (db path, CORS, host/port)
     main.py                 # FastAPI app factory (routes + studio routers)
     api/{routes,queries}.py # read endpoints + SQL
-    api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health
-  tests/                    # pytest: test_hygiene_studio.py (units) + test_studio_api.py (e2e flow)
+    api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
+    api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / config / recompute
+  tests/                    # pytest: test_hygiene_studio.py + test_studio_api.py + test_early_feeds.py + test_scoring.py
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -410,14 +468,24 @@ frontend/
     App.tsx, main.tsx, index.css
     lib/{useHashRoute,format}.ts
     api/{client,types}.ts
-    pages/{Dashboard,DataStudio,DataHealth}.tsx
+    pages/{Dashboard,Scores,DataStudio,DataHealth}.tsx
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel}.tsx
+    components/scores/{BaseRangeChart,QuadrantScatter}.tsx
     components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds}.tsx
 CLAUDE.md
 ```
 
 ## Notes & gotchas
-- **numpy < 2.5** on Python 3.11 (2.5 requires 3.12); pinned in `pyproject.toml`.
+- **numpy < 2.5** on Python 3.11 (2.5 requires 3.12); pinned in `pyproject.toml`. The scoring
+  engine adds **statsmodels** (STL) + **scipy** (rank percentiles) — installed by `uv sync`.
+- **Scoring is capability-gated end-to-end**: each metric returns `available + reason`; gated
+  sub-scores (margin, elasticity, EVR, market, quotes, credit) report `available:false` on a thin
+  book and the UI greys them out. `customer_scores`/`customer_lane` are *derived caches* recomputed
+  from canonical data (live-computed on read with a data-signature cache; persisted by `recompute`).
+- **`window` is a reserved word in DuckDB** (window functions) — the scoring tables use
+  `score_window` for the column (the JSON/API still exposes `window`), like the `at`→`ts` rule.
+- The **VARIABILITY** "VAR" score (steadiness, 0–100) is deliberately distinct from any financial
+  **VaR** — they are never conflated in code or UI.
 - DuckDB bulk insert casts each column to its declared schema type, so pandas
   datetime → DATE/TIMESTAMP and `NaT` → NULL are handled in `db.insert_df`.
 - Coverage is measured against each field's **own** table row count.
