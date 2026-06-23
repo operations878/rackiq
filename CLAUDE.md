@@ -353,7 +353,9 @@ percentile ranking. Results persist to `customer_scores` + `customer_lane`.
 All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
 live in `api/routes.py`; `/api/studio/*` write/upload endpoints in `api/studio.py`; the
 `/api/scores/*` scoring endpoints in `api/scores.py` (live-compute with a data-signature cache);
-the **daily-operating / regime / scorecard / playbook** endpoints in `api/daily.py`.
+the **daily-operating / regime / scorecard / playbook** endpoints in `api/daily.py`; the
+**Demand Cockpit** endpoints in `api/demand.py` (heavy forecast cached per scope, the
+service-level slider re-derives only the cheap action).
 
 | Endpoint | Purpose |
 |---|---|
@@ -376,6 +378,10 @@ the **daily-operating / regime / scorecard / playbook** endpoints in `api/daily.
 | `GET /api/daily/recommendations?run_date=&terminal=` | read back the persisted §14 worklist |
 | `GET /api/scorecards?terminal=&<regime axes>&window=` | per-customer **scorecards** with the regime-adjusted score + the **flip-side** line (Blueprint E) |
 | `GET /api/playbook?terminal=&window=` | the **Sales Playbook**: per-archetype plays + regime cheat-sheets + morning routine (Blueprint G) |
+| `GET /api/demand/cockpit?terminal=&product=&window=&service_level=&lead_time_days=&lot_size=` | the **Demand Cockpit**: per-customer→terminal P10/P50/P90 forecast band, days-of-cover + burn-down (gated on inventory), the recommended buy action at a service level, and the accuracy strip |
+| `POST /api/demand/persist` | recompute & write the per-customer + terminal forecast distributions (`demand_forecast_customer`/`demand_forecast_terminal`) — the P6/P7/P10 read contract |
+| `GET /api/demand/forecasts?terminal=&product=&level=&window=` | read back the persisted forecast distributions (terminal or customer level) |
+| `GET /api/demand/config` | the demand-cockpit config (horizon, service-level / lead-time defaults, band weights) |
 
 Interactive docs at `http://localhost:8000/docs`.
 
@@ -409,6 +415,42 @@ On top of the standing scores sits the **operating layer** people live in day-to
 
 ---
 
+## Demand Cockpit — the per-terminal operating forecast
+
+`backend/app/demand.py` is the per-terminal demand-planning view. For one `terminal × product`
+(product `(all)` aggregates a terminal's whole book):
+
+- **Per-customer forecast → terminal band.** Each customer's weekly series (Mon-start buckets over
+  the active span; a trailing **partial week is dropped** so it can't drag the model) is forecast by
+  **per-account model selection**: the lowest-backtest-error of **Holt-Winters seasonal** (≥2 weekly
+  cycles), **Holt's linear trend** (`holt_linear`), **seasonal-naive**, or **flat** — so a ratable
+  gasoline account lands on Holt while a weather-driven distillate lands on seasonal-naive, *by
+  skill*. A reliability **shrinkage** blends the path toward the recent run-rate (trusting the model
+  less when its backtest error is high) to curb thin-series overforecasting. Forecasts are summed to
+  the terminal **P50**; the **P10/P90 band** is *derived from historical one-step forecast error*
+  and is **VAR-weighted** — erratic (low-VAR) accounts widen the band via `1 + λ·(1 − VAR/100)`,
+  combined as `σ_terminal = √(Σ σ_i²)` and grown ∝√h (plateauing after `sigma_growth_cap_periods`).
+- **Days of cover + burn-down** (capability-gated on `inventory_days_of_supply`): the latest book
+  inventory / `tank_capacity` / `min_heel` give **days-of-cover** = on-hand-above-heel ÷ near-term
+  daily P50, and a daily **burn-down** projecting inventory at the P50 rate with a fast(P90)/slow(P10)
+  cone vs. the heel & capacity lines (the fast-path heel crossing is the conservative reorder day).
+- **Recommended action** = a plain-English **order-up-to** plan at a chosen **service level** (z via
+  `scipy.stats.norm.ppf`): reorder point `s = μ_d·L + z·σ_d·√L`, order-up-to `S = μ_d·(L+R) + z·σ_d·√(L+R)`
+  (above heel), → "**buy ~X gal by &lt;date&gt; to hold a 95% service level**", rounded to **lot size**
+  and capped at tank ullage. With **no supply constraints** it degrades to a **target carry** and
+  notes the gap. Service level / lead time / lot size are live inputs; the heavy forecast is cached
+  per scope so only this cheap step re-runs.
+- **Accuracy strip** = recent **MAPE / bias** from a terminal-level one-step backtest, with the
+  selected model vs. naive-last / seasonal-naive baselines.
+- **Persistence (the P6/P7/P10 contract).** `persist` writes the **per-customer** and **terminal**
+  forecast distributions to `demand_forecast_customer` / `demand_forecast_terminal` for every
+  `terminal × product` (+ the all-products rollup) so downstream phases (P6 allocation, P7 pricing,
+  P10 S&OP) read one canonical forecast. Like `customer_scores` / `daily_recommendations` these are
+  derived caches created by `demand.ensure_tables` (NOT `init_db`), so they **survive** demo reload /
+  reset. Every horizon / weight / planning constant lives in `demand.DemandConfig`.
+
+---
+
 ## Frontend
 
 Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A **left-nav dashboard
@@ -421,6 +463,14 @@ the Daily Operating Dashboard.
   terminal, the **nine ranked panels** (lists, not charts), and the **regime selector**
   (`components/RegimeSelector.tsx`) that re-ranks everything live by calling `/api/daily`. A
   "Persist worklist (§14)" button writes `daily_recommendations`. Rows deep-link to the scorecard.
+- **Demand Cockpit** (`pages/DemandCockpit.tsx`, route `demand`) — the per-terminal operating
+  forecast. Terminal / product / window selectors; a **P10/P50/P90 forecast-band chart**
+  (`components/demand/DemandForecastChart.tsx`, history → forecast with a boundary line); an
+  **inventory burn-down** vs. heel/capacity (`components/demand/BurnDownChart.tsx`, greyed with a
+  gap-note when inventory is absent); a **days-of-cover** stat; a **Recommended Action** panel with a
+  **service-level slider** + lead-time / lot-size inputs (re-derives the buy-by date live); and a
+  **forecast-accuracy strip** (MAPE / bias vs. baselines). A "Persist (P6/P7/P10)" button writes the
+  forecast distributions.
 - **Scorecards** (`pages/Scorecards.tsx`, routes `scorecards` / `scorecard/{id}`) — Blueprint E.
   One-page per-customer cards: sub-scores, Base Value, today's Regime-Adjusted Score (+ per-axis
   multiplier breakdown), archetype(s), why-now, recommended action, posture, expected impact, and
@@ -508,6 +558,7 @@ backend/
     regime.py               # ★ daily operating engine: regime re-rank + the nine ranked panels + scorecards
     regime_config.py        # ★ the V1 regime-multiplier matrix (axes/states/multipliers — every value a param)
     playbook.py             # ★ Sales Playbook source (archetype plays + regime cheat-sheets + routine) + md render
+    demand.py               # ★ Demand Cockpit: per-customer HW/seasonal-naive forecast → terminal P10/P50/P90 band, days-of-cover/burn-down, order-up-to action, persisted distributions (DemandConfig)
     generator.py            # parameterized Soundview synthetic data + profiles
     ingest.py               # Data Studio: parse, fuzzy mapping, inspect (+profiling), validate, coerce
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -517,12 +568,13 @@ backend/
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
     cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook
     config.py               # settings (db path, CORS, host/port)
-    main.py                 # FastAPI app factory (routes + studio + scores + daily routers)
+    main.py                 # FastAPI app factory (routes + studio + scores + daily + demand routers)
     api/{routes,queries}.py # read endpoints + SQL
     api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
     api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / config / recompute
     api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_early_feeds + test_scoring + test_regime
+    api/demand.py           # /api/demand/cockpit / persist / forecasts / config (the Demand Cockpit)
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_early_feeds + test_scoring + test_regime + test_demand
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -533,9 +585,10 @@ frontend/
     App.tsx, main.tsx, index.css       # App.tsx = the left-nav dashboard shell (Operate/Analyze/Data)
     lib/{useHashRoute,format}.ts, lib/scoreui.tsx
     api/{client,types}.ts
-    pages/{DailyOps,Scorecards,Playbook,BookOverview,Radar,Scores,Dashboard,DataStudio,DataHealth}.tsx
+    pages/{DailyOps,DemandCockpit,Scorecards,Playbook,BookOverview,Radar,Scores,Dashboard,DataStudio,DataHealth}.tsx
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
     components/scores/{BaseRangeChart,QuadrantScatter}.tsx
+    components/demand/{DemandForecastChart,BurnDownChart}.tsx
     components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds}.tsx
 CLAUDE.md
 ```
@@ -553,6 +606,16 @@ CLAUDE.md
   The scorecard **flip side** uses `opposite_regime` (inverts inventory + market). `daily_recommendations`
   is a derived cache created by `regime.ensure_tables` (NOT in `init_db`), so it survives like
   `customer_scores`; `persist_daily` rewrites the current `run_date`.
+- **Demand Cockpit forecasting** is at a **weekly** terminal grain (so per-customer forecasts align
+  to sum); a trailing **partial week is dropped** before modeling. Method tiering counts **active
+  (non-zero) weeks** — zero-padding a sparse account's span must not promote it to a trend model;
+  the model is **picked per account by backtest** (Holt-Winters seasonal/linear vs. seasonal-naive
+  vs. flat). The P10/P90 band comes from the **historical one-step error** (not a model's own CI) and
+  is **VAR-weighted**. `demand_forecast_customer`/`demand_forecast_terminal` are derived caches created
+  by `demand.ensure_tables` (NOT `init_db`), so they **survive reset/demo** like `customer_scores`;
+  the heavy forecast is cached per `(data-sig, terminal, product, window)` so the service-level slider
+  re-runs only the cheap order-up-to action. Days-of-cover / burn-down / buy-by-date are gated on the
+  `inventory_days_of_supply` capability (else a target carry + gap note).
 - **`window` is a reserved word in DuckDB** (window functions) — the scoring tables use
   `score_window` for the column (the JSON/API still exposes `window`), like the `at`→`ts` rule.
 - The **VARIABILITY** "VAR" score (steadiness, 0–100) is deliberately distinct from any financial

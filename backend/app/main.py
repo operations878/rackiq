@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
 from .api.daily import router as daily_router
+from .api.demand import router as demand_router
 from .api.routes import router
 from .api.scores import router as scores_router
 from .api.studio import router as studio_router
@@ -26,6 +27,7 @@ def create_app() -> FastAPI:
     app.include_router(studio_router)
     app.include_router(scores_router)
     app.include_router(daily_router)
+    app.include_router(demand_router)
 
     @app.get("/")
     def root():
