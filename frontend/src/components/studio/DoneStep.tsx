@@ -5,10 +5,12 @@ export default function DoneStep({
   result,
   onImportAnother,
   onGoDashboard,
+  onGoHealth,
 }: {
   result: CommitResponse;
   onImportAnother: () => void;
   onGoDashboard: () => void;
+  onGoHealth: () => void;
 }) {
   return (
     <div className="space-y-4">
@@ -22,6 +24,14 @@ export default function DoneStep({
           unlocked
           {result.saved_profile && <> · saved profile “{result.saved_profile}”</>}
         </p>
+        {result.quarantined > 0 && (
+          <button
+            onClick={onGoHealth}
+            className="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100"
+          >
+            ⚠ {result.quarantined.toLocaleString()} row(s) quarantined — review in Data Health →
+          </button>
+        )}
       </div>
 
       <div className="rounded-lg border border-slate-200 bg-white p-4">

@@ -5,6 +5,7 @@ import { useHashRoute } from "./lib/useHashRoute";
 import ProfileBadge from "./components/ProfileBadge";
 import Dashboard from "./pages/Dashboard";
 import DataStudio from "./pages/DataStudio";
+import DataHealth from "./pages/DataHealth";
 
 function Centered({ children }: { children: ReactNode }) {
   return (
@@ -70,6 +71,9 @@ export default function App() {
   if (!summary || !caps) return <Centered>Loading RackIQ…</Centered>;
 
   const onStudio = route === "studio";
+  const onHealth = route === "health";
+  const onDashboard = !onStudio && !onHealth;
+  const quarantine = summary.quarantine_total ?? 0;
 
   return (
     <div className="min-h-screen bg-slate-100 text-slate-900">
@@ -81,8 +85,21 @@ export default function App() {
               <p className="text-[11px] text-slate-500">Customer Demand &amp; Margin Intelligence</p>
             </div>
             <nav className="flex items-center gap-1">
-              <NavLink label="Dashboard" active={!onStudio} onClick={() => navigate("")} />
+              <NavLink label="Dashboard" active={onDashboard} onClick={() => navigate("")} />
               <NavLink label="Data Studio" active={onStudio} onClick={() => navigate("studio")} />
+              <button
+                onClick={() => navigate("health")}
+                className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition ${
+                  onHealth ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                Data Health
+                {quarantine > 0 && (
+                  <span className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                    {quarantine}
+                  </span>
+                )}
+              </button>
             </nav>
           </div>
           <ProfileBadge profile={caps.profile} enabled={caps.summary.enabled} total={caps.summary.total} />
@@ -90,11 +107,9 @@ export default function App() {
       </header>
 
       <main className="mx-auto max-w-7xl px-6 py-6">
-        {onStudio ? (
-          <DataStudio caps={caps} summary={summary} onState={applyState} navigate={navigate} />
-        ) : (
-          <Dashboard summary={summary} caps={caps} navigate={navigate} />
-        )}
+        {onStudio && <DataStudio caps={caps} summary={summary} onState={applyState} navigate={navigate} />}
+        {onHealth && <DataHealth navigate={navigate} onState={applyState} />}
+        {onDashboard && <Dashboard summary={summary} caps={caps} navigate={navigate} />}
       </main>
 
       <footer className="mx-auto max-w-7xl px-6 pb-6 text-center text-xs text-slate-400">

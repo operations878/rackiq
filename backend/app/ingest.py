@@ -267,14 +267,16 @@ def _looks_datelike(v: str) -> bool:
 
 
 def inspect(df: pd.DataFrame, filename: str) -> dict:
-    """Build the full inspect payload the wizard renders (columns + suggestions + targets)."""
+    """Build the full inspect payload the wizard renders (columns + suggestions + targets).
+
+    Each column carries the full profiling scorecard (type, null %, distinct count, min/max,
+    samples, outliers, and quality flags) so problems are visible before any mapping.
+    """
+    from . import profiling  # lazy import (profiling imports helpers from this module)
+
     headers = list(df.columns)
-    columns = [{
-        "name": h,
-        "samples": _sample_values(df[h]),
-        "null_rate": _null_rate(df[h]),
-        "dtype_guess": _dtype_guess(df[h]),
-    } for h in headers]
+    profile = profiling.profile_frame(df)
+    columns = profile["columns"]
 
     suggested_table = infer_table(headers)
     suggestions_by_table = {t: suggest_for_table(headers, t) for t in schema.IMPORTABLE_TABLES}
@@ -285,6 +287,8 @@ def inspect(df: pd.DataFrame, filename: str) -> dict:
         "n_rows": int(len(df)),
         "n_columns": int(len(headers)),
         "columns": columns,
+        "profile": {"score": profile["score"], "n_flagged_columns": profile["n_flagged_columns"],
+                    "n_warnings": profile["n_warnings"]},
         "suggested_table": suggested_table,
         "suggestions_by_table": suggestions_by_table,
         "targets_by_table": targets_by_table,
@@ -299,6 +303,32 @@ def _clean_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
+def _parse_mixed_dates(series: pd.Series) -> pd.Series:
+    """Parse a column of possibly-mixed date formats, salvaging day-first values.
+
+    First pass infers per-value formats; any non-blank value that still failed is retried
+    day-first (so "13/02/2024" and "02/13/2024" can coexist in one column).
+    """
+    import warnings
+
+    def _to_dt(s, **kw):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                return pd.to_datetime(s, errors="coerce", format="mixed", **kw)
+            except (ValueError, TypeError):
+                return pd.to_datetime(s, errors="coerce", **kw)
+
+    non_blank = series.map(lambda v: not (v is None
+                                          or (isinstance(v, float) and pd.isna(v))
+                                          or (isinstance(v, str) and v.strip() == "")))
+    out = _to_dt(series)
+    remaining = non_blank & out.isna()
+    if remaining.any():
+        out.loc[remaining] = _to_dt(series[remaining], dayfirst=True)
+    return out
+
+
 def coerce_column(series: pd.Series, dtype: str) -> tuple[pd.Series, int]:
     """Coerce a source column to a canonical dtype; return (coerced, parse_error_count).
 
@@ -311,7 +341,7 @@ def coerce_column(series: pd.Series, dtype: str) -> tuple[pd.Series, int]:
         out = _clean_numeric(series)
         errors = int((non_blank & out.isna()).sum())
     elif dtype in ("TIMESTAMP", "DATE"):
-        out = pd.to_datetime(series, errors="coerce")
+        out = _parse_mixed_dates(series)
         errors = int((non_blank & out.isna()).sum())
     else:  # VARCHAR
         out = series.map(lambda v: None if (v is None or (isinstance(v, float) and pd.isna(v)))

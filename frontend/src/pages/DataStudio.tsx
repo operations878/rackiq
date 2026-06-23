@@ -8,16 +8,19 @@ import type {
   CommitResponse,
   SavedProfile,
   StudioState,
+  HygieneOptions,
 } from "../api/types";
+import { DEFAULT_HYGIENE } from "../api/types";
 import Panel from "../components/Panel";
 import DataCapabilityPanel from "../components/DataCapabilityPanel";
 import Stepper from "../components/studio/Stepper";
 import UploadStep from "../components/studio/UploadStep";
 import MappingStep from "../components/studio/MappingStep";
+import CleanStep from "../components/studio/CleanStep";
 import ValidateStep from "../components/studio/ValidateStep";
 import DoneStep from "../components/studio/DoneStep";
 
-type Step = "upload" | "map" | "validate" | "done";
+type Step = "upload" | "map" | "clean" | "validate" | "done";
 
 function mappingFromSuggestions(inspect: InspectResponse, table: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -41,6 +44,7 @@ export default function DataStudio({
   const [inspect, setInspect] = useState<InspectResponse | null>(null);
   const [table, setTable] = useState<string>("lifts");
   const [mapping, setMapping] = useState<Record<string, string>>({});
+  const [options, setOptions] = useState<HygieneOptions>(DEFAULT_HYGIENE);
   const [saveProfileName, setSaveProfileName] = useState("");
   const [validation, setValidation] = useState<ValidateResponse | null>(null);
   const [mode, setMode] = useState("replace");
@@ -59,6 +63,7 @@ export default function DataStudio({
     setStep("upload");
     setInspect(null);
     setMapping({});
+    setOptions(DEFAULT_HYGIENE);
     setValidation(null);
     setResult(null);
     setSaveProfileName("");
@@ -75,7 +80,11 @@ export default function DataStudio({
       const t = data.matched_profile?.target_table ?? data.suggested_table;
       setTable(t);
       setMapping(data.matched_profile?.mapping ?? mappingFromSuggestions(data, t));
-      if (data.matched_profile) setNotice(`Applied saved profile “${data.matched_profile.name}”.`);
+      setOptions(data.matched_profile?.hygiene ?? DEFAULT_HYGIENE);
+      const notes: string[] = [];
+      if (data.matched_profile) notes.push(`Applied saved profile “${data.matched_profile.name}”.`);
+      notes.push(`Quality score ${data.profile.score}/100${data.profile.n_warnings ? ` · ${data.profile.n_warnings} warning(s)` : ""}.`);
+      setNotice(notes.join(" "));
       setStep("map");
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
@@ -98,7 +107,7 @@ export default function DataStudio({
     setBusy("validate");
     setError(null);
     try {
-      const v = await api.studio.validate({ upload_id: inspect.upload_id, table, mapping });
+      const v = await api.studio.validate({ upload_id: inspect.upload_id, table, mapping, options });
       setValidation(v);
       setStep("validate");
     } catch (e) {
@@ -119,6 +128,7 @@ export default function DataStudio({
         mapping,
         mode,
         save_profile: saveProfileName.trim() || null,
+        options,
       });
       setResult(r);
       onState({ summary: r.summary, capabilities: r.capabilities });
@@ -208,6 +218,19 @@ export default function DataStudio({
                 saveProfileName={saveProfileName}
                 onChangeSaveProfileName={setSaveProfileName}
                 onBack={() => setStep("upload")}
+                onValidate={() => setStep("clean")}
+                busy={busy}
+              />
+            )}
+            {step === "clean" && inspect && (
+              <CleanStep
+                inspect={inspect}
+                table={table}
+                mapping={mapping}
+                options={options}
+                onChangeOptions={setOptions}
+                onResolved={() => setNotice("Customer merge saved to the master crosswalk — it will auto-resolve on every future upload.")}
+                onBack={() => setStep("map")}
                 onValidate={handleValidate}
                 busy={busy}
               />
@@ -217,7 +240,7 @@ export default function DataStudio({
                 validation={validation}
                 mode={mode}
                 onChangeMode={setMode}
-                onBack={() => setStep("map")}
+                onBack={() => setStep("clean")}
                 onCommit={handleCommit}
                 busy={busy}
               />
@@ -227,6 +250,7 @@ export default function DataStudio({
                 result={result}
                 onImportAnother={resetWizard}
                 onGoDashboard={() => navigate("")}
+                onGoHealth={() => navigate("health")}
               />
             )}
           </Panel>

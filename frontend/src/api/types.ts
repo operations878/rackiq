@@ -13,6 +13,8 @@ export interface Summary {
     table: string | null;
     at: string | null;
   };
+  quarantine_total?: number;
+  crosswalk_total?: number;
 }
 
 export interface FieldPresence {
@@ -87,11 +89,26 @@ export interface MarketPrices {
 }
 
 // ---- Data Studio ----------------------------------------------------------------
+export interface ColumnFlag {
+  level: "warn" | "info";
+  code: string;
+  message: string;
+}
+
 export interface SourceColumn {
   name: string;
   samples: string[];
   null_rate: number;
   dtype_guess: string;
+  // Profiling scorecard (added by the Data Hygiene Studio):
+  distinct?: number;
+  n_total?: number;
+  n_nonblank?: number;
+  min?: number | string | null;
+  max?: number | string | null;
+  outliers?: number;
+  flags?: ColumnFlag[];
+  quality?: number;
 }
 
 export interface ImportTarget {
@@ -111,6 +128,7 @@ export interface MatchedProfile {
   name: string;
   target_table: string;
   mapping: Record<string, string>;
+  hygiene?: HygieneOptions | null;
 }
 
 export interface InspectResponse {
@@ -119,12 +137,104 @@ export interface InspectResponse {
   n_rows: number;
   n_columns: number;
   columns: SourceColumn[];
+  profile: { score: number; n_flagged_columns: number; n_warnings: number };
   suggested_table: string;
   suggestions_by_table: Record<string, Record<string, Suggestion>>;
   targets_by_table: Record<string, ImportTarget[]>;
   table_labels: Record<string, string>;
   required_keys: Record<string, string[]>;
   matched_profile: MatchedProfile | null;
+  crosswalk_size: number;
+}
+
+// ---- Hygiene options (the approved auto-fixes) ----------------------------------
+export interface HygieneOptions {
+  trim_whitespace: boolean;
+  drop_empty_rows: boolean;
+  standardize_units: boolean;
+  source_unit: string;            // "gallons" | "barrels"
+  fill_defaults: boolean;
+  default_terminal: string | null;
+  default_product: string | null;
+  net_correction: string;         // "auto" | "factor" | "gross" | "off"
+  net_factor: number | null;
+  resolve_customers: boolean;
+  dedupe_exact: boolean;
+  dedupe_lifts_grain: boolean;
+  quarantine_failures: boolean;
+}
+
+export const DEFAULT_HYGIENE: HygieneOptions = {
+  trim_whitespace: true,
+  drop_empty_rows: true,
+  standardize_units: false,
+  source_unit: "gallons",
+  fill_defaults: false,
+  default_terminal: null,
+  default_product: null,
+  net_correction: "auto",
+  net_factor: null,
+  resolve_customers: true,
+  dedupe_exact: true,
+  dedupe_lifts_grain: false,
+  quarantine_failures: true,
+};
+
+// ---- Customer Master crosswalk --------------------------------------------------
+export interface MergeMember {
+  key: string;
+  name: string;
+  count: number;
+  in_file: boolean;
+  already_confirmed: boolean;
+  similarity: number;
+}
+
+export interface MergeGroup {
+  group_id: string;
+  master_id: string;
+  master_name: string;
+  confidence: number;
+  from_existing: boolean;
+  members: MergeMember[];
+}
+
+export interface ProposeResponse {
+  groups: MergeGroup[];
+  n_distinct_keys: number;
+  n_groups: number;
+  n_resolved: number;
+  n_new_singletons: number;
+  threshold: number;
+  crosswalk_size: number;
+  key_column: string;
+}
+
+export interface CrosswalkEntry {
+  variant_key: string;
+  master_id: string;
+  master_name: string;
+  confidence: number | null;
+  status: string;
+  source: string;
+  updated_at: string;
+}
+
+// ---- Validation rule engine -----------------------------------------------------
+export interface RuleRow {
+  row: number;
+  values: Record<string, string | number | null>;
+}
+
+export interface RuleResult {
+  key: string;
+  label: string;
+  severity: "error" | "warning" | "info";
+  action: "quarantine" | "fix" | "none";
+  passed: boolean;
+  count: number;
+  message: string;
+  rows: RuleRow[];
 }
 
 export interface ValidateFieldReport {
@@ -148,6 +258,13 @@ export interface ValidateResponse {
   warnings: string[];
   errors: string[];
   can_commit: boolean;
+  // Data Hygiene Studio additions:
+  rules: RuleResult[];
+  fixes_preview: HygieneStep[];
+  rule_errors: number;
+  rule_warnings: number;
+  quarantine_count: number;
+  clean_rows: number;
 }
 
 export interface HygieneStep {
@@ -162,7 +279,9 @@ export interface CommitResponse {
   mode: string;
   rows_written: number;
   rows_in_file: number;
+  quarantined: number;
   hygiene: HygieneStep[];
+  rules: RuleResult[];
   saved_profile: string | null;
   summary: Summary;
   capabilities: Capabilities;
@@ -173,7 +292,72 @@ export interface SavedProfile {
   target_table: string;
   mapping: Record<string, string>;
   source_columns: string[];
+  hygiene: HygieneOptions | null;
   created_at: string;
+}
+
+// ---- Standing Data Health -------------------------------------------------------
+export interface HealthComponent {
+  key: string;
+  score: number;
+  weight: number;
+  detail: Record<string, number | string>;
+}
+
+export interface CustomerDriftAlert {
+  code: string;
+  kind: "possible_variant" | "new_code";
+  near?: string;
+  similarity?: number;
+}
+
+export interface VolumeDrift {
+  month: string;
+  value: number;
+  mean: number;
+  z: number;
+  alert: boolean;
+  direction?: string;
+}
+
+export interface AuditEntry {
+  at: string;
+  target_table: string;
+  filename: string;
+  step: string;
+  detail: string;
+  rows_affected: number;
+}
+
+export interface DataHealth {
+  score: number;
+  grade: string;
+  components: HealthComponent[];
+  drift: {
+    customers: CustomerDriftAlert[];
+    n_possible_variants: number;
+    n_new_codes: number;
+    volume: VolumeDrift | null;
+  };
+  quarantine: { total: number; by_table: Record<string, number> };
+  crosswalk: { size: number; masters: number };
+  recent_audit: AuditEntry[];
+  profile: string;
+}
+
+export interface QuarantineRow {
+  id: string;
+  at: string;
+  target_table: string;
+  filename: string;
+  reasons: string[];
+  payload: Record<string, string | number | null>;
+}
+
+export interface QuarantineResponse {
+  rows: QuarantineRow[];
+  counts: Record<string, number>;
+  total: number;
 }
 
 export interface StudioState {

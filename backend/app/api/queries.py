@@ -37,6 +37,8 @@ def get_summary(con) -> dict:
             "table": db.get_meta(con, "last_import_table"),
             "at": db.get_meta(con, "last_import_at"),
         },
+        "quarantine_total": sum(db.quarantine_counts(con).values()),
+        "crosswalk_total": len(db.get_crosswalk(con)),
     }
 
 

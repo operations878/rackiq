@@ -10,6 +10,12 @@ import type {
   SavedProfile,
   StudioState,
   ImportLogEntry,
+  HygieneOptions,
+  ProposeResponse,
+  CrosswalkEntry,
+  DataHealth,
+  QuarantineResponse,
+  AuditEntry,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -60,18 +66,28 @@ export const api = {
       if (!res.ok) throw new Error(await readError(res, "/studio/inspect"));
       return (await res.json()) as InspectResponse;
     },
-    validate: (body: { upload_id: string; table: string; mapping: Record<string, string> }) =>
-      postJSON<ValidateResponse>("/studio/validate", body),
+    validate: (body: {
+      upload_id: string;
+      table: string;
+      mapping: Record<string, string>;
+      options?: HygieneOptions;
+    }) => postJSON<ValidateResponse>("/studio/validate", body),
     commit: (body: {
       upload_id: string;
       table: string;
       mapping: Record<string, string>;
       mode: string;
       save_profile?: string | null;
+      options?: HygieneOptions;
     }) => postJSON<CommitResponse>("/studio/commit", body),
     profiles: () => getJSON<{ profiles: SavedProfile[] }>("/studio/profiles"),
-    saveProfile: (body: { name: string; table: string; mapping: Record<string, string>; source_columns: string[] }) =>
-      postJSON<{ ok: boolean; name: string }>("/studio/profiles", body),
+    saveProfile: (body: {
+      name: string;
+      table: string;
+      mapping: Record<string, string>;
+      source_columns: string[];
+      hygiene?: HygieneOptions | null;
+    }) => postJSON<{ ok: boolean; name: string }>("/studio/profiles", body),
     async deleteProfile(name: string): Promise<void> {
       const res = await fetch(`${BASE}/studio/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
       if (!res.ok) throw new Error(await readError(res, "/studio/profiles"));
@@ -79,5 +95,34 @@ export const api = {
     history: () => getJSON<{ imports: ImportLogEntry[] }>("/studio/history"),
     loadDemo: (profile: string) => postJSON<StudioState & { ok: boolean }>("/studio/load-demo", { profile }),
     reset: () => postJSON<StudioState & { ok: boolean }>("/studio/reset", {}),
+
+    // ---- Customer Master crosswalk ----
+    crosswalkPropose: (body: {
+      upload_id: string;
+      table: string;
+      mapping: Record<string, string>;
+      name_source?: string | null;
+      threshold?: number;
+    }) => postJSON<ProposeResponse>("/studio/crosswalk/propose", body),
+    crosswalkConfirm: (body: { groups: unknown[]; rejected_keys: string[] }) =>
+      postJSON<{ written: number; crosswalk_size: number; crosswalk: CrosswalkEntry[] }>(
+        "/studio/crosswalk/confirm", body),
+    crosswalkList: () => getJSON<{ crosswalk: CrosswalkEntry[] }>("/studio/crosswalk"),
+    async crosswalkDelete(key: string): Promise<void> {
+      const res = await fetch(`${BASE}/studio/crosswalk/${encodeURIComponent(key)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await readError(res, "/studio/crosswalk"));
+    },
+    crosswalkClear: () => postJSON<{ ok: boolean }>("/studio/crosswalk/clear", {}),
+
+    // ---- Data health, quarantine, audit ----
+    dataHealth: () => getJSON<DataHealth>("/studio/data-health"),
+    quarantine: (table?: string) =>
+      getJSON<QuarantineResponse>(`/studio/quarantine${table ? `?table=${encodeURIComponent(table)}` : ""}`),
+    quarantineReimport: (body: { ids?: string[]; edits?: Record<string, Record<string, unknown>> }) =>
+      postJSON<StudioState & { ok: boolean; reimported: number; still_quarantined: number }>(
+        "/studio/quarantine/reimport", body),
+    quarantineDiscard: (body: { ids?: string[] }) =>
+      postJSON<{ ok: boolean; discarded: number }>("/studio/quarantine/discard", body),
+    audit: (limit = 100) => getJSON<{ audit: AuditEntry[] }>(`/studio/audit?limit=${limit}`),
   },
 };

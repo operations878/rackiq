@@ -21,14 +21,16 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "rackiq.duck
 META_DDL = "CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR)"
 
 # Data Studio persistence. These survive a demo regeneration / data reset on purpose, so
-# saved mappings ("profiles") and import history are not lost when the book is reloaded.
+# saved mappings ("profiles"), import history, the customer master crosswalk, the hygiene
+# audit log, and the quarantine queue are not lost when the book is reloaded.
 STUDIO_DDL = [
     """CREATE TABLE IF NOT EXISTS import_profiles (
         name VARCHAR PRIMARY KEY,
         target_table VARCHAR,
         mapping VARCHAR,
         source_columns VARCHAR,
-        created_at VARCHAR
+        created_at VARCHAR,
+        hygiene VARCHAR
     )""",
     """CREATE TABLE IF NOT EXISTS import_log (
         imported_at VARCHAR,
@@ -37,6 +39,40 @@ STUDIO_DDL = [
         rows INTEGER,
         mode VARCHAR
     )""",
+    # Customer Master crosswalk: every observed customer variant resolves to a master id.
+    # status: 'confirmed' (apply the merge) | 'rejected' (keep separate, suppress re-proposal).
+    """CREATE TABLE IF NOT EXISTS customer_crosswalk (
+        variant_key VARCHAR PRIMARY KEY,
+        master_id VARCHAR,
+        master_name VARCHAR,
+        confidence DOUBLE,
+        status VARCHAR,
+        source VARCHAR,
+        updated_at VARCHAR
+    )""",
+    # Hygiene audit log: one row per transformation applied during a commit.
+    """CREATE TABLE IF NOT EXISTS hygiene_audit (
+        ts VARCHAR,
+        target_table VARCHAR,
+        filename VARCHAR,
+        step VARCHAR,
+        detail VARCHAR,
+        rows_affected INTEGER
+    )""",
+    # Quarantine queue: rows that failed validation, held for review / fix / re-import.
+    """CREATE TABLE IF NOT EXISTS quarantine (
+        id VARCHAR PRIMARY KEY,
+        ts VARCHAR,
+        target_table VARCHAR,
+        filename VARCHAR,
+        reasons VARCHAR,
+        payload VARCHAR
+    )""",
+]
+
+# Lightweight, idempotent migrations for stores created before a column existed.
+STUDIO_MIGRATIONS = [
+    "ALTER TABLE import_profiles ADD COLUMN IF NOT EXISTS hygiene VARCHAR",
 ]
 
 
@@ -83,6 +119,11 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(META_DDL)
     for ddl in STUDIO_DDL:
         con.execute(ddl)
+    for stmt in STUDIO_MIGRATIONS:
+        try:
+            con.execute(stmt)
+        except duckdb.Error:
+            pass  # best-effort migration; the column already exists or backend lacks IF NOT EXISTS
 
 
 def drop_all(con: duckdb.DuckDBPyConnection) -> None:
@@ -182,26 +223,36 @@ def rebuild_customers_from_lifts(con: duckdb.DuckDBPyConnection, replace: bool) 
         ) t
         WHERE t.customer_id NOT IN (SELECT customer_id FROM customers)
     """)
+    # Prefer the human master name from the crosswalk over the bare id, where we have one.
+    con.execute("""
+        UPDATE customers SET name = cw.master_name
+        FROM customer_crosswalk cw
+        WHERE cw.master_id = customers.customer_id
+          AND cw.status = 'confirmed'
+          AND cw.master_name IS NOT NULL
+          AND customers.name = customers.customer_id
+    """)
 
 
-# ---- Import profiles (saved column mappings) ------------------------------------
+# ---- Import profiles (saved column mappings + cleaning options) -----------------
 def save_import_profile(con, name: str, target_table: str, mapping_json: str,
-                        source_columns_json: str, created_at: str) -> None:
+                        source_columns_json: str, created_at: str,
+                        hygiene_json: str | None = None) -> None:
     con.execute("DELETE FROM import_profiles WHERE name = ?", [name])
     con.execute(
-        "INSERT INTO import_profiles (name, target_table, mapping, source_columns, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [name, target_table, mapping_json, source_columns_json, created_at],
+        "INSERT INTO import_profiles (name, target_table, mapping, source_columns, created_at, hygiene) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [name, target_table, mapping_json, source_columns_json, created_at, hygiene_json],
     )
 
 
 def list_import_profiles(con) -> list[dict]:
     rows = con.execute(
-        "SELECT name, target_table, mapping, source_columns, created_at "
+        "SELECT name, target_table, mapping, source_columns, created_at, hygiene "
         "FROM import_profiles ORDER BY created_at DESC"
     ).fetchall()
     return [{"name": r[0], "target_table": r[1], "mapping": r[2],
-             "source_columns": r[3], "created_at": r[4]} for r in rows]
+             "source_columns": r[3], "created_at": r[4], "hygiene": r[5]} for r in rows]
 
 
 def delete_import_profile(con, name: str) -> None:
@@ -224,3 +275,130 @@ def list_import_log(con, limit: int = 20) -> list[dict]:
     ).fetchall()
     return [{"imported_at": r[0], "target_table": r[1], "filename": r[2],
              "rows": int(r[3]) if r[3] is not None else 0, "mode": r[4]} for r in rows]
+
+
+# ---- Customer Master crosswalk --------------------------------------------------
+def get_crosswalk(con) -> dict[str, dict]:
+    """Map every known variant_key -> {master_id, master_name, confidence, status, source}."""
+    rows = con.execute(
+        "SELECT variant_key, master_id, master_name, confidence, status, source "
+        "FROM customer_crosswalk"
+    ).fetchall()
+    return {r[0]: {"master_id": r[1], "master_name": r[2],
+                   "confidence": float(r[3]) if r[3] is not None else None,
+                   "status": r[4], "source": r[5]} for r in rows}
+
+
+def list_crosswalk(con) -> list[dict]:
+    rows = con.execute(
+        "SELECT variant_key, master_id, master_name, confidence, status, source, updated_at "
+        "FROM customer_crosswalk ORDER BY master_id, variant_key"
+    ).fetchall()
+    return [{"variant_key": r[0], "master_id": r[1], "master_name": r[2],
+             "confidence": float(r[3]) if r[3] is not None else None,
+             "status": r[4], "source": r[5], "updated_at": r[6]} for r in rows]
+
+
+def upsert_crosswalk_entries(con, entries: list[dict]) -> int:
+    """Insert/replace crosswalk rows. Each entry: variant_key, master_id, master_name,
+    confidence, status, source, updated_at."""
+    n = 0
+    for e in entries:
+        con.execute("DELETE FROM customer_crosswalk WHERE variant_key = ?", [e["variant_key"]])
+        con.execute(
+            "INSERT INTO customer_crosswalk "
+            "(variant_key, master_id, master_name, confidence, status, source, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [e["variant_key"], e.get("master_id"), e.get("master_name"),
+             e.get("confidence"), e.get("status", "confirmed"),
+             e.get("source", "manual"), e.get("updated_at")],
+        )
+        n += 1
+    return n
+
+
+def delete_crosswalk_entry(con, variant_key: str) -> None:
+    con.execute("DELETE FROM customer_crosswalk WHERE variant_key = ?", [variant_key])
+
+
+def clear_crosswalk(con) -> None:
+    con.execute("DELETE FROM customer_crosswalk")
+
+
+# ---- Hygiene audit log ----------------------------------------------------------
+def log_hygiene_audit(con, at: str, target_table: str, filename: str,
+                      entries: list[dict]) -> None:
+    for e in entries:
+        con.execute(
+            "INSERT INTO hygiene_audit (ts, target_table, filename, step, detail, rows_affected) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [at, target_table, filename, e.get("step"), e.get("detail"),
+             int(e.get("rows_affected", 0) or 0)],
+        )
+
+
+def list_hygiene_audit(con, limit: int = 100) -> list[dict]:
+    rows = con.execute(
+        "SELECT ts, target_table, filename, step, detail, rows_affected "
+        "FROM hygiene_audit ORDER BY ts DESC LIMIT ?", [limit]
+    ).fetchall()
+    return [{"at": r[0], "target_table": r[1], "filename": r[2], "step": r[3],
+             "detail": r[4], "rows_affected": int(r[5]) if r[5] is not None else 0}
+            for r in rows]
+
+
+# ---- Quarantine queue -----------------------------------------------------------
+def add_quarantine(con, rows: list[dict]) -> int:
+    for r in rows:
+        con.execute(
+            "INSERT INTO quarantine (id, ts, target_table, filename, reasons, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [r["id"], r["at"], r["target_table"], r.get("filename"),
+             r.get("reasons"), r.get("payload")],
+        )
+    return len(rows)
+
+
+def list_quarantine(con, table: str | None = None, limit: int = 500) -> list[dict]:
+    if table:
+        rows = con.execute(
+            "SELECT id, ts, target_table, filename, reasons, payload FROM quarantine "
+            "WHERE target_table = ? ORDER BY ts DESC LIMIT ?", [table, limit]).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT id, ts, target_table, filename, reasons, payload FROM quarantine "
+            "ORDER BY ts DESC LIMIT ?", [limit]).fetchall()
+    return [{"id": r[0], "at": r[1], "target_table": r[2], "filename": r[3],
+             "reasons": r[4], "payload": r[5]} for r in rows]
+
+
+def quarantine_counts(con) -> dict[str, int]:
+    rows = con.execute(
+        "SELECT target_table, count(*) FROM quarantine GROUP BY 1").fetchall()
+    return {r[0]: int(r[1]) for r in rows}
+
+
+def get_quarantine_rows(con, ids: list[str]) -> list[dict]:
+    if not ids:
+        return []
+    placeholders = ", ".join("?" for _ in ids)
+    rows = con.execute(
+        f"SELECT id, ts, target_table, filename, reasons, payload FROM quarantine "
+        f"WHERE id IN ({placeholders})", ids).fetchall()
+    return [{"id": r[0], "at": r[1], "target_table": r[2], "filename": r[3],
+             "reasons": r[4], "payload": r[5]} for r in rows]
+
+
+def delete_quarantine(con, ids: list[str]) -> int:
+    if not ids:
+        return 0
+    placeholders = ", ".join("?" for _ in ids)
+    con.execute(f"DELETE FROM quarantine WHERE id IN ({placeholders})", ids)
+    return len(ids)
+
+
+def clear_quarantine(con, table: str | None = None) -> None:
+    if table:
+        con.execute("DELETE FROM quarantine WHERE target_table = ?", [table])
+    else:
+        con.execute("DELETE FROM quarantine")

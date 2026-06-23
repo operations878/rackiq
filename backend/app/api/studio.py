@@ -1,25 +1,30 @@
-"""Data Studio API — upload, column-mapping, validation, commit, and saved profiles.
+"""Data Studio + Data Hygiene Studio API — upload, profile, map, clean, validate, commit.
 
-This is the write side of RackIQ. Unlike the read endpoints (which can run against a
-read-only connection), Data Studio mutates the store while the server is live, so it uses
-the shared read/write connection guarded by ``db.lock()``. The flow is:
+This is the write side of RackIQ. It mutates the store while the server is live, so it uses
+the shared read/write connection guarded by ``db.lock()``. The full flow is:
 
-    inspect (file)  ->  validate (mapping)  ->  commit (mapping)
+    inspect (file + profiling)
+      -> crosswalk/propose + crosswalk/confirm   (Customer Master de-duplication)
+      -> validate (apply fixes -> run rules)      (drill-down preview + quarantine preview)
+      -> commit (apply fixes -> rules -> quarantine split -> write -> audit)
 
-On commit we coerce the mapped columns, hand the frame to the Hygiene Studio pipeline,
-write the canonical table, derive the customers dimension (for lifts), and recompute the
-capability matrix from the fields actually present.
+On commit we coerce the mapped columns, apply the approved hygiene fixes (trim, units, net-60
+correction, default fill, crosswalk resolution), run the validation rule engine, divert failing
+rows to quarantine (never silently dropped), write the clean rows, derive the customers
+dimension, log every transformation to the audit table, and recompute the capability matrix.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timezone
 
+import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from .. import capabilities, db, generator, hygiene, ingest, schema
+from .. import capabilities, crosswalk, data_health, db, generator, hygiene, ingest, schema, validation
 from . import queries
 
 router = APIRouter(prefix="/api/studio")
@@ -33,11 +38,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _now_us() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 # ---- Request bodies -------------------------------------------------------------
 class ValidateRequest(BaseModel):
     upload_id: str
     table: str
     mapping: dict[str, str]
+    options: dict | None = None
 
 
 class CommitRequest(BaseModel):
@@ -46,6 +56,7 @@ class CommitRequest(BaseModel):
     mapping: dict[str, str]
     mode: str = "replace"                       # "replace" | "append"
     save_profile: str | None = None
+    options: dict | None = None
 
 
 class SaveProfileRequest(BaseModel):
@@ -53,6 +64,25 @@ class SaveProfileRequest(BaseModel):
     table: str
     mapping: dict[str, str]
     source_columns: list[str] = Field(default_factory=list)
+    hygiene: dict | None = None
+
+
+class ProposeRequest(BaseModel):
+    upload_id: str
+    table: str
+    mapping: dict[str, str]
+    name_source: str | None = None
+    threshold: float = crosswalk.DEFAULT_THRESHOLD
+
+
+class ConfirmRequest(BaseModel):
+    groups: list[dict] = Field(default_factory=list)
+    rejected_keys: list[str] = Field(default_factory=list)
+
+
+class QuarantineRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    edits: dict[str, dict] = Field(default_factory=dict)
 
 
 class LoadDemoRequest(BaseModel):
@@ -65,7 +95,7 @@ class LoadDemoRequest(BaseModel):
 # ---- Helpers --------------------------------------------------------------------
 def _match_profile(con, source_columns: list[str]) -> dict | None:
     """Find the most recent saved profile whose source columns the file satisfies."""
-    file_cols = {c for c in source_columns}
+    file_cols = set(source_columns)
     for p in db.list_import_profiles(con):
         try:
             saved = set(json.loads(p["source_columns"] or "[]"))
@@ -76,6 +106,7 @@ def _match_profile(con, source_columns: list[str]) -> dict | None:
                 "name": p["name"],
                 "target_table": p["target_table"],
                 "mapping": json.loads(p["mapping"] or "{}"),
+                "hygiene": json.loads(p["hygiene"]) if p.get("hygiene") else None,
             }
     return None
 
@@ -88,6 +119,30 @@ def _state(con) -> dict:
     }
 
 
+def _date_targets(table: str) -> set[str]:
+    out = {f.name for f in schema.CANONICAL_FIELDS
+           if f.table == table and f.dtype in (schema.DType.DATE, schema.DType.TIMESTAMP)}
+    out |= {n for n, dt in schema.STRUCTURAL_COLUMNS.get(table, [])
+            if dt in (schema.DType.DATE, schema.DType.TIMESTAMP)}
+    return out
+
+
+def _raw_by_target(up_df: pd.DataFrame, index, mapping: dict[str, str], table: str) -> dict:
+    """Original source values for each date target, aligned to ``index`` (for parse checks)."""
+    dts = _date_targets(table)
+    out: dict[str, pd.Series] = {}
+    for src, target in mapping.items():
+        if target in dts and src in up_df.columns:
+            out[target] = up_df[src].reindex(index)
+    return out
+
+
+def _coerce_fix(up, table: str, mapping: dict[str, str], options: dict | None):
+    """Map -> coerce -> apply hygiene fixes. Returns (fixed_df, report, audit)."""
+    mapped, _ = ingest.build_mapped_frame(up.df, table, mapping)
+    return hygiene.apply_fixes(mapped, table, options, _con())
+
+
 # ---- Endpoints ------------------------------------------------------------------
 @router.get("/targets")
 def targets():
@@ -97,6 +152,8 @@ def targets():
         "table_labels": schema.TABLE_LABELS,
         "targets_by_table": {t: schema.import_targets(t) for t in schema.IMPORTABLE_TABLES},
         "required_keys": {t: schema.required_import_keys(t) for t in schema.IMPORTABLE_TABLES},
+        "customer_key_column": schema.CUSTOMER_KEY_COLUMN,
+        "defaultable_fields": schema.DEFAULTABLE_FIELDS,
     }
 
 
@@ -115,8 +172,73 @@ async def inspect(file: UploadFile = File(...)):
     payload["upload_id"] = upload_id
 
     with db.lock():
-        payload["matched_profile"] = _match_profile(_con(), list(df.columns))
+        con = _con()
+        payload["matched_profile"] = _match_profile(con, list(df.columns))
+        payload["crosswalk_size"] = len(db.get_crosswalk(con))
     return payload
+
+
+@router.post("/crosswalk/propose")
+def crosswalk_propose(req: ProposeRequest):
+    up = ingest.get_upload(req.upload_id)
+    if up is None:
+        raise HTTPException(status_code=404, detail="Upload expired — please re-upload the file.")
+    key_col = schema.customer_key_column(req.table)
+    if not key_col:
+        raise HTTPException(status_code=400,
+                            detail=f"{schema.TABLE_LABELS.get(req.table, req.table)} has no customer key to resolve.")
+    mapped, _ = ingest.build_mapped_frame(up.df, req.table, req.mapping)
+    if key_col not in mapped.columns:
+        raise HTTPException(status_code=400, detail=f"Map a column to '{key_col}' before resolving customers.")
+
+    keys = mapped[key_col].dropna().astype(str).str.strip()
+    keys = keys[keys != ""]
+    counts = keys.value_counts().to_dict()
+
+    names = None
+    if req.name_source and req.name_source in up.df.columns:
+        name_col = up.df[req.name_source]
+        tmp = pd.DataFrame({"k": keys, "nm": name_col.reindex(keys.index)})
+        names = {}
+        for k, grp in tmp.dropna(subset=["k"]).groupby("k"):
+            val = next((str(x).strip() for x in grp["nm"]
+                        if pd.notna(x) and str(x).strip()), None)
+            if val:
+                names[k] = val
+
+    with db.lock():
+        result = crosswalk.propose(_con(), counts, names, req.threshold)
+    result["key_column"] = key_col
+    return result
+
+
+@router.post("/crosswalk/confirm")
+def crosswalk_confirm(req: ConfirmRequest):
+    with db.lock():
+        con = _con()
+        out = crosswalk.confirm_groups(con, req.groups, req.rejected_keys, _now())
+        out["crosswalk"] = db.list_crosswalk(con)
+    return out
+
+
+@router.get("/crosswalk")
+def crosswalk_list():
+    with db.lock():
+        return {"crosswalk": db.list_crosswalk(_con())}
+
+
+@router.delete("/crosswalk/{variant_key}")
+def crosswalk_delete(variant_key: str):
+    with db.lock():
+        db.delete_crosswalk_entry(_con(), variant_key)
+    return {"ok": True}
+
+
+@router.post("/crosswalk/clear")
+def crosswalk_clear():
+    with db.lock():
+        db.clear_crosswalk(_con())
+    return {"ok": True}
 
 
 @router.post("/validate")
@@ -126,7 +248,21 @@ def validate(req: ValidateRequest):
         raise HTTPException(status_code=404, detail="Upload expired — please re-upload the file.")
     if req.table not in schema.IMPORTABLE_TABLES:
         raise HTTPException(status_code=400, detail=f"Unknown target table '{req.table}'.")
-    return ingest.validate(up.df, req.table, req.mapping)
+
+    base = ingest.validate(up.df, req.table, req.mapping)  # mapping validity + field stats
+
+    with db.lock():
+        fixed, report, _audit = _coerce_fix(up, req.table, req.mapping, req.options)
+        raw = _raw_by_target(up.df, fixed.index, req.mapping, req.table)
+        rules = validation.run_rules(fixed, req.table, req.options, raw, _con())
+
+    base["rules"] = rules["rules"]
+    base["fixes_preview"] = report
+    base["rule_errors"] = rules["n_errors"]
+    base["rule_warnings"] = rules["n_warnings"]
+    base["quarantine_count"] = rules["quarantine_count"] if (req.options or {}).get("quarantine_failures", True) else 0
+    base["clean_rows"] = int(len(fixed) - rules["quarantine_count"])
+    return base
 
 
 @router.post("/commit")
@@ -139,20 +275,42 @@ def commit(req: CommitRequest):
     if req.mode not in ("replace", "append"):
         raise HTTPException(status_code=400, detail="mode must be 'replace' or 'append'.")
 
-    report = ingest.validate(up.df, req.table, req.mapping)
-    if not report["can_commit"]:
+    base = ingest.validate(up.df, req.table, req.mapping)
+    if not base["can_commit"]:
         raise HTTPException(status_code=422, detail={"message": "Mapping is not valid.",
-                                                     "errors": report["errors"]})
+                                                     "errors": base["errors"]})
 
-    # Coerce to canonical types, then hand off to the Hygiene Studio pipeline.
-    mapped, _ = ingest.build_mapped_frame(up.df, req.table, req.mapping)
-    cleaned, hygiene_report = hygiene.run_pipeline(mapped, req.table)
+    opts = hygiene.HygieneOptions.from_dict(req.options)
 
     with db.lock():
         con = _con()
+        fixed, report, audit = _coerce_fix(up, req.table, req.mapping, req.options)
+        raw = _raw_by_target(up.df, fixed.index, req.mapping, req.table)
+        rules = validation.run_rules(fixed, req.table, opts.to_dict(), raw, con)
+
+        q_index = rules["quarantine_index"]
+        quarantined = fixed.loc[q_index] if q_index else fixed.iloc[0:0]
+        good = fixed.drop(index=q_index) if q_index else fixed
+
+        if opts.dedupe_exact:
+            good = hygiene.dedupe_exact(good, report, audit)
+
         if req.mode == "replace":
             db.truncate(con, req.table)
-        rows_written = db.insert_df(con, req.table, cleaned)
+        rows_written = db.insert_df(con, req.table, good.reset_index(drop=True))
+
+        # Route failing rows to quarantine (held for review) unless the user opted out.
+        n_quarantined = 0
+        if len(quarantined):
+            if opts.quarantine_failures:
+                n_quarantined = _quarantine_rows(con, req.table, up.filename, quarantined,
+                                                  rules["quarantine_reasons"])
+                audit.append({"step": "quarantine", "rows_affected": n_quarantined,
+                              "detail": f"Held {n_quarantined} failing row(s) for review."})
+            else:
+                audit.append({"step": "drop_invalid", "rows_affected": int(len(quarantined)),
+                              "detail": f"Dropped {len(quarantined)} invalid row(s) (quarantine disabled)."})
+
         if req.table == schema.LIFTS:
             db.rebuild_customers_from_lifts(con, replace=(req.mode == "replace"))
 
@@ -161,11 +319,13 @@ def commit(req: CommitRequest):
         db.set_meta(con, "last_import_table", req.table)
         db.set_meta(con, "last_import_filename", up.filename)
         db.log_import(con, _now(), req.table, up.filename, rows_written, req.mode)
+        db.log_hygiene_audit(con, _now_us(), req.table, up.filename, audit)
 
         if req.save_profile:
             db.save_import_profile(
                 con, req.save_profile.strip(), req.table,
-                json.dumps(req.mapping), json.dumps(list(up.df.columns)), _now())
+                json.dumps(req.mapping), json.dumps(list(up.df.columns)), _now(),
+                json.dumps(opts.to_dict()))
 
         state = _state(con)
 
@@ -175,10 +335,141 @@ def commit(req: CommitRequest):
         "mode": req.mode,
         "rows_written": rows_written,
         "rows_in_file": int(len(up.df)),
-        "hygiene": hygiene_report,
+        "quarantined": n_quarantined,
+        "hygiene": report,
+        "rules": rules["rules"],
         "saved_profile": req.save_profile or None,
         **state,
     }
+
+
+def _quarantine_rows(con, table: str, filename: str, frame: pd.DataFrame,
+                     reasons: dict) -> int:
+    cols = [c for c in schema.column_names(table) if c in frame.columns]
+    rows = []
+    for idx, row in frame.iterrows():
+        payload = {}
+        for c in cols:
+            v = row[c]
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                payload[c] = None
+            elif isinstance(v, (pd.Timestamp, datetime)):
+                payload[c] = str(v)
+            else:
+                payload[c] = v if not isinstance(v, float) else round(float(v), 4)
+        rows.append({
+            "id": uuid.uuid4().hex,
+            "at": _now_us(),
+            "target_table": table,
+            "filename": filename,
+            "reasons": json.dumps(reasons.get(idx, [])),
+            "payload": json.dumps(payload, default=str),
+        })
+    return db.add_quarantine(con, rows)
+
+
+@router.get("/quarantine")
+def quarantine_list(table: str | None = None):
+    with db.lock():
+        rows = db.list_quarantine(_con(), table)
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "at": r["at"], "target_table": r["target_table"],
+            "filename": r["filename"],
+            "reasons": json.loads(r["reasons"] or "[]"),
+            "payload": json.loads(r["payload"] or "{}"),
+        })
+    with db.lock():
+        counts = db.quarantine_counts(_con())
+    return {"rows": out, "counts": counts, "total": sum(counts.values())}
+
+
+@router.post("/quarantine/discard")
+def quarantine_discard(req: QuarantineRequest):
+    with db.lock():
+        if req.ids:
+            n = db.delete_quarantine(_con(), req.ids)
+        else:
+            db.clear_quarantine(_con())
+            n = -1
+    return {"ok": True, "discarded": n}
+
+
+@router.post("/quarantine/reimport")
+def quarantine_reimport(req: QuarantineRequest):
+    with db.lock():
+        con = _con()
+        rows = db.get_quarantine_rows(con, req.ids) if req.ids else db.list_quarantine(con)
+        by_table: dict[str, list[dict]] = {}
+        for r in rows:
+            by_table.setdefault(r["target_table"], []).append(r)
+
+        total_reimported, total_still = 0, 0
+        per_table = {}
+        for table, trows in by_table.items():
+            reimported, still = _reimport_table(con, table, trows, req.edits)
+            per_table[table] = {"reimported": reimported, "still_quarantined": still}
+            total_reimported += reimported
+            total_still += still
+            if table == schema.LIFTS and reimported:
+                db.rebuild_customers_from_lifts(con, replace=False)
+        if total_reimported:
+            db.set_meta(con, "last_import_at", _now())
+        state = _state(con)
+
+    return {"ok": True, "reimported": total_reimported, "still_quarantined": total_still,
+            "by_table": per_table, **state}
+
+
+def _reimport_table(con, table: str, rows: list[dict], edits: dict) -> tuple[int, int]:
+    records, ids = [], []
+    for r in rows:
+        payload = json.loads(r["payload"] or "{}")
+        payload.update(edits.get(r["id"], {}))
+        records.append(payload)
+        ids.append(r["id"])
+    if not records:
+        return 0, 0
+
+    df = pd.DataFrame(records)
+    raw_dates = {}
+    types = schema.column_types(table)
+    for col in list(df.columns):
+        dt = types.get(col)
+        if dt is None:
+            df = df.drop(columns=[col])
+            continue
+        if dt in (schema.DType.DATE, schema.DType.TIMESTAMP):
+            raw_dates[col] = df[col].copy()
+        coerced, _ = ingest.coerce_column(df[col], dt.value)
+        df[col] = coerced
+
+    # Re-importing hand-fixed rows: respect the corrected values (don't recompute net).
+    opts = hygiene.HygieneOptions(net_correction="off")
+    fixed, _report, _audit = hygiene.apply_fixes(df, table, opts, con)
+    raw = {t: s.reindex(fixed.index) for t, s in raw_dates.items()}
+    rules = validation.run_rules(fixed, table, opts.to_dict(), raw, con)
+
+    q_index = set(rules["quarantine_index"])
+    good = fixed.drop(index=list(q_index)) if q_index else fixed
+    db.insert_df(con, table, good.reset_index(drop=True))
+
+    passed_ids = [ids[i] for i in good.index]
+    db.delete_quarantine(con, passed_ids)
+    return len(passed_ids), len(q_index)
+
+
+@router.get("/data-health")
+def data_health_report():
+    with db.lock():
+        return data_health.compute(_con())
+
+
+@router.get("/audit")
+def audit_log(limit: int = 100):
+    with db.lock():
+        return {"audit": db.list_hygiene_audit(_con(), limit)}
 
 
 @router.get("/profiles")
@@ -192,6 +483,7 @@ def list_profiles():
             "target_table": r["target_table"],
             "mapping": json.loads(r["mapping"] or "{}"),
             "source_columns": json.loads(r["source_columns"] or "[]"),
+            "hygiene": json.loads(r["hygiene"]) if r.get("hygiene") else None,
             "created_at": r["created_at"],
         })
     return {"profiles": out}
@@ -205,7 +497,8 @@ def save_profile(req: SaveProfileRequest):
     with db.lock():
         db.save_import_profile(
             _con(), name, req.table, json.dumps(req.mapping),
-            json.dumps(req.source_columns), _now())
+            json.dumps(req.source_columns), _now(),
+            json.dumps(req.hygiene) if req.hygiene else None)
     return {"ok": True, "name": name}
 
 
