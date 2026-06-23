@@ -236,3 +236,74 @@ def import_targets(table: str) -> list[dict]:
 
 def required_import_keys(table: str) -> list[str]:
     return list(REQUIRED_IMPORT_KEYS.get(table, []))
+
+
+# ---- Data-quality / Hygiene Studio metadata -------------------------------------
+# The customer key column on each table that carries one (drives the Customer Master
+# crosswalk / de-duplication). Tables without one are skipped by entity resolution.
+CUSTOMER_KEY_COLUMN: dict[str, str] = {
+    LIFTS: "customer_id",
+    INVOICES: "customer_id",
+}
+
+# Canonical fields that represent a volume in gallons. These are the columns eligible
+# for unit standardization (barrels -> gallons) and the non-negative / sane-bound checks.
+VOLUME_FIELDS: set[str] = {
+    "net_gallons", "gross_gallons", "tank_capacity", "min_heel",
+    "inventory_snapshot", "physical_inventory", "receipts",
+    "committed_buys", "committed_sells",
+}
+
+# Canonical fields that represent a per-gallon price or a dollar amount.
+PRICE_FIELDS: set[str] = {"unit_price", "unit_cost", "market_price", "street_rack", "nyh_basis"}
+
+# Fields that must never be negative (a negative value is a hard data error).
+NONNEGATIVE_FIELDS: set[str] = VOLUME_FIELDS | {
+    "unit_price", "unit_cost", "market_price", "street_rack",
+    "invoice_amount", "credit_limit", "observed_temp",  # observed_temp in deg F, >0 in practice
+}
+
+# Inclusive (lo, hi) sane bounds per canonical field for the "within sane bounds" rule.
+# Values outside these are flagged (often a unit-mismatch or fat-finger), not auto-dropped.
+FIELD_BOUNDS: dict[str, tuple[float, float]] = {
+    "net_gallons": (0.0, 2_000_000.0),
+    "gross_gallons": (0.0, 2_000_000.0),
+    "observed_temp": (-20.0, 160.0),
+    "api_gravity": (0.0, 100.0),
+    "unit_price": (0.0, 50.0),
+    "unit_cost": (0.0, 50.0),
+    "market_price": (0.0, 50.0),
+    "street_rack": (0.0, 50.0),
+    "nyh_basis": (-5.0, 5.0),
+    "invoice_amount": (0.0, 100_000_000.0),
+    "credit_limit": (0.0, 1_000_000_000.0),
+    "tank_capacity": (0.0, 200_000_000.0),
+    "min_heel": (0.0, 50_000_000.0),
+    "inventory_snapshot": (0.0, 200_000_000.0),
+    "physical_inventory": (0.0, 200_000_000.0),
+    "receipts": (0.0, 200_000_000.0),
+    "committed_buys": (0.0, 1_000_000_000.0),
+    "committed_sells": (0.0, 1_000_000_000.0),
+}
+
+# Fields a user may fill from a default when missing (low-cardinality dimensional values).
+DEFAULTABLE_FIELDS: dict[str, list[str]] = {
+    LIFTS: ["terminal", "product"],
+    INVENTORY: ["terminal", "product"],
+    MARKET: ["terminal", "product"],
+}
+
+# Reasonable absolute date window for the "dates in range" rule (catches typo'd years).
+MIN_REASONABLE_YEAR = 1990
+MAX_REASONABLE_YEAR_OFFSET = 1   # now + this many years is the latest sane date
+
+# One US barrel = 42 US gallons (the only unit standardization we perform).
+GALLONS_PER_BARREL = 42.0
+
+
+def customer_key_column(table: str) -> str | None:
+    return CUSTOMER_KEY_COLUMN.get(table)
+
+
+def volume_fields_for_table(table: str) -> list[str]:
+    return [f.name for f in CANONICAL_FIELDS if f.table == table and f.name in VOLUME_FIELDS]

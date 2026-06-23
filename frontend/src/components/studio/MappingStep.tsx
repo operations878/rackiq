@@ -174,7 +174,7 @@ export default function MappingStep({
             title={missingRequired.length ? `Map: ${missingRequired.map(humanize).join(", ")}` : ""}
             className="rounded-lg bg-slate-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-40"
           >
-            {busy === "validate" ? "Validating…" : "Validate →"}
+            Next: Clean →
           </button>
         </div>
       </div>

@@ -136,15 +136,28 @@ fields, preview validation, and commit. Capabilities then flex from the fields a
 **Backend modules**
 - `app/ingest.py` — parse (CSV/TSV/Excel), **fuzzy header matching** (curated synonyms +
   string-similarity + token overlap), per-table mapping suggestions, target-table inference,
-  column inspection (samples / null-rate / dtype guess), type **coercion**, and **validation**.
-  Parsed uploads are cached in-process (bounded) keyed by an `upload_id` so inspect → validate
-  → commit don't re-transmit the file.
-- `app/hygiene.py` — the **Hygiene Studio pipeline seam** that commit hands off to *before*
-  the write: trim whitespace, drop all-null rows, drop rows missing a required key, and remove
-  exact-duplicate rows — each step returns a report. Conservative/lossless by default; the next
-  phase grows this into a configurable pipeline. Contract: `run_pipeline(df, table) → (df, report)`.
-- `app/api/studio.py` — the `/api/studio/*` endpoints, wiring ingest → hygiene → DuckDB and
-  recomputing the capability matrix on every write.
+  column inspection, type **coercion** (now with **mixed-format date** salvage — a day-first
+  retry pass), and mapping **validation**. Parsed uploads are cached in-process (bounded) keyed
+  by an `upload_id` so the wizard's steps don't re-transmit the file.
+- `app/profiling.py` — the **data-quality scorecard**: per column type, null %, distinct count,
+  min/max, sample values, outlier counts (IQR fences), and quality flags (mixed-type, high-null,
+  negatives, unparsed-dates, whitespace, constant) + an overall 0–100 score.
+- `app/crosswalk.py` — the **Customer Master crosswalk** (entity resolution / de-duplication):
+  fuzzy-clusters customer key variants into proposed merge groups with a confidence score,
+  persists confirm/reject decisions, and rewrites variant ids → master id on every commit.
+- `app/validation.py` — the **rule engine**: required-present, dates-parseable, dates-in-range,
+  volume-non-negative, value-bounds, duplicate-lifts, price≥cost — each with a severity, a count,
+  and **drill-down rows**; rules with `action="quarantine"` feed the quarantine index.
+- `app/hygiene.py` — the **configurable cleaning pipeline** (`HygieneOptions` → `apply_fixes`):
+  trim, drop-empty, **unit standardization** (bbl→gal ×42), **default fill**, **ASTM D1250
+  net(60°F) correction** (`vcf(api, temp, product)`), and **crosswalk resolution**. Each step
+  emits a human report line and a structured audit entry. `run_pipeline(df, table)` is kept as
+  the conservative lossless default.
+- `app/data_health.py` — the **standing health report**: composite quality score
+  (completeness · validity · consistency · resolution) + drift alerts (un-mapped/variant customer
+  codes, volume out of historical pattern) + quarantine/crosswalk/audit summaries.
+- `app/api/studio.py` — the `/api/studio/*` endpoints, orchestrating profile → map → fix →
+  validate → **quarantine split** → write → audit → recompute capabilities on every write.
 
 **Import targets.** A file targets exactly one canonical table; its columns map to that table's
 *import targets* = structural keys (grain/foreign keys) + that table's canonical fields. Required
@@ -156,30 +169,76 @@ invoices → `customer_id`; inventory → `snapshot_datetime, terminal, product`
 
 | Step | Endpoint | What it does |
 |---|---|---|
-| Inspect | `/api/studio/inspect` (multipart) | parse + stash; return columns, samples, null rates, suggested table, per-table fuzzy suggestions, mappable targets, and any matched saved profile |
-| Validate | `/api/studio/validate` | row count, date range, exact-duplicate count, per-field null rates & parse errors, missing-required + duplicate-target errors, `can_commit` |
-| Commit | `/api/studio/commit` | coerce → **hygiene pipeline** → write table (replace/append) → derive `customers` from lifts → recompute capabilities; returns rows written, hygiene report, fresh summary + capability matrix |
-| Targets | `GET /api/studio/targets` | static registry powering the mapping dropdowns |
-| Profiles | `GET/POST /api/studio/profiles`, `DELETE …/{name}` | save/list/delete named **mapping profiles**; a re-uploaded file whose columns satisfy a profile auto-applies it (one-click re-upload) |
+| Inspect | `/api/studio/inspect` (multipart) | parse + stash; return the **profiling scorecard** (columns + samples + null rates + distinct + min/max + outliers + flags + score), suggested table, per-table fuzzy suggestions, mappable targets, matched profile, crosswalk size |
+| Validate | `/api/studio/validate` | apply the chosen **hygiene fixes**, then run the **rule engine**: returns `rules` (with drill-down rows), `fixes_preview`, `quarantine_count`, `clean_rows`, plus the mapping-level `can_commit` |
+| Commit | `/api/studio/commit` | coerce → `apply_fixes` → run rules → **split quarantine** → write clean rows (replace/append) → derive `customers` (names from crosswalk) → log audit → recompute capabilities; returns rows written, quarantined count, hygiene report |
+| Targets | `GET /api/studio/targets` | static registry powering the mapping dropdowns (+ `customer_key_column`, `defaultable_fields`) |
+| Crosswalk | `POST …/crosswalk/propose`, `…/crosswalk/confirm`, `GET …/crosswalk`, `DELETE …/crosswalk/{key}`, `POST …/crosswalk/clear` | propose merge groups, persist confirm/reject, browse/edit the master crosswalk |
+| Quarantine | `GET …/quarantine`, `POST …/quarantine/reimport`, `…/quarantine/discard` | review held rows, fix-and-re-import (with edits), or discard |
+| Data health | `GET …/data-health` | the standing quality-score + drift report |
+| Audit | `GET …/audit` | recent hygiene transformations |
+| Profiles | `GET/POST /api/studio/profiles`, `DELETE …/{name}` | save/list/delete named **cleaning profiles** (mapping **+ hygiene options**); a re-uploaded file whose columns satisfy a profile auto-applies its mapping *and* its fix settings |
 | History | `GET /api/studio/history` | recent imports (table, filename, rows, mode) |
-| Demo / Reset | `/api/studio/load-demo`, `/api/studio/reset` | load the synthetic book (`core`/`lite`/`full`) or clear the store — both run in-process via the shared connection |
+| Demo / Reset | `/api/studio/load-demo`, `/api/studio/reset` | load the synthetic book (`core`/`lite`/`full`) or clear the store |
 
-Saved profiles and the import log live in dedicated tables (`import_profiles`, `import_log`) that
-**survive** demo regeneration / reset on purpose.
+Saved profiles, the import log, the **customer crosswalk**, the **hygiene audit log**, and the
+**quarantine queue** live in dedicated tables (`import_profiles`, `import_log`,
+`customer_crosswalk`, `hygiene_audit`, `quarantine`) that **survive** demo regeneration / reset on
+purpose — merge decisions and held rows are never lost when the book is reloaded.
 
-**Frontend** (`pages/DataStudio.tsx` + `components/studio/*`): a 4-step wizard — **Upload**
-(drag/drop, demo loader, reset, saved-profile list), **Map Columns** (target-table picker,
-per-column dropdowns with sample chips + auto-suggest confidence badges + duplicate-target
-guards + required-field checklist + "save as profile"), **Validate** (stat cards, per-field
-table, warnings/errors, replace/append), and **Commit** (rows written + hygiene report). A live
-**Data Capability** panel (`components/DataCapabilityPanel.tsx`) sits alongside every step: each
-feature is unlocked (green + coverage) or locked with a **"Feed me: &lt;field&gt;"** hint, updating
-the instant data lands.
+**Frontend** (`pages/DataStudio.tsx` + `components/studio/*`): a **5-step** wizard — **Upload**,
+**Map Columns**, **Clean** (`CleanStep` = `ProfilingScorecard` + `CustomerMasterPanel` +
+`FixOptions`), **Validate** (stat cards + fixes preview + rule cards with row-level drill-down),
+and **Commit** (rows written + hygiene report + quarantine link). A live **Data Capability** panel
+sits alongside, unlocking features the instant data lands.
+
+---
+
+## Data Hygiene Studio — clean before it lands
+
+The Hygiene Studio runs on **every upload, before the canonical write**. It is the **Clean** step
+of the wizard plus the standing **Data Health** page, and covers eight jobs:
+
+1. **Profiling scorecard** (`profiling.py`) — per-column type, null %, distinct, min/max, samples,
+   outlier count, and quality flags; an overall 0–100 score shown on upload.
+2. **Customer Master / de-duplication** (`crosswalk.py`) — *the most important job*. Fuzzy-clusters
+   the distinct customer keys (optionally aided by a name column) into **merge groups** with a
+   confidence score. You confirm or reject each (and may edit membership / master id+name). Decisions
+   persist in the **`customer_crosswalk`** table; `apply_to_frame` rewrites every variant → master id
+   on **every future commit**, so all downstream metrics read one resolved entity. Rejected keys are
+   pinned as singletons and never re-proposed.
+3. **Validation rules** (`validation.py`) — required-present, dates-parseable, dates-in-range,
+   volume-non-negative, value-bounds, duplicate-lifts (customer·datetime·net), price≥cost. Each
+   failure carries a **drill-down** to the offending rows.
+4. **Auto-fix with approval + audit** (`hygiene.apply_fixes`) — trim whitespace, **standardize units**
+   (barrels→gallons), parse mixed date formats, **fill terminal/product defaults**, resolve customers.
+   Toggled per import; every transformation is written to **`hygiene_audit`**.
+5. **Net (60°F) correction** — when `gross_gallons` is mapped, compute net via an **ASTM D1250-style
+   VCF** (`hygiene.vcf(api, temp, product)`); modes: `auto` (D1250 where temp+API exist), `factor`
+   (flat user factor), `gross` (net = gross), `off`. Gated on field availability.
+6. **Quarantine + re-import** — rows failing a hard rule (missing required, negative volume, opted-in
+   duplicate lifts) are diverted to the **`quarantine`** table instead of being dropped. The Data
+   Health page lets you edit the held values and **fix-and-re-import**, re-import all (re-run the
+   rules), or discard.
+7. **Reusable cleaning profiles** — saved profiles store the **mapping + hygiene options** together,
+   so a repeat upload is one click and consistent. The crosswalk is global, so merge decisions apply
+   regardless of profile.
+8. **Standing Data-Health dashboard** (`data_health.py`, `pages/DataHealth.tsx`) — composite quality
+   score with component bars, **drift alerts** (new/likely-variant customer codes, monthly volume
+   outside ±2σ of history), the quarantine queue, the crosswalk browser, and the audit log.
+
+**Net-60 correction (ASTM D1250-style).** `VCF = exp(−α·ΔT·(1 + 0.8·α·ΔT))`, `ΔT = T − 60°F`,
+`α = (K0 + K1·ρ₆₀)/ρ₆₀²` with `ρ₆₀ = (141.5/(131.5+API))·999.016 kg/m³` and product-group constants
+(gasoline / distillate / crude). `vcf=1.0` exactly at 60°F; hot → shrink, cold → expand.
 
 **Sample files.** `uv run rackiq-export-samples` writes `samples/{lifts,invoices,market_prices,
 inventory_snapshots}_sample.csv` (+ `lifts_sample.xlsx`) with *friendly* headers (e.g. "Customer",
 "Lift Date", "Sell Price", "Posted Rack") so the fuzzy matcher has something to chew on. Importing
-all four walks capabilities 9 → 12 → 14 → 17.
+all four walks capabilities 9 → 12 → 14 → 17. It also writes **deliberately-dirty** Hygiene Studio
+demo files: `samples/lifts_dirty.csv` (customer NAMES with spelling/ID variants of several
+customers, mixed/bad dates, negative volumes, exact-duplicate rows, stray whitespace) and
+`samples/lifts_barrels.csv` (volumes in barrels, for the unit-standardization toggle). `--no-dirty`
+skips them. Worked screenshots of the merge + fix flow live in `docs/hygiene-studio/`.
 
 ---
 
@@ -235,15 +294,17 @@ Interactive docs at `http://localhost:8000/docs`.
 ## Frontend
 
 Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A top nav switches
-between two pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`):
+between three pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`):
 
 - **Dashboard** (`pages/Dashboard.tsx`) — the "Connected — N customers loaded" banner, the live
   **capability-matrix grid** (enabled = green with coverage bar; disabled = grey with the missing
   fields), a monthly-volume bar chart, a market-price line chart, and a top-customers table
   (margin/DSO columns appear only when enabled). With no data it shows an empty state that points
   to Data Studio.
-- **Data Studio** (`pages/DataStudio.tsx`) — the upload → map → validate → commit wizard with its
-  live "Feed me &lt;field&gt;" capability panel (see **Data Studio** above).
+- **Data Studio** (`pages/DataStudio.tsx`) — the upload → map → **clean** → validate → commit
+  wizard with its live "Feed me &lt;field&gt;" capability panel (see **Data Studio** above).
+- **Data Health** (`pages/DataHealth.tsx`) — the standing quality score + drift alerts + quarantine
+  review + crosswalk browser + audit log. The nav shows a quarantine-count badge when rows are held.
 
 `App.tsx` owns `summary` + `capabilities`; Data Studio returns fresh copies on every write so the
 header badge and panels update without a reload.
@@ -265,7 +326,8 @@ uv run rackiq-serve                       # FastAPI on http://localhost:8000
 # First run boots EMPTY — feed it from Data Studio (upload or "Load demo data").
 # Optional: pre-seed the book from the CLI before serving:
 uv run rackiq-generate --seed 42 --profile full
-uv run rackiq-export-samples              # write sample CSV/XLSX into ../samples/
+uv run rackiq-export-samples              # write sample CSV/XLSX (+ dirty demo files) into ../samples/
+uv run pytest                             # run the test suite (units + e2e API flow)
 # rackiq-info  -> print row counts + enabled capability count
 ```
 
@@ -286,30 +348,36 @@ Open **http://localhost:5173**. Either click **Data Studio → Load demo data** 
 
 ```
 backend/
-  pyproject.toml            # uv project; scripts rackiq-generate/serve/info/export-samples
+  pyproject.toml            # uv project; scripts + [dependency-groups] dev (pytest, httpx) + pytest cfg
   app/
-    schema.py               # ★ canonical field registry + DDL + import targets (single source of truth)
-    db.py                   # DuckDB lifecycle, shared r/w connection + lock, casting bulk-insert, studio tables
+    schema.py               # ★ canonical field registry + DDL + import targets + hygiene metadata
+    db.py                   # DuckDB lifecycle, shared r/w connection + lock, studio + crosswalk/audit/quarantine tables
     capabilities.py         # ★ FEATURES registry + runtime matrix
     generator.py            # parameterized Soundview synthetic data + profiles
-    ingest.py               # Data Studio: parse, fuzzy mapping, inspect, validate, coerce
-    hygiene.py              # Hygiene Studio pipeline seam (run_pipeline → df, report)
-    cli.py                  # rackiq-generate / rackiq-serve / rackiq-info / rackiq-export-samples
+    ingest.py               # Data Studio: parse, fuzzy mapping, inspect (+profiling), validate, coerce
+    profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
+    crosswalk.py            # ★ Customer Master crosswalk — fuzzy merge groups, confirm/reject, apply
+    validation.py           # validation rule engine with row-level drill-down + quarantine index
+    hygiene.py              # configurable cleaning pipeline (HygieneOptions, apply_fixes, ASTM D1250 vcf)
+    data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
+    cli.py                  # rackiq-generate / rackiq-serve / rackiq-info / rackiq-export-samples (+dirty)
     config.py               # settings (db path, CORS, host/port)
     main.py                 # FastAPI app factory (routes + studio routers)
     api/{routes,queries}.py # read endpoints + SQL
-    api/studio.py           # /api/studio/* upload / map / validate / commit / profiles
+    api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health
+  tests/                    # pytest: test_hygiene_studio.py (units) + test_studio_api.py (e2e flow)
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
-samples/                    # generated sample CSV/XLSX for Data Studio (rackiq-export-samples)
+samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
+docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
 frontend/
   vite.config.ts            # react + tailwindcss plugins; /api dev proxy
   src/
     App.tsx, main.tsx, index.css
     lib/{useHashRoute,format}.ts
     api/{client,types}.ts
-    pages/{Dashboard,DataStudio}.tsx
+    pages/{Dashboard,DataStudio,DataHealth}.tsx
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel}.tsx
-    components/studio/{Stepper,UploadStep,MappingStep,ValidateStep,DoneStep}.tsx
+    components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep}.tsx
 CLAUDE.md
 ```
 
@@ -321,7 +389,20 @@ CLAUDE.md
 - The live server holds the DuckDB file **read/write** (one shared connection). Don't run the
   CLI `rackiq-generate`/`rackiq-info` against the served file while it's up — use the UI's
   **Load demo / Reset**, or stop the server (or target a separate `--db` path).
-- Hygiene dedupe is **exact-duplicate-only** by default (lossless); grain-aware dedupe is a
-  Hygiene Studio job for the next phase.
+- **Hygiene fixes are opt-in and ordered** (trim → drop-empty → units → defaults → net-60 →
+  resolve-customers); exact-duplicate removal is lossless, grain-aware duplicate *lifts* are
+  quarantined (not dropped) when that toggle is on.
+- **`at` is a reserved word in DuckDB** — the audit/quarantine tables use `ts` for the timestamp
+  column (the JSON still exposes `at`).
+- **Crosswalk resolution happens at commit** (variant ids are rewritten to master ids before the
+  write), so downstream queries need no crosswalk awareness; re-importing more data auto-resolves.
+- **Net-60 `auto` recomputes net from gross** wherever temp+API exist (it overwrites a provided
+  net with the corrected value); quarantine **re-import uses `net_correction="off"`** so hand-fixed
+  values are respected.
+- The studio persistence tables (`import_profiles`, `import_log`, `customer_crosswalk`,
+  `hygiene_audit`, `quarantine`) **survive reset/demo** by design; init runs an idempotent
+  `ALTER TABLE … ADD COLUMN IF NOT EXISTS hygiene` migration for pre-existing profile stores.
 - Uploads are cached in-process by `upload_id`; a server restart between map/commit means
   re-uploading the file (the UI surfaces this as "upload expired").
+- **Tests:** `uv run pytest` (dev group adds `pytest` + `httpx`); covers VCF, profiling, crosswalk,
+  validation, the hygiene pipeline, and the full API flow against a throwaway DuckDB.

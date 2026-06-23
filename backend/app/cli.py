@@ -117,6 +117,8 @@ def export_samples_main() -> None:
     ap.add_argument("--n-customers", type=int, default=24)
     ap.add_argument("--months", type=int, default=14)
     ap.add_argument("--limit", type=int, default=1200, help="Max rows per sample file.")
+    ap.add_argument("--no-dirty", action="store_true",
+                    help="Skip the deliberately-dirty Hygiene Studio demo files.")
     repo_root = Path(__file__).resolve().parent.parent.parent
     ap.add_argument("--out", default=str(repo_root / "samples"))
     args = ap.parse_args()
@@ -141,9 +143,85 @@ def export_samples_main() -> None:
                 xlsx_path = out_dir / f"{table}_sample.xlsx"
                 frame.to_excel(xlsx_path, index=False)
                 written.append((xlsx_path, len(frame)))
+
+        if not args.no_dirty:
+            for path, n in _write_dirty_samples(con, out_dir, args.limit, args.seed):
+                written.append((path, n))
     finally:
         con.close()
 
     print(f"Wrote {len(written)} sample file(s) to {out_dir}:")
     for path, n in written:
         print(f"  {path.name:28s} {n:>6d} rows")
+
+
+# Spelling/ID variants used to "dirty" customer names so de-duplication has work to do.
+def _name_variants(name: str) -> list[str]:
+    base = name.strip()
+    upper = base.upper()
+    return [
+        base,
+        f"{upper} ",                       # caps + trailing whitespace
+        base.replace(" ", "") ,            # de-spaced
+        f"{base} Inc",                     # legal-suffix variant
+        f"  {base} Dist",                  # leading whitespace + suffix
+    ]
+
+
+def _write_dirty_samples(con, out_dir: Path, limit: int, seed: int):
+    """Write deliberately-dirty lifts files to exercise the Data Hygiene Studio.
+
+    ``lifts_dirty.csv``  — customer NAMES (not codes) with spelling/ID variants of a few
+    customers (de-duplication), mixed/bad dates, a few negative volumes, exact-duplicate
+    rows, and stray whitespace. ``lifts_barrels.csv`` — the same shape with volumes in
+    barrels, to demonstrate unit standardization (bbl → gal).
+    """
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(seed + 1)
+    df = con.execute(
+        "SELECT c.name AS Customer, l.lift_datetime AS \"Lift Date\", l.net_gallons AS \"Net Gallons\", "
+        "l.terminal AS Terminal, l.product AS Product, l.gross_gallons AS \"Gross Gallons\", "
+        "l.observed_temp AS \"Temp (F)\", l.api_gravity AS \"API Gravity\", "
+        "l.unit_price AS \"Sell Price\", l.unit_cost AS \"Unit Cost\" "
+        "FROM lifts l JOIN customers c USING (customer_id) "
+        f"ORDER BY l.lift_datetime LIMIT {limit}"
+    ).df()
+    df["Lift Date"] = pd.to_datetime(df["Lift Date"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1) Inject spelling/ID variants for the four busiest customers (de-duplication target).
+    busy = df["Customer"].value_counts().head(4).index.tolist()
+    for name in busy:
+        variants = _name_variants(name)
+        idx = df.index[df["Customer"] == name].tolist()
+        for i in idx:
+            df.at[i, "Customer"] = variants[int(rng.integers(0, len(variants)))]
+
+    # 2) A few mixed-format and bad dates.
+    bad_dates = ["13/02/2024", "2024-13-45", "not a date", "07/22/2023"]
+    for i in rng.choice(df.index, size=max(3, len(df) // 60), replace=False):
+        df.at[i, "Lift Date"] = bad_dates[int(rng.integers(0, len(bad_dates)))]
+
+    # 3) A few negative volumes (will be quarantined, never silently stored). Negate both
+    #    net and gross so the anomaly survives net-60 recomputation from gross.
+    for i in rng.choice(df.index, size=max(4, len(df) // 100), replace=False):
+        df.at[i, "Net Gallons"] = -abs(float(df.at[i, "Net Gallons"]))
+        df.at[i, "Gross Gallons"] = -abs(float(df.at[i, "Gross Gallons"]))
+
+    # 4) Some exact-duplicate rows appended (hygiene removes these losslessly).
+    dupes = df.loc[rng.choice(df.index, size=max(3, len(df) // 80), replace=False)]
+    df = pd.concat([df, dupes], ignore_index=True)
+
+    dirty_path = out_dir / "lifts_dirty.csv"
+    df.to_csv(dirty_path, index=False)
+
+    # Barrels variant (volumes ÷ 42) for the unit-standardization demo.
+    bbl = df.head(max(60, limit // 4)).copy()
+    bbl = bbl[~bbl["Net Gallons"].astype(str).str.startswith("-")]  # keep it tidy
+    for col in ("Net Gallons", "Gross Gallons"):
+        bbl[col] = (pd.to_numeric(bbl[col], errors="coerce") / 42.0).round(2)
+    bbl_path = out_dir / "lifts_barrels.csv"
+    bbl.to_csv(bbl_path, index=False)
+
+    return [(dirty_path, len(df)), (bbl_path, len(bbl))]

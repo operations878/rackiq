@@ -1,6 +1,7 @@
 const STEPS = [
   { key: "upload", label: "Upload" },
   { key: "map", label: "Map Columns" },
+  { key: "clean", label: "Clean" },
   { key: "validate", label: "Validate" },
   { key: "done", label: "Commit" },
 ];
