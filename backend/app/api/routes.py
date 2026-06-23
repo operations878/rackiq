@@ -1,4 +1,9 @@
-"""HTTP API — thin endpoints that open a read-only DuckDB connection per request."""
+"""HTTP API — read endpoints over the shared DuckDB connection.
+
+All API access (reads here, writes in ``studio.py``) goes through the one shared
+read/write connection guarded by ``db.lock()``. Data Studio mutates the store while the
+server is live, so reads must see those writes — a single shared connection guarantees it.
+"""
 
 from __future__ import annotations
 
@@ -11,67 +16,47 @@ router = APIRouter(prefix="/api")
 
 
 def _con():
-    return db.get_connection(read_only=True)
+    return db.get_shared_connection()
 
 
 @router.get("/health")
 def health():
-    con = _con()
-    try:
-        return {"status": "ok", "version": __version__, "profile": db.get_meta(con, "profile", "unknown")}
-    finally:
-        con.close()
+    with db.lock():
+        con = _con()
+        return {"status": "ok", "version": __version__, "profile": db.get_meta(con, "profile", "empty")}
 
 
 @router.get("/summary")
 def summary():
-    con = _con()
-    try:
-        return queries.get_summary(con)
-    finally:
-        con.close()
+    with db.lock():
+        return queries.get_summary(_con())
 
 
 @router.get("/schema")
 def schema_endpoint():
-    con = _con()
-    try:
-        return queries.get_schema(con)
-    finally:
-        con.close()
+    with db.lock():
+        return queries.get_schema(_con())
 
 
 @router.get("/capabilities")
 def capabilities_endpoint():
-    con = _con()
-    try:
-        return capabilities.compute_capabilities(con)
-    finally:
-        con.close()
+    with db.lock():
+        return capabilities.compute_capabilities(_con())
 
 
 @router.get("/customers")
 def customers():
-    con = _con()
-    try:
-        return queries.get_customers(con)
-    finally:
-        con.close()
+    with db.lock():
+        return queries.get_customers(_con())
 
 
 @router.get("/market-prices")
 def market_prices(product: str | None = Query(default=None)):
-    con = _con()
-    try:
-        return queries.get_market_prices(con, product)
-    finally:
-        con.close()
+    with db.lock():
+        return queries.get_market_prices(_con(), product)
 
 
 @router.get("/monthly-volume")
 def monthly_volume():
-    con = _con()
-    try:
-        return queries.get_monthly_volume(con)
-    finally:
-        con.close()
+    with db.lock():
+        return queries.get_monthly_volume(_con())

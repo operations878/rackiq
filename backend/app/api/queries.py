@@ -30,8 +30,13 @@ def get_summary(con) -> dict:
             "end": str(rng[1].date()) if rng[1] else None,
         },
         "total_net_gallons": round(float(total), 1),
-        "profile": db.get_meta(con, "profile", "unknown"),
+        "profile": db.get_meta(con, "profile", "empty"),
         "generated_at": db.get_meta(con, "generated_at"),
+        "last_import": {
+            "filename": db.get_meta(con, "last_import_filename"),
+            "table": db.get_meta(con, "last_import_table"),
+            "at": db.get_meta(con, "last_import_at"),
+        },
     }
 
 

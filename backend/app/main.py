@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
 from .api.routes import router
+from .api.studio import router as studio_router
 from .config import settings
 
 
@@ -20,6 +21,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(router)
+    app.include_router(studio_router)
 
     @app.get("/")
     def root():

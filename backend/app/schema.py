@@ -164,3 +164,75 @@ def optional_field_names() -> list[str]:
 
 def optional_fields_for_table(table: str) -> list[str]:
     return [f.name for f in CANONICAL_FIELDS if f.table == table and not f.required]
+
+
+# ---- Import targets (Data Studio column-mapping) --------------------------------
+# A file imported through Data Studio targets exactly one canonical table. Its columns
+# map to that table's *import targets*: the structural keys (grain/foreign keys) plus the
+# canonical fields whose primary table is this one. A subset of those targets are
+# REQUIRED before the file can be committed (e.g. lifts needs the 3 core fields; an AR
+# file needs at least customer_id; an inventory file needs its grain keys).
+
+# Human-facing labels + the row grain each table represents (shown in the wizard).
+TABLE_LABELS: dict[str, str] = {
+    LIFTS: "Lifts / Sales Book",
+    INVOICES: "Accounts Receivable (Invoices)",
+    INVENTORY: "Inventory Snapshots",
+    MARKET: "Market Prices",
+}
+
+# Descriptions for the structural (non-canonical) columns so the mapping UI can explain
+# every dropdown option, not just canonical fields.
+STRUCTURAL_DESCRIPTIONS: dict[str, str] = {
+    "snapshot_datetime": "Timestamp of the inventory reading (grain key).",
+    "price_date": "Date of the market quote (grain key).",
+    "terminal": "Terminal (dimensional key on this table).",
+    "product": "Product (dimensional key on this table).",
+    "customer_id": "Customer identifier (foreign key on this table).",
+}
+
+# Columns that must be mapped before a file can be committed into each table.
+REQUIRED_IMPORT_KEYS: dict[str, list[str]] = {
+    LIFTS: ["customer_id", "lift_datetime", "net_gallons"],
+    INVOICES: ["customer_id"],
+    INVENTORY: ["snapshot_datetime", "terminal", "product"],
+    MARKET: ["price_date", "product"],
+}
+
+# The single datetime/date column that defines a table's time axis (for date-range stats).
+PRIMARY_TIME_COLUMN: dict[str, str] = {
+    LIFTS: "lift_datetime",
+    INVOICES: "invoice_date",
+    INVENTORY: "snapshot_datetime",
+    MARKET: "price_date",
+}
+
+# Tables a user can import into (customers is derived from lifts, never imported directly).
+IMPORTABLE_TABLES = [LIFTS, INVOICES, INVENTORY, MARKET]
+
+
+def import_targets(table: str) -> list[dict]:
+    """Ordered mappable columns for an import into ``table``.
+
+    Each target carries enough metadata for the wizard's dropdowns: whether it is a
+    canonical field (vs a structural key), whether it is required to commit, its declared
+    type, and a human description.
+    """
+    required = set(REQUIRED_IMPORT_KEYS.get(table, []))
+    out: list[dict] = []
+    for name, dt, field_required in physical_columns(table):
+        f = FIELDS_BY_NAME.get(name)
+        is_canonical = f is not None and f.table == table
+        desc = f.description if is_canonical else STRUCTURAL_DESCRIPTIONS.get(name, "")
+        out.append({
+            "name": name,
+            "dtype": dt.value,
+            "canonical": is_canonical,
+            "required": (name in required) or field_required,
+            "description": desc,
+        })
+    return out
+
+
+def required_import_keys(table: str) -> list[str]:
+    return list(REQUIRED_IMPORT_KEYS.get(table, []))

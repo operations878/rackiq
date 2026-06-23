@@ -24,25 +24,34 @@ Monorepo with a Python backend and a React frontend.
             │  backend/  (FastAPI + DuckDB)                             │
             │                                                          │
   generator.py ──drop+recreate+bulk insert──▶  DuckDB (data/rackiq.duckdb)
+   ingest.py ─▶ hygiene.py ─▶ canonical tables ──▶      │               │
             │                                          │               │
             │   schema.py  ── single source of truth ──┤               │
             │   capabilities.py ── reads non-null cols ┘               │
             │        │                                                 │
-            │   api/ (routes + queries) ──▶ /api/* JSON                │
+            │   api/routes.py  (reads)   api/studio.py (uploads/writes)│
+            │        └──────────────▶ /api/* JSON ◀─────────┘          │
             └────────────────────────────────────┬─────────────────────┘
                                                   │  (Vite dev proxy /api → :8000)
             ┌─────────────────────────────────────▼────────────────────┐
             │  frontend/ (Vite + React + TS + Tailwind v4 + Recharts)   │
-            │  ConnectionBanner · CapabilityGrid · Volume/Market charts │
+            │  Dashboard  ·  Data Studio (upload → map → validate → go) │
             └──────────────────────────────────────────────────────────┘
 ```
 
 - **Storage:** a single DuckDB file at `backend/data/rackiq.duckdb` (gitignored,
-  regenerable). The API opens short-lived **read-only** connections per request; the
-  generator opens read/write and does drop-and-recreate. Never serve and regenerate
-  against the same file simultaneously (DuckDB is single-writer).
+  regenerable). Because **Data Studio writes while the server is live**, the API process
+  holds ONE long-lived **read/write** connection (`db.get_shared_connection()`) guarded by
+  a process-wide lock (`db.lock()`); all reads and writes go through it. DuckDB is
+  single-writer *per process*, so while the server runs it holds the file lock — use the
+  UI's **Load demo / Reset** (or stop the server) instead of the CLI generator against the
+  served file.
+- **First run is empty:** with no DuckDB file, the shared connection initializes empty
+  canonical tables. The app boots to a "no data — open Data Studio" state; you feed it via
+  upload or the demo button. Nothing needs to be generated up front.
 - **Single source of truth:** `backend/app/schema.py` declares every canonical field once.
-  DDL, the generator, capability detection, and the API all derive from it.
+  DDL, the generator, capability detection, the Data Studio import targets, and the API all
+  derive from it.
 
 ---
 
@@ -119,6 +128,61 @@ rackiq-generate --profile full   #  capabilities enabled: 17/17
 
 ---
 
+## Data Studio — the front door for feeding RackIQ
+
+Data Studio is how a real book gets in: upload a CSV/Excel file, map its columns to canonical
+fields, preview validation, and commit. Capabilities then flex from the fields actually present.
+
+**Backend modules**
+- `app/ingest.py` — parse (CSV/TSV/Excel), **fuzzy header matching** (curated synonyms +
+  string-similarity + token overlap), per-table mapping suggestions, target-table inference,
+  column inspection (samples / null-rate / dtype guess), type **coercion**, and **validation**.
+  Parsed uploads are cached in-process (bounded) keyed by an `upload_id` so inspect → validate
+  → commit don't re-transmit the file.
+- `app/hygiene.py` — the **Hygiene Studio pipeline seam** that commit hands off to *before*
+  the write: trim whitespace, drop all-null rows, drop rows missing a required key, and remove
+  exact-duplicate rows — each step returns a report. Conservative/lossless by default; the next
+  phase grows this into a configurable pipeline. Contract: `run_pipeline(df, table) → (df, report)`.
+- `app/api/studio.py` — the `/api/studio/*` endpoints, wiring ingest → hygiene → DuckDB and
+  recomputing the capability matrix on every write.
+
+**Import targets.** A file targets exactly one canonical table; its columns map to that table's
+*import targets* = structural keys (grain/foreign keys) + that table's canonical fields. Required
+mappings per table (must be set to commit): lifts → `customer_id, lift_datetime, net_gallons`;
+invoices → `customer_id`; inventory → `snapshot_datetime, terminal, product`; market →
+`price_date, product`. Derived in `schema.import_targets(table)` from the single source of truth.
+
+**Wizard flow** (`POST` unless noted):
+
+| Step | Endpoint | What it does |
+|---|---|---|
+| Inspect | `/api/studio/inspect` (multipart) | parse + stash; return columns, samples, null rates, suggested table, per-table fuzzy suggestions, mappable targets, and any matched saved profile |
+| Validate | `/api/studio/validate` | row count, date range, exact-duplicate count, per-field null rates & parse errors, missing-required + duplicate-target errors, `can_commit` |
+| Commit | `/api/studio/commit` | coerce → **hygiene pipeline** → write table (replace/append) → derive `customers` from lifts → recompute capabilities; returns rows written, hygiene report, fresh summary + capability matrix |
+| Targets | `GET /api/studio/targets` | static registry powering the mapping dropdowns |
+| Profiles | `GET/POST /api/studio/profiles`, `DELETE …/{name}` | save/list/delete named **mapping profiles**; a re-uploaded file whose columns satisfy a profile auto-applies it (one-click re-upload) |
+| History | `GET /api/studio/history` | recent imports (table, filename, rows, mode) |
+| Demo / Reset | `/api/studio/load-demo`, `/api/studio/reset` | load the synthetic book (`core`/`lite`/`full`) or clear the store — both run in-process via the shared connection |
+
+Saved profiles and the import log live in dedicated tables (`import_profiles`, `import_log`) that
+**survive** demo regeneration / reset on purpose.
+
+**Frontend** (`pages/DataStudio.tsx` + `components/studio/*`): a 4-step wizard — **Upload**
+(drag/drop, demo loader, reset, saved-profile list), **Map Columns** (target-table picker,
+per-column dropdowns with sample chips + auto-suggest confidence badges + duplicate-target
+guards + required-field checklist + "save as profile"), **Validate** (stat cards, per-field
+table, warnings/errors, replace/append), and **Commit** (rows written + hygiene report). A live
+**Data Capability** panel (`components/DataCapabilityPanel.tsx`) sits alongside every step: each
+feature is unlocked (green + coverage) or locked with a **"Feed me: &lt;field&gt;"** hint, updating
+the instant data lands.
+
+**Sample files.** `uv run rackiq-export-samples` writes `samples/{lifts,invoices,market_prices,
+inventory_snapshots}_sample.csv` (+ `lifts_sample.xlsx`) with *friendly* headers (e.g. "Customer",
+"Lift Date", "Sell Price", "Posted Rack") so the fuzzy matcher has something to chew on. Importing
+all four walks capabilities 9 → 12 → 14 → 17.
+
+---
+
 ## Synthetic data generator
 
 `backend/app/generator.py` builds a realistic, deterministic-per-seed "Soundview" book:
@@ -150,7 +214,9 @@ recent invoices left **open** (`paid_date` NULL); inventory book rolls forward
 
 ## API endpoints
 
-All return JSON; all open read-only DuckDB connections.
+All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
+live in `api/routes.py`; the `/api/studio/*` write/upload endpoints are in `api/studio.py`
+(see **Data Studio** above).
 
 | Endpoint | Purpose |
 |---|---|
@@ -168,11 +234,19 @@ Interactive docs at `http://localhost:8000/docs`.
 
 ## Frontend
 
-Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. The shell renders the
-"Connected — N customers loaded" banner, the live **capability-matrix grid** (enabled =
-green with coverage bar; disabled = grey with the missing fields), a monthly-volume bar
-chart, a market-price line chart, and a top-customers table (margin/DSO columns appear only
-when enabled).
+Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A top nav switches
+between two pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`):
+
+- **Dashboard** (`pages/Dashboard.tsx`) — the "Connected — N customers loaded" banner, the live
+  **capability-matrix grid** (enabled = green with coverage bar; disabled = grey with the missing
+  fields), a monthly-volume bar chart, a market-price line chart, and a top-customers table
+  (margin/DSO columns appear only when enabled). With no data it shows an empty state that points
+  to Data Studio.
+- **Data Studio** (`pages/DataStudio.tsx`) — the upload → map → validate → commit wizard with its
+  live "Feed me &lt;field&gt;" capability panel (see **Data Studio** above).
+
+`App.tsx` owns `summary` + `capabilities`; Data Studio returns fresh copies on every write so the
+header badge and panels update without a reload.
 
 Tailwind v4 is wired via `@tailwindcss/vite`; `src/index.css` is just `@import "tailwindcss";`
 — there is intentionally **no** `tailwind.config.js` or `postcss.config.js`.
@@ -187,8 +261,11 @@ Prereqs: Python ≥ 3.11, `uv`, Node ≥ 20, `npm`.
 ```bash
 cd backend
 uv sync                                   # install deps into .venv
-uv run rackiq-generate --seed 42 --profile full   # build the DuckDB book
 uv run rackiq-serve                       # FastAPI on http://localhost:8000
+# First run boots EMPTY — feed it from Data Studio (upload or "Load demo data").
+# Optional: pre-seed the book from the CLI before serving:
+uv run rackiq-generate --seed 42 --profile full
+uv run rackiq-export-samples              # write sample CSV/XLSX into ../samples/
 # rackiq-info  -> print row counts + enabled capability count
 ```
 
@@ -200,8 +277,8 @@ npm run dev                               # http://localhost:5173 (proxies /api 
 # npm run build  -> type-check + production build into dist/
 ```
 
-Open **http://localhost:5173**. Regenerate with `--profile core` / `lite` / `full` and
-refresh to watch the capability grid flex.
+Open **http://localhost:5173**. Either click **Data Studio → Load demo data** (`core`/`lite`/
+`full`) or upload `samples/*.csv` and map the columns, and watch the capability grid flex.
 
 ---
 
@@ -209,23 +286,30 @@ refresh to watch the capability grid flex.
 
 ```
 backend/
-  pyproject.toml            # uv project; console scripts rackiq-generate/serve/info
+  pyproject.toml            # uv project; scripts rackiq-generate/serve/info/export-samples
   app/
-    schema.py               # ★ canonical field registry + DDL (single source of truth)
-    db.py                   # DuckDB lifecycle, casting bulk-insert, meta table
+    schema.py               # ★ canonical field registry + DDL + import targets (single source of truth)
+    db.py                   # DuckDB lifecycle, shared r/w connection + lock, casting bulk-insert, studio tables
     capabilities.py         # ★ FEATURES registry + runtime matrix
     generator.py            # parameterized Soundview synthetic data + profiles
-    cli.py                  # rackiq-generate / rackiq-serve / rackiq-info
+    ingest.py               # Data Studio: parse, fuzzy mapping, inspect, validate, coerce
+    hygiene.py              # Hygiene Studio pipeline seam (run_pipeline → df, report)
+    cli.py                  # rackiq-generate / rackiq-serve / rackiq-info / rackiq-export-samples
     config.py               # settings (db path, CORS, host/port)
-    main.py                 # FastAPI app factory
-    api/{routes,queries}.py # endpoints + SQL
-  data/rackiq.duckdb        # generated, gitignored
+    main.py                 # FastAPI app factory (routes + studio routers)
+    api/{routes,queries}.py # read endpoints + SQL
+    api/studio.py           # /api/studio/* upload / map / validate / commit / profiles
+  data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
+samples/                    # generated sample CSV/XLSX for Data Studio (rackiq-export-samples)
 frontend/
   vite.config.ts            # react + tailwindcss plugins; /api dev proxy
   src/
     App.tsx, main.tsx, index.css
+    lib/{useHashRoute,format}.ts
     api/{client,types}.ts
-    components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart}.tsx
+    pages/{Dashboard,DataStudio}.tsx
+    components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel}.tsx
+    components/studio/{Stepper,UploadStep,MappingStep,ValidateStep,DoneStep}.tsx
 CLAUDE.md
 ```
 
@@ -234,5 +318,10 @@ CLAUDE.md
 - DuckDB bulk insert casts each column to its declared schema type, so pandas
   datetime → DATE/TIMESTAMP and `NaT` → NULL are handled in `db.insert_df`.
 - Coverage is measured against each field's **own** table row count.
-- Don't run `rackiq-generate` while `rackiq-serve` holds the file (single-writer); stop the
-  server, regenerate, restart — or generate into a separate `--db` path.
+- The live server holds the DuckDB file **read/write** (one shared connection). Don't run the
+  CLI `rackiq-generate`/`rackiq-info` against the served file while it's up — use the UI's
+  **Load demo / Reset**, or stop the server (or target a separate `--db` path).
+- Hygiene dedupe is **exact-duplicate-only** by default (lossless); grain-aware dedupe is a
+  Hygiene Studio job for the next phase.
+- Uploads are cached in-process by `upload_id`; a server restart between map/commit means
+  re-uploading the file (the UI surfaces this as "upload expired").
