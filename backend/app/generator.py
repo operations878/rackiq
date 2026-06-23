@@ -8,7 +8,7 @@ Data PROFILES let the generator omit optional field groups so the capability mat
 visibly flexes:
   - core : only the 3 required fields populated (no inventory / invoices / market) -> 4 features
   - lite : core + terminal + product on lifts                                       -> 6 features
-  - full : every canonical field populated                                          -> 17 features
+  - full : every canonical field populated                                          -> 21 features
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from . import db, schema
+from .hygiene import vcf as _astm_vcf
 
 
 # ---- Configuration --------------------------------------------------------------
@@ -338,49 +339,149 @@ def _build_invoices(cfg: GenConfig, lifts, profiles, rng):
     return df
 
 
-def _build_inventory(cfg: GenConfig, lifts, dates, rng):
-    cols = schema.column_names(schema.INVENTORY)
+def _tank_id_for(t: str, p: str) -> str:
+    return f"{t[:3].upper()}-{p}-1"
+
+
+def _meter_id_for(t: str, p: str) -> str:
+    return f"MTR-{t[:3].upper()}-{p}"
+
+
+# Per-tank loss scenarios deliberately seeded into the synthetic book so the reconciliation
+# module has something real to find. Assigned deterministically over the sorted (terminal,
+# product) tanks so the same offenders appear for a given book:
+#   bad_vcf   : the loading meter's temperature probe reads hot → it over-corrects → the
+#               billed net is systematically below an independent ASTM D1250 recompute
+#               (a VCF/probe calibration problem, temperature-correlated). [measurement]
+#   drift     : the meter totalizer drifts low over time → billed net runs progressively
+#               under the true draw → tank loss-% trends up out of control. [measurement]
+#   high_evap : elevated physical shrink (evaporation / line-fill / theft). [physical]
+#   routine   : ordinary small shrink + gauge noise.
+_DRIFT_MAX = 0.006          # meter under-reads up to 0.6% by end of horizon
+_BAD_VCF_PROBE_ERR = 5.0    # deg F the bad lane's temperature probe reads high
+_EVAP_RATE = 0.0005         # routine physical shrink as a fraction of true throughput
+_HIGH_EVAP_MULT = 4.0       # the seeded physical-loss tank
+_GAUGE_SD_FRAC = 0.0003     # gauge-reading noise as a fraction of capacity
+
+
+def _tank_scenarios(lifts) -> tuple[dict, list]:
+    keys = sorted({(t, p) for t, p in zip(lifts["terminal"], lifts["product"])
+                   if t is not None and p is not None})
+    scen = {k: "routine" for k in keys}
+    if len(keys) >= 1:
+        scen[keys[0]] = "bad_vcf"
+    if len(keys) >= 2:
+        scen[keys[1]] = "drift"
+    if len(keys) >= 3:
+        scen[keys[2]] = "high_evap"
+    if len(keys) >= 4:
+        scen[keys[3]] = "drift"
+    return scen, keys
+
+
+def _build_bol_compartments(cfg: GenConfig, lifts, dates, ambient, rng):
+    """Explode each lift into a bill-of-lading with 1-N metered compartments.
+
+    The compartments' BILLED net (the meter ticket) sums to the lift's net, but the TRUE
+    physical net diverges per the tank's seeded meter scenario; gross is derived from the
+    true net via ASTM D1250 so an independent recompute (engine side) recovers the truth and
+    the net-recon cross-check can flag the billed-vs-recomputed gap. Also returns the per
+    (terminal, product, day) BILLED and TRUE draws used to roll book vs physical inventory.
+    """
+    cols = schema.column_names(schema.BOL)
+    draw_billed: dict = defaultdict(float)
+    draw_true: dict = defaultdict(float)
     if lifts is None or len(lifts) == 0:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=cols), draw_billed, draw_true
+
     n = len(dates)
     date_index = {d: i for i, d in enumerate(dates)}
-    tmp = lifts.copy()
-    tmp["d"] = tmp["lift_datetime"].dt.date
-    grp = tmp.groupby(["terminal", "product", "d"])["net_gallons"].sum().reset_index()
-
-    draw = {}
-    total_draw = defaultdict(float)
-    max_day = defaultdict(float)
-    for r in grp.itertuples(index=False):
-        di = date_index.get(r.d)
+    scen, _keys = _tank_scenarios(lifts)
+    rows = []
+    seq = 0
+    for r in lifts.itertuples(index=False):
+        t, p = r.terminal, r.product
+        if t is None or p is None:
+            continue
+        bdt = pd.Timestamp(r.lift_datetime)
+        di = date_index.get(bdt.date())
         if di is None:
             continue
-        v = float(r.net_gallons)
-        draw[(r.terminal, r.product, di)] = v
-        total_draw[(r.terminal, r.product)] += v
-        max_day[(r.terminal, r.product)] = max(max_day[(r.terminal, r.product)], v)
+        frac = di / max(1, n - 1)
+        sc = scen.get((t, p), "routine")
+        tank_id, meter_id = _tank_id_for(t, p), _meter_id_for(t, p)
+        net = float(r.net_gallons)
+        ncomp = int(min(8, max(1, round(net / 4500.0))))
+        parts = np.clip(rng.normal(1.0, 0.12, ncomp), 0.4, None)
+        parts = parts / parts.sum() * net          # billed compartment nets sum to the lift
+        seq += 1
+        bol_number = f"BOL-{t[:3].upper()}-{seq:06d}"
+        cost = None if pd.isna(r.unit_cost) else float(r.unit_cost)
+        for j in range(ncomp):
+            billed = float(parts[j])
+            temp = float(ambient[di] + rng.normal(0, 4.0))
+            api = API_GRAVITY.get(p, 40.0) + float(rng.normal(0, 0.5))
+            vcf_c = _astm_vcf(api, temp, p)
+            if sc == "drift":
+                true_net = billed / max(1e-6, 1.0 - _DRIFT_MAX * frac)
+            elif sc == "bad_vcf":
+                vcf_probe = _astm_vcf(api, temp + _BAD_VCF_PROBE_ERR, p)
+                true_net = billed * (vcf_c / max(1e-6, vcf_probe))
+            else:
+                true_net = billed * (1.0 + float(rng.normal(0, 0.0003)))
+            gross = true_net / max(1e-6, vcf_c)     # recompute(gross, temp, api) == true_net
+            rows.append((bol_number, bdt, t, p, tank_id, meter_id, r.customer_id,
+                         f"{bol_number}-C{j + 1}", round(gross, 1), round(billed, 1),
+                         round(temp, 1), round(api, 2),
+                         round(cost, 4) if cost is not None else None))
+            draw_billed[(t, p, di)] += billed
+            draw_true[(t, p, di)] += true_net
+
+    df = pd.DataFrame(rows, columns=cols)
+    df["bol_datetime"] = pd.to_datetime(df["bol_datetime"])
+    return df, draw_billed, draw_true
+
+
+def _build_inventory(cfg: GenConfig, lifts, draw_billed, draw_true, dates, rng):
+    """Daily per-tank snapshots: book rolls on BILLED disbursements (what the office sees);
+    physical rolls on TRUE disbursements minus seeded evaporation (what the gauge would read).
+    Their difference is the gain/loss the reconciliation module recovers."""
+    cols = schema.column_names(schema.INVENTORY)
+    if lifts is None or len(lifts) == 0 or not draw_billed:
+        return pd.DataFrame(columns=cols)
+    n = len(dates)
+    scen, _keys = _tank_scenarios(lifts)
+
+    total_true = defaultdict(float)
+    max_day = defaultdict(float)
+    for (t, p, di), v in draw_true.items():
+        total_true[(t, p)] += v
+        max_day[(t, p)] = max(max_day[(t, p)], v)
 
     rows = []
-    for (t, p) in sorted(total_draw.keys()):
-        avg_daily = total_draw[(t, p)] / n
+    for (t, p) in sorted(total_true.keys()):
+        avg_daily = total_true[(t, p)] / n
         capacity = round(max(150000.0, avg_daily * 28, max_day[(t, p)] * 1.8), -3)
         min_heel = round(0.05 * capacity, -2)
-        tank_id = f"{t[:3].upper()}-{p}-1"
-        book = 0.70 * capacity
+        tank_id = _tank_id_for(t, p)
+        evap_mult = _HIGH_EVAP_MULT if scen.get((t, p)) == "high_evap" else 1.0
+        gauge_sd = _GAUGE_SD_FRAC * capacity
+        book = phys = 0.70 * capacity
         for di in range(n):
             d = dates[di]
-            book -= draw.get((t, p, di), 0.0)
+            book -= draw_billed.get((t, p, di), 0.0)
+            phys -= draw_true.get((t, p, di), 0.0)
+            phys -= evap_mult * _EVAP_RATE * draw_true.get((t, p, di), 0.0) + 1.5e-6 * capacity
             receipt = 0.0
-            if book < 1.5 * min_heel:
-                receipt = max(0.0, 0.85 * capacity - book)
+            if book < 1.5 * min_heel:                 # refill to 0.85·cap (covers negative book)
+                receipt = 0.85 * capacity - book
                 book += receipt
-            if book < 0:  # emergency top-up
-                receipt += 0.85 * capacity - book
-                book = 0.85 * capacity
+                phys += receipt                       # the receipt lands in both books equally
             book = min(book, capacity)
-            physical = book + float(rng.normal(0, 0.0015 * capacity))
+            phys = min(phys, capacity)
+            reading = phys + float(rng.normal(0, gauge_sd))
             rows.append((datetime(d.year, d.month, d.day, 23, 59), t, p, tank_id, capacity,
-                         min_heel, round(book, 1), round(physical, 1), round(receipt, 1)))
+                         min_heel, round(book, 1), round(reading, 1), round(receipt, 1)))
 
     df = pd.DataFrame(rows, columns=cols)
     df["snapshot_datetime"] = pd.to_datetime(df["snapshot_datetime"])
@@ -466,11 +567,19 @@ def _build_quotes(cfg: GenConfig, profiles, lifts, px, dates, rng):
     return df
 
 
-def _build_receipts(cfg: GenConfig, inventory_df, rng):
-    """Synthesize receipt detail from inventory replenishment events (source / basis / variance)."""
+def _build_receipts(cfg: GenConfig, inventory_df, dates, ambient, rng):
+    """Synthesize receipt detail from inventory replenishment events.
+
+    Gross is derived from net via an ASTM VCF at the (cooler, bulk) receipt temperature so
+    there is a real gross-vs-net thermal gap to attribute. The B/L-vs-received variance is
+    biased by source so marine carries a vessel-experience-factor loss and pipeline a transit
+    shrink — the line items the reconciliation module surfaces (the VEF / shrinkage argument).
+    """
     cols = schema.column_names(schema.RECEIPTS)
     if inventory_df is None or len(inventory_df) == 0:
         return pd.DataFrame(columns=cols)
+    date_index = {d: i for i, d in enumerate(dates)}
+    n = len(dates)
     ev = inventory_df[inventory_df["receipts"] > 0.0]
     basis_for = {"marine": "ship_meter", "pipeline": "pipeline_meter", "truck": "truck_meter"}
     rows = []
@@ -482,8 +591,16 @@ def _build_receipts(cfg: GenConfig, inventory_df, rng):
             src = "pipeline" if rng.random() < 0.6 else "marine"
         else:
             src = "truck" if rng.random() < 0.6 else "pipeline"
-        gross = net * (1 + abs(float(rng.normal(0, 0.0008))))
-        variance = float(rng.normal(0, 0.001) * net)  # BL vs received (signed)
+        di = date_index.get(pd.Timestamp(r.snapshot_datetime).date(), 0)
+        api = API_GRAVITY.get(r.product, 40.0)
+        temp = float(ambient[min(di, n - 1)] - 4.0 + rng.normal(0, 3.0))  # bulk supply a touch cool
+        gross = net / max(1e-6, _astm_vcf(api, temp, r.product))
+        if src == "marine":        # vessel experience factor: ship delivers a hair under the B/L
+            variance = -abs(float(rng.normal(0, 0.0015))) * net
+        elif src == "pipeline":    # pipeline transit / line shrink
+            variance = -abs(float(rng.normal(0, 0.0009))) * net
+        else:
+            variance = float(rng.normal(0, 0.0004)) * net
         mb = basis_for[src]
         if src == "marine" and rng.random() < 0.4:
             mb = "shore_tank"
@@ -532,9 +649,10 @@ def generate(cfg: GenConfig, con) -> dict:
     market_df, px = _build_market_prices(cfg, dates, rng)
     lifts_df = _build_lifts(cfg, profiles, px, dates, ambient, hdd_norm, rng)
     invoices_df = _build_invoices(cfg, lifts_df, profiles, rng)
-    inventory_df = _build_inventory(cfg, lifts_df, dates, rng)
+    bol_df, draw_billed, draw_true = _build_bol_compartments(cfg, lifts_df, dates, ambient, rng)
+    inventory_df = _build_inventory(cfg, lifts_df, draw_billed, draw_true, dates, rng)
     quotes_df = _build_quotes(cfg, profiles, lifts_df, px, dates, rng)
-    receipts_df = _build_receipts(cfg, inventory_df, rng)
+    receipts_df = _build_receipts(cfg, inventory_df, dates, ambient, rng)
 
     db.drop_all(con)
     db.init_db(con)
@@ -552,6 +670,8 @@ def generate(cfg: GenConfig, con) -> dict:
         db.insert_df(con, schema.QUOTES, quotes_df)
     if _table_enabled(schema.RECEIPTS, allowed):
         db.insert_df(con, schema.RECEIPTS, receipts_df)
+    if _table_enabled(schema.BOL, allowed):
+        db.insert_df(con, schema.BOL, bol_df)
 
     db.set_meta(con, "profile", cfg.profile)
     db.set_meta(con, "seed", cfg.seed)

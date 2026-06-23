@@ -7,6 +7,7 @@ import Dashboard from "./pages/Dashboard";
 import DataStudio from "./pages/DataStudio";
 import DataHealth from "./pages/DataHealth";
 import Scores from "./pages/Scores";
+import Reconciliation from "./pages/Reconciliation";
 import DailyOps from "./pages/DailyOps";
 import BookOverview from "./pages/BookOverview";
 import Radar from "./pages/Radar";
@@ -103,6 +104,7 @@ export default function App() {
         { key: "overview", label: "Book Overview", icon: "☰", match: (b) => b === "overview" },
         { key: "radar", label: "Early-Warning Radar", icon: "◔", match: (b) => b === "radar" },
         { key: "scores", label: "Scores & Quadrant", icon: "✦", match: (b) => b === "scores" },
+        { key: "reconciliation", label: "Reconciliation", icon: "⚖", match: (b) => b === "reconciliation" },
         { key: "capabilities", label: "Capabilities", icon: "▦", match: (b) => b === "capabilities" },
       ],
     },
@@ -152,6 +154,7 @@ export default function App() {
           {base === "overview" && <BookOverview summary={summary} navigate={navigate} />}
           {base === "radar" && <Radar summary={summary} />}
           {base === "scores" && <Scores summary={summary} />}
+          {base === "reconciliation" && <Reconciliation summary={summary} navigate={navigate} />}
           {base === "capabilities" && <Dashboard summary={summary} caps={caps} navigate={navigate} />}
           {base === "studio" && <DataStudio caps={caps} summary={summary} onState={applyState} navigate={navigate} />}
           {base === "health" && <DataHealth navigate={navigate} onState={applyState} />}

@@ -145,6 +145,19 @@ _SAMPLE_EXPORTS = {
             "bl_vs_received_variance": "BL Variance",
         },
     },
+    "bol_compartments": {
+        "query": "SELECT bol_number, bol_datetime, terminal, product, tank_id, meter_id, "
+                 "customer_id, compartment_id, compartment_gross_gallons, compartment_net_gallons, "
+                 "compartment_temp, compartment_api, compartment_unit_cost FROM bol_compartments "
+                 "ORDER BY bol_datetime LIMIT {limit}",
+        "headers": {
+            "bol_number": "BOL Number", "bol_datetime": "BOL Date", "terminal": "Terminal",
+            "product": "Product", "tank_id": "Tank", "meter_id": "Meter", "customer_id": "Customer",
+            "compartment_id": "Compartment", "compartment_gross_gallons": "Gross Gallons",
+            "compartment_net_gallons": "Net Gallons", "compartment_temp": "Temp (F)",
+            "compartment_api": "API Gravity", "compartment_unit_cost": "Unit Cost",
+        },
+    },
 }
 
 

@@ -10,13 +10,13 @@ products (RBOB / ULSD / ULSHO); **no blending operations**.
 > **Core principle — capabilities flex with the data you provide.**
 > One canonical schema; only `customer_id`, `lift_datetime`, and `net_gallons` are required.
 > A **capability matrix** inspects which canonical fields are actually populated and
-> enables/disables 17 features accordingly — exposed over the API so the UI reflects it live.
+> enables/disables 21 features accordingly — exposed over the API so the UI reflects it live.
 
 | Profile | Populated | Features enabled |
 |---|---|---|
-| `core` | the 3 required fields only | **4 / 17** |
-| `lite` | core + `terminal` + `product` | **6 / 17** |
-| `full` | every canonical field | **17 / 17** |
+| `core` | the 3 required fields only | **4 / 21** |
+| `lite` | core + `terminal` + `product` | **6 / 21** |
+| `full` | every canonical field | **21 / 21** |
 
 ## Stack
 

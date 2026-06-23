@@ -23,6 +23,7 @@ import type {
   QuadrantResponse,
   CustomerScoreResponse,
   BacktestResponse,
+  Reconciliation,
   RegimeConfig,
   Regime,
   DailyResponse,
@@ -154,6 +155,14 @@ export const api = {
     recompute: (overrides?: Record<string, number | string>) =>
       postJSON<{ ok: boolean; computed_at: string; windows: Record<string, number> }>(
         "/scores/recompute", { overrides: overrides ?? null }),
+  },
+
+  // ---- Reconciliation & loss control ----
+  reconciliation: {
+    get: (period = "month") => getJSON<Reconciliation>(`/reconciliation?period=${period}`),
+    config: () =>
+      getJSON<{ config: Record<string, number | string>; period_grains: string[] }>(
+        "/reconciliation/config"),
   },
 
   // ---- Daily operating dashboard / regime / scorecards / playbook ----
