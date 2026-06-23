@@ -7,27 +7,44 @@ import { humanize, pct } from "../lib/format";
  * capability matrix the dashboard does, so feeding data lights features up in real time.
  */
 function Row({ f }: { f: Feature }) {
+  const isFeed = f.kind === "feed";
+  const collecting = isFeed && f.status === "collecting";
+  const tone = collecting
+    ? "border-indigo-200 bg-indigo-50"
+    : f.enabled
+    ? "border-emerald-200 bg-emerald-50"
+    : "border-slate-200 bg-slate-50";
   return (
-    <div
-      className={`flex items-start justify-between gap-3 rounded-md border px-2.5 py-1.5 ${
-        f.enabled ? "border-emerald-200 bg-emerald-50" : "border-slate-200 bg-slate-50"
-      }`}
-    >
+    <div className={`flex items-start justify-between gap-3 rounded-md border px-2.5 py-1.5 ${tone}`}>
       <div className="min-w-0">
         <div className="flex items-center gap-1.5">
-          <span className={`text-xs ${f.enabled ? "text-emerald-600" : "text-slate-400"}`}>
-            {f.enabled ? "✓" : "🔒"}
+          <span
+            className={`text-xs ${
+              collecting ? "text-indigo-500" : f.enabled ? "text-emerald-600" : "text-slate-400"
+            }`}
+          >
+            {collecting ? "⏳" : f.enabled ? "✓" : "🔒"}
           </span>
           <span className="truncate text-xs font-medium text-slate-700">{f.label}</span>
         </div>
-        {!f.enabled && (
-          <p className="mt-0.5 text-[11px] text-amber-700">
-            Feed me: {f.missing_fields.map(humanize).join(", ")}
+        {isFeed && f.collecting ? (
+          <p className="mt-0.5 text-[11px] text-indigo-700">{f.collecting.label}
+            {f.collecting.rejections != null && <> · {f.collecting.rejections} rejections</>}
           </p>
+        ) : (
+          !f.enabled && (
+            <p className="mt-0.5 text-[11px] text-amber-700">
+              Feed me: {f.missing_fields.map(humanize).join(", ")}
+            </p>
+          )
         )}
       </div>
-      {f.enabled && (
-        <span className="shrink-0 text-[10px] font-medium text-emerald-700">{pct(f.coverage)}</span>
+      {isFeed ? (
+        <span className="shrink-0 text-[10px] font-medium text-indigo-700">{pct(f.coverage)}</span>
+      ) : (
+        f.enabled && (
+          <span className="shrink-0 text-[10px] font-medium text-emerald-700">{pct(f.coverage)}</span>
+        )
       )}
     </div>
   );

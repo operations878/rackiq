@@ -1,11 +1,16 @@
 import type { Capabilities, Feature } from "../api/types";
 
 function FeatureCard({ f }: { f: Feature }) {
+  const collecting = f.kind === "feed" && f.status === "collecting";
+  const tone = collecting
+    ? "border-indigo-200 bg-indigo-50"
+    : f.enabled
+    ? "border-emerald-200 bg-emerald-50"
+    : "border-slate-200 bg-slate-50";
+  const barColor = collecting ? "bg-indigo-500" : "bg-emerald-500";
   return (
     <div
-      className={`rounded-lg border p-3 ${
-        f.enabled ? "border-emerald-200 bg-emerald-50" : "border-slate-200 bg-slate-50"
-      }`}
+      className={`rounded-lg border p-3 ${tone}`}
       title={
         f.enabled
           ? `requires: ${f.required_fields.join(", ")}`
@@ -14,20 +19,29 @@ function FeatureCard({ f }: { f: Feature }) {
     >
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-medium text-slate-800">{f.label}</span>
-        <span
-          className={`h-2 w-2 shrink-0 rounded-full ${
-            f.enabled ? "bg-emerald-500" : "bg-slate-300"
-          }`}
-        />
+        {collecting ? (
+          <span className="shrink-0 rounded-full bg-indigo-100 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-indigo-700">
+            collecting
+          </span>
+        ) : (
+          <span className={`h-2 w-2 shrink-0 rounded-full ${f.enabled ? "bg-emerald-500" : "bg-slate-300"}`} />
+        )}
       </div>
       <p className="mt-1 text-xs leading-snug text-slate-500">{f.description}</p>
-      {f.enabled ? (
+      {f.kind === "feed" && f.collecting ? (
         <div className="mt-2">
           <div className="h-1.5 w-full overflow-hidden rounded bg-slate-200">
-            <div
-              className="h-1.5 rounded bg-emerald-500"
-              style={{ width: `${Math.round(f.coverage * 100)}%` }}
-            />
+            <div className={`h-1.5 rounded ${barColor}`} style={{ width: `${Math.round(f.coverage * 100)}%` }} />
+          </div>
+          <p className={`mt-1 text-[11px] ${collecting ? "text-indigo-700" : "text-emerald-700"}`}>
+            {f.collecting.label}
+            {f.collecting.rejections != null && <> · {f.collecting.rejections} rejections</>}
+          </p>
+        </div>
+      ) : f.enabled ? (
+        <div className="mt-2">
+          <div className="h-1.5 w-full overflow-hidden rounded bg-slate-200">
+            <div className="h-1.5 rounded bg-emerald-500" style={{ width: `${Math.round(f.coverage * 100)}%` }} />
           </div>
           {f.enhanced_by.length > 0 && (
             <p className="mt-1 text-[11px] text-emerald-700">+ {f.enhanced_by.join(", ")}</p>

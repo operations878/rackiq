@@ -24,17 +24,28 @@ export interface FieldPresence {
   coverage: number;
 }
 
+export interface Collecting {
+  count: number;
+  target: number;
+  unit: string;
+  label: string;
+  rejections?: number;
+}
+
 export interface Feature {
   key: string;
   label: string;
   description: string;
   category: string;
+  kind?: "analysis" | "feed";
+  status?: "enabled" | "collecting" | "locked";
   required_fields: string[];
   optional_fields: string[];
   enabled: boolean;
   missing_fields: string[];
   enhanced_by: string[];
   coverage: number;
+  collecting?: Collecting | null;
 }
 
 export interface Capabilities {
@@ -42,6 +53,7 @@ export interface Capabilities {
   categories: string[];
   fields: Record<string, FieldPresence>;
   features: Feature[];
+  feeds?: Record<string, number>;
   summary: { enabled: number; total: number };
 }
 
@@ -329,6 +341,12 @@ export interface AuditEntry {
   rows_affected: number;
 }
 
+export interface FeedCounts {
+  rack_benchmark_days: number;
+  quotes: { total: number; rejected: number; by_outcome: Record<string, number> };
+  receipts: { rows: number; by_source: Record<string, number> };
+}
+
 export interface DataHealth {
   score: number;
   grade: string;
@@ -340,9 +358,38 @@ export interface DataHealth {
     volume: VolumeDrift | null;
   };
   quarantine: { total: number; by_table: Record<string, number> };
+  feeds?: FeedCounts;
   crosswalk: { size: number; masters: number };
   recent_audit: AuditEntry[];
   profile: string;
+}
+
+// ---- Early data feeds (quick-entry forms) ---------------------------------------
+export interface RackBenchmarkEntry {
+  price_date: string;
+  terminal: string;
+  product: string;
+  rack_benchmark: number;
+}
+
+export interface QuoteEntry {
+  customer_id: string;
+  quote_time: string;
+  product: string;
+  quoted_price: number;
+  outcome: string;
+  market_price_at_quote?: number | null;
+  inventory_state?: string | null;
+  capacity_state?: string | null;
+  competitor_context?: string | null;
+  time_to_decision?: number | null;
+  final_gallons?: number | null;
+}
+
+export interface FeedWriteResponse extends StudioState {
+  ok: boolean;
+  rows_written: number;
+  quarantined: number;
 }
 
 export interface QuarantineRow {

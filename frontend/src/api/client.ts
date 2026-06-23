@@ -16,6 +16,9 @@ import type {
   DataHealth,
   QuarantineResponse,
   AuditEntry,
+  RackBenchmarkEntry,
+  QuoteEntry,
+  FeedWriteResponse,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -95,6 +98,11 @@ export const api = {
     history: () => getJSON<{ imports: ImportLogEntry[] }>("/studio/history"),
     loadDemo: (profile: string) => postJSON<StudioState & { ok: boolean }>("/studio/load-demo", { profile }),
     reset: () => postJSON<StudioState & { ok: boolean }>("/studio/reset", {}),
+
+    // ---- Early data feeds (quick entry) ----
+    rackBenchmark: (entries: RackBenchmarkEntry[]) =>
+      postJSON<FeedWriteResponse>("/studio/rack-benchmark", { entries }),
+    quote: (entries: QuoteEntry[]) => postJSON<FeedWriteResponse>("/studio/quote", { entries }),
 
     // ---- Customer Master crosswalk ----
     crosswalkPropose: (body: {

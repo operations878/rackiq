@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import statistics
 
-from . import crosswalk, db, schema
+from . import capabilities, crosswalk, db, schema
 
 
 def _clamp01(x: float) -> float:
@@ -124,6 +124,30 @@ def _drift_volume(con) -> dict | None:
             "direction": "above" if z > 0 else "below"}
 
 
+def _feeds(con) -> dict:
+    """Running counts of the early data feeds (rack benchmark, quotes, receipts)."""
+    counts = capabilities.feed_counts(con)
+
+    def _grp(sql: str) -> dict:
+        try:
+            return {(r[0] or "—"): int(r[1]) for r in con.execute(sql).fetchall()}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    return {
+        "rack_benchmark_days": counts["rack_benchmark_days"],
+        "quotes": {
+            "total": counts["quotes_logged"],
+            "rejected": counts["quotes_rejected"],
+            "by_outcome": _grp("SELECT lower(outcome), count(*) FROM quotes GROUP BY 1 ORDER BY 2 DESC"),
+        },
+        "receipts": {
+            "rows": counts["receipt_rows"],
+            "by_source": _grp("SELECT lower(receipt_source), count(*) FROM receipts GROUP BY 1 ORDER BY 2 DESC"),
+        },
+    }
+
+
 def compute(con) -> dict:
     parts = {
         "completeness": _completeness(con),
@@ -153,6 +177,7 @@ def compute(con) -> dict:
             "volume": vol,
         },
         "quarantine": {"total": sum(q_counts.values()), "by_table": q_counts},
+        "feeds": _feeds(con),
         "crosswalk": {"size": len(db.get_crosswalk(con)),
                       "masters": len({v["master_id"] for v in db.get_crosswalk(con).values()
                                       if v.get("status") == "confirmed"})},

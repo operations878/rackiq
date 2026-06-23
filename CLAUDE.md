@@ -57,7 +57,7 @@ Monorepo with a Python backend and a React frontend.
 
 ## Canonical schema
 
-**26 canonical fields = 3 required + 23 optional**, organized into four canonical data
+**40 canonical fields = 3 required + 37 optional**, organized into six canonical data
 tables plus a `customers` dimension. Defined in `backend/app/schema.py`.
 
 | Table | Grain | Fields |
@@ -65,11 +65,32 @@ tables plus a `customers` dimension. Defined in `backend/app/schema.py`.
 | **lifts** | one lift/load event | **`customer_id`\***, **`lift_datetime`\***, **`net_gallons`\***, `terminal`, `product`, `gross_gallons`, `observed_temp`, `api_gravity`, `unit_price`, `unit_cost` |
 | **inventory_snapshots** | terminal × product × tank × time | `tank_id`, `tank_capacity`, `min_heel`, `inventory_snapshot`, `physical_inventory`, `receipts` (+ keys `snapshot_datetime`, `terminal`, `product`) |
 | **invoices** | one invoice (AR) | `invoice_date`, `due_date`, `paid_date` (NULL = open), `invoice_amount`, `credit_limit` (+ key `customer_id`) |
-| **market_prices** | price_date × product × terminal | `market_price`, `nyh_basis`, `street_rack`, `committed_buys`, `committed_sells` |
+| **market_prices** | price_date × product × terminal | `market_price`, `nyh_basis`, `street_rack`, `committed_buys`, `committed_sells`, `rack_benchmark` |
+| **quotes** *(early feed)* | one quote given | `quoted_price`, `market_price_at_quote`, `inventory_state`, `capacity_state`, `competitor_context`, `outcome` (accept/reject/no_response), `time_to_decision`, `final_gallons` (+ keys `customer_id`, `quote_time`, `product`) |
+| **receipts** *(early feed)* | one receipt landed | `receipt_source` (marine/pipeline/truck), `receipt_gross_gallons`, `receipt_net_gallons`, `measurement_basis` (shore_tank/ship_meter/pipeline_meter/truck_meter), `bl_vs_received_variance` (signed) (+ keys `receipt_datetime`, `terminal`, `product`) |
 | **customers** *(dimension)* | one customer | `customer_id`, `name`, `archetype`, `home_terminal` |
 
 \* = required core field. `terminal`/`product` are detected for presence on **lifts** (their
-primary home); their copies on inventory/market are dimensional keys.
+primary home); their copies on inventory/market/quotes/receipts are dimensional keys.
+
+### Early data feeds — start collecting now, modules consume later
+
+Three feeds let history accumulate before the analytics that read them ship. They are wired
+through the **same** column-mapping + hygiene + capability pipeline as everything else:
+
+1. **`rack_benchmark`** (on `market_prices`) — the daily street/OPIS rack reference. Logged via a
+   quick **daily-entry form** (date · terminal · product · price) *or* CSV/OPIS import. Powers the
+   Pricing Sandbox + elasticity models.
+2. **`quotes`** — the **elasticity training set**: every quote outcome incl. **rejections** (the
+   point). Logged via a fast in-app form (customer resolved through the crosswalk) *or* bulk CSV.
+3. **`receipts`** — receipt detail (source / gross+net gallons / measurement basis / BL-vs-received
+   variance). Optional, capability-gated for **P8**. Imported via the wizard.
+
+These surface as **feed capabilities** that are *never hard-locked*: they report
+`status: "collecting"` with `collecting: {count, target, unit, label}` (e.g. "collecting — N days
+logged") and flip to `enabled` once they cross their target. Running counts also appear on the
+**Data Health** dashboard. Quick-entry endpoints: `POST /api/studio/rack-benchmark`, `POST
+/api/studio/quote` (both append through the hygiene pipeline).
 
 **Derived concepts** (computed from stored columns; nothing is discarded):
 net-vs-gross / VCF shrinkage ← `gross_gallons`,`net_gallons`(+`observed_temp`,`api_gravity`);
@@ -80,13 +101,16 @@ gain/loss ← `physical_inventory` vs `inventory_snapshot`; net position ← `co
 
 ## Capability matrix
 
-`backend/app/capabilities.py` declares **17 features**. Each feature lists the canonical
-fields it `requires` (and optional fields that `enhance` it). At runtime:
+`backend/app/capabilities.py` declares **20 features** (17 analysis + 3 *feed*). Each feature
+lists the canonical fields it `requires` (and optional fields that `enhance` it). At runtime:
 
 - A field is **present** if it has ≥1 non-null value in its primary table.
 - `coverage` = non-null ÷ that table's own row count (an empty sibling table never dilutes
   another table's coverage).
-- A feature is **enabled** iff all its required fields are present.
+- An **analysis** feature is **enabled** iff all its required fields are present (else `locked`).
+- A **feed** feature (`kind:"feed"`) is *never hard-locked*: it reports `status:"collecting"` with
+  `collecting:{count,target,unit,label}` and flips to `enabled` once its count crosses the target.
+  `compute_capabilities` also returns a `feeds` block with the raw running counts.
 
 Served at **`GET /api/capabilities`**:
 
@@ -106,8 +130,9 @@ Served at **`GET /api/capabilities`**:
 | **Demand** | demand_ranking (customer_id, net_gallons) · lift_cadence (customer_id, lift_datetime) · archetype_detection (core 3) · demand_forecast (core 3) · product_mix (net_gallons, product) · terminal_breakdown (net_gallons, terminal) |
 | **Margin** | net_vs_gross (net_gallons, gross_gallons) · margin_analysis (unit_price, unit_cost, net_gallons) · revenue (net_gallons, unit_price) |
 | **Receivables** | ar_aging (invoice_date, due_date, invoice_amount) · dso (invoice_date, paid_date, invoice_amount) · credit_risk_late_payers (due_date, paid_date) |
-| **Inventory** | inventory_days_of_supply (inventory_snapshot, tank_capacity, min_heel) · gain_loss_reconciliation (physical_inventory, inventory_snapshot) · tank_utilization (inventory_snapshot, tank_capacity) |
+| **Inventory** | inventory_days_of_supply (inventory_snapshot, tank_capacity, min_heel) · gain_loss_reconciliation (physical_inventory, inventory_snapshot) · tank_utilization (inventory_snapshot, tank_capacity) · **receipt_detail** *(feed: receipt_source; target 20 receipts)* |
 | **Market** | basis_tracking (market_price, nyh_basis) · position_committed (committed_buys, committed_sells) |
+| **Pricing** | **pricing_sandbox** *(feed: rack_benchmark; target 30 days)* · **quote_elasticity** *(feed: quoted_price + outcome; target 50 quotes)* |
 
 ### Data profiles make the matrix flex
 
@@ -116,15 +141,18 @@ from the **same code** on different data:
 
 | Profile | Populated | Enabled features |
 |---|---|---|
-| `core` | only the 3 required fields (no inventory/invoices/market) | **4** |
+| `core` | only the 3 required fields (no inventory/invoices/market/quotes/receipts) | **4** |
 | `lite` | core + `terminal` + `product` on lifts | **6** |
-| `full` | every canonical field | **17** |
+| `full` | every canonical field (incl. rack_benchmark, quotes, receipts) | **20** |
 
 ```
-rackiq-generate --profile core   #  capabilities enabled: 4/17
-rackiq-generate --profile lite   #  capabilities enabled: 6/17
-rackiq-generate --profile full   #  capabilities enabled: 17/17
+rackiq-generate --profile core   #  capabilities enabled: 4/20
+rackiq-generate --profile lite   #  capabilities enabled: 6/20
+rackiq-generate --profile full   #  capabilities enabled: 20/20
 ```
+
+(The 3 feed capabilities count toward "enabled" only once their history crosses the target;
+the `full` book generates enough rack-benchmark days / quotes / receipts to mature all three.)
 
 ---
 
@@ -163,7 +191,9 @@ fields, preview validation, and commit. Capabilities then flex from the fields a
 *import targets* = structural keys (grain/foreign keys) + that table's canonical fields. Required
 mappings per table (must be set to commit): lifts → `customer_id, lift_datetime, net_gallons`;
 invoices → `customer_id`; inventory → `snapshot_datetime, terminal, product`; market →
-`price_date, product`. Derived in `schema.import_targets(table)` from the single source of truth.
+`price_date, product`; quotes → `customer_id, quote_time, product, quoted_price, outcome`;
+receipts → `receipt_datetime, terminal, product, receipt_source`. Derived in
+`schema.import_targets(table)` from the single source of truth.
 
 **Wizard flow** (`POST` unless noted):
 
@@ -179,6 +209,7 @@ invoices → `customer_id`; inventory → `snapshot_datetime, terminal, product`
 | Audit | `GET …/audit` | recent hygiene transformations |
 | Profiles | `GET/POST /api/studio/profiles`, `DELETE …/{name}` | save/list/delete named **cleaning profiles** (mapping **+ hygiene options**); a re-uploaded file whose columns satisfy a profile auto-applies its mapping *and* its fix settings |
 | History | `GET /api/studio/history` | recent imports (table, filename, rows, mode) |
+| Quick feeds | `/api/studio/rack-benchmark`, `/api/studio/quote` | append a daily rack benchmark / a single quote (resolved via crosswalk) through the hygiene pipeline; bumps the "collecting" counters live |
 | Demo / Reset | `/api/studio/load-demo`, `/api/studio/reset` | load the synthetic book (`core`/`lite`/`full`) or clear the store |
 
 Saved profiles, the import log, the **customer crosswalk**, the **hygiene audit log**, and the
@@ -190,7 +221,8 @@ purpose — merge decisions and held rows are never lost when the book is reload
 **Map Columns**, **Clean** (`CleanStep` = `ProfilingScorecard` + `CustomerMasterPanel` +
 `FixOptions`), **Validate** (stat cards + fixes preview + rule cards with row-level drill-down),
 and **Commit** (rows written + hygiene report + quarantine link). A live **Data Capability** panel
-sits alongside, unlocking features the instant data lands.
+sits alongside, unlocking features the instant data lands, plus a **Quick Feeds** panel
+(`components/studio/QuickFeeds.tsx`) with the rack-benchmark daily-entry and quote-logger forms.
 
 ---
 
@@ -232,9 +264,9 @@ of the wizard plus the standing **Data Health** page, and covers eight jobs:
 (gasoline / distillate / crude). `vcf=1.0` exactly at 60°F; hot → shrink, cold → expand.
 
 **Sample files.** `uv run rackiq-export-samples` writes `samples/{lifts,invoices,market_prices,
-inventory_snapshots}_sample.csv` (+ `lifts_sample.xlsx`) with *friendly* headers (e.g. "Customer",
-"Lift Date", "Sell Price", "Posted Rack") so the fuzzy matcher has something to chew on. Importing
-all four walks capabilities 9 → 12 → 14 → 17. It also writes **deliberately-dirty** Hygiene Studio
+inventory_snapshots,quotes,receipts}_sample.csv` (+ `lifts_sample.xlsx`) with *friendly* headers
+(e.g. "Customer", "Lift Date", "Sell Price", "Posted Rack", "OPIS Rack", "Quoted Price", "Outcome")
+so the fuzzy matcher has something to chew on. Importing them walks the capability matrix up. It also writes **deliberately-dirty** Hygiene Studio
 demo files: `samples/lifts_dirty.csv` (customer NAMES with spelling/ID variants of several
 customers, mixed/bad dates, negative volumes, exact-duplicate rows, stray whitespace) and
 `samples/lifts_barrels.csv` (volumes in barrels, for the unit-standardization toggle). `--no-dirty`
@@ -246,7 +278,10 @@ skips them. Worked screenshots of the merge + fix flow live in `docs/hygiene-stu
 
 `backend/app/generator.py` builds a realistic, deterministic-per-seed "Soundview" book:
 ~40 customers across 3 terminals (Linden / Providence / Albany), products RBOB / ULSD /
-ULSHO, ~21 months, plus matching AR, inventory snapshots, and daily market prices.
+ULSHO, ~21 months, plus matching AR, inventory snapshots, and daily market prices. In `full`
+it also generates the early feeds: a daily `rack_benchmark`, a **quote log** (accepts +
+rejections with a recoverable per-archetype price elasticity), and **receipt detail** derived
+from inventory replenishments (source / measurement basis / BL variance).
 
 **Customer archetypes** (default mix sums to 40, scales with `--n-customers`):
 
@@ -377,7 +412,7 @@ frontend/
     api/{client,types}.ts
     pages/{Dashboard,DataStudio,DataHealth}.tsx
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel}.tsx
-    components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep}.tsx
+    components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds}.tsx
 CLAUDE.md
 ```
 

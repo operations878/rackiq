@@ -102,6 +102,52 @@ function DriftPanel({ health }: { health: DataHealthT }) {
   );
 }
 
+function FeedsPanel({ health }: { health: DataHealthT }) {
+  const f = health.feeds;
+  if (!f) return null;
+  return (
+    <Panel title="Early data feeds — collecting now">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="rounded-lg border border-indigo-200 bg-indigo-50 p-3">
+          <div className="text-[11px] uppercase tracking-wide text-indigo-500">Rack benchmark</div>
+          <div className="mt-1 text-2xl font-bold text-indigo-700">{f.rack_benchmark_days}</div>
+          <div className="text-[11px] text-slate-500">days logged → Pricing Sandbox</div>
+        </div>
+        <div className="rounded-lg border border-indigo-200 bg-indigo-50 p-3">
+          <div className="text-[11px] uppercase tracking-wide text-indigo-500">Quote logger</div>
+          <div className="mt-1 text-2xl font-bold text-indigo-700">{f.quotes.total}</div>
+          <div className="text-[11px] text-slate-500">
+            quotes · <b className="text-rose-600">{f.quotes.rejected} rejections</b> (the elasticity gold)
+          </div>
+          {Object.keys(f.quotes.by_outcome).length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {Object.entries(f.quotes.by_outcome).map(([k, v]) => (
+                <span key={k} className="rounded bg-white px-1.5 py-0.5 text-[10px] text-slate-600">
+                  {k}: <b>{v}</b>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="rounded-lg border border-indigo-200 bg-indigo-50 p-3">
+          <div className="text-[11px] uppercase tracking-wide text-indigo-500">Receipt detail (P8)</div>
+          <div className="mt-1 text-2xl font-bold text-indigo-700">{f.receipts.rows}</div>
+          <div className="text-[11px] text-slate-500">receipts with source / basis / BL variance</div>
+          {Object.keys(f.receipts.by_source).length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {Object.entries(f.receipts.by_source).map(([k, v]) => (
+                <span key={k} className="rounded bg-white px-1.5 py-0.5 text-[10px] text-slate-600">
+                  {k}: <b>{v}</b>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
 function QuarantineRowCard({
   row,
   onReimport,
@@ -342,6 +388,8 @@ export default function DataHealth({
         <ScoreCard health={health} />
         <DriftPanel health={health} />
       </div>
+
+      <FeedsPanel health={health} />
 
       <Panel
         title={`Quarantine — ${quarantine?.total ?? 0} row(s) held for review`}

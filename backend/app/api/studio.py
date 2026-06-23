@@ -92,6 +92,35 @@ class LoadDemoRequest(BaseModel):
     months: int = 21
 
 
+class RackBenchmarkEntry(BaseModel):
+    price_date: str
+    terminal: str
+    product: str
+    rack_benchmark: float
+
+
+class RackBenchmarkRequest(BaseModel):
+    entries: list[RackBenchmarkEntry] = Field(default_factory=list)
+
+
+class QuoteEntry(BaseModel):
+    customer_id: str
+    quote_time: str
+    product: str
+    quoted_price: float
+    outcome: str                              # accept | reject | no_response
+    market_price_at_quote: float | None = None
+    inventory_state: str | None = None
+    capacity_state: str | None = None
+    competitor_context: str | None = None
+    time_to_decision: float | None = None
+    final_gallons: float | None = None
+
+
+class QuoteRequest(BaseModel):
+    entries: list[QuoteEntry] = Field(default_factory=list)
+
+
 # ---- Helpers --------------------------------------------------------------------
 def _match_profile(con, source_columns: list[str]) -> dict | None:
     """Find the most recent saved profile whose source columns the file satisfies."""
@@ -513,6 +542,81 @@ def delete_profile(name: str):
 def history():
     with db.lock():
         return {"imports": db.list_import_log(_con())}
+
+
+def _append_entries(con, table: str, records: list[dict], filename: str,
+                    resolve: bool = True) -> dict:
+    """Append manually-entered rows through the SAME hygiene path as a file import.
+
+    Coerce → apply fixes (incl. crosswalk resolution) → run rules → split quarantine →
+    append clean rows → audit/log. Used by the rack-benchmark and quote quick-entry forms
+    so direct entries are cleaned exactly like everything else.
+    """
+    if not records:
+        return {"rows_written": 0, "quarantined": 0}
+    df = pd.DataFrame(records)
+    types = schema.column_types(table)
+    raw_dates: dict[str, pd.Series] = {}
+    for col in list(df.columns):
+        dt = types.get(col)
+        if dt is None:
+            df = df.drop(columns=[col])
+            continue
+        if dt in (schema.DType.DATE, schema.DType.TIMESTAMP):
+            raw_dates[col] = df[col].copy()
+        coerced, _ = ingest.coerce_column(df[col], dt.value)
+        df[col] = coerced
+
+    opts = hygiene.HygieneOptions(net_correction="off", resolve_customers=resolve,
+                                  dedupe_lifts_grain=False, quarantine_failures=True)
+    fixed, report, audit = hygiene.apply_fixes(df, table, opts, con)
+    raw = {t: s.reindex(fixed.index) for t, s in raw_dates.items()}
+    rules = validation.run_rules(fixed, table, opts.to_dict(), raw, con)
+
+    q_index = rules["quarantine_index"]
+    quarantined = fixed.loc[q_index] if q_index else fixed.iloc[0:0]
+    good = fixed.drop(index=q_index) if q_index else fixed
+    good = hygiene.dedupe_exact(good, report, audit)
+
+    rows_written = db.insert_df(con, table, good.reset_index(drop=True))
+    n_quarantined = 0
+    if len(quarantined):
+        n_quarantined = _quarantine_rows(con, table, filename, quarantined,
+                                         rules["quarantine_reasons"])
+    db.set_meta(con, "last_import_at", _now())
+    db.log_import(con, _now(), table, filename, rows_written, "append")
+    db.log_hygiene_audit(con, _now_us(), table, filename, audit)
+    return {"rows_written": rows_written, "quarantined": n_quarantined}
+
+
+@router.post("/rack-benchmark")
+def rack_benchmark(req: RackBenchmarkRequest):
+    """Daily street/OPIS rack-benchmark entry — appends to the market price time series."""
+    if not req.entries:
+        raise HTTPException(status_code=400, detail="No rack-benchmark entries provided.")
+    records = [{"price_date": e.price_date, "terminal": e.terminal, "product": e.product,
+                "rack_benchmark": e.rack_benchmark} for e in req.entries]
+    with db.lock():
+        con = _con()
+        res = _append_entries(con, schema.MARKET, records, "rack-benchmark (manual)", resolve=False)
+        state = _state(con)
+    return {"ok": True, **res, **state}
+
+
+@router.post("/quote")
+def quote(req: QuoteRequest):
+    """Quote-logger quick entry — resolves the customer via the crosswalk and appends a quote."""
+    if not req.entries:
+        raise HTTPException(status_code=400, detail="No quotes provided.")
+    records = []
+    for e in req.entries:
+        rec = {k: v for k, v in e.model_dump().items() if v is not None}
+        records.append(rec)
+    with db.lock():
+        con = _con()
+        res = _append_entries(con, schema.QUOTES, records, "quote log (manual)", resolve=True)
+        state = _state(con)
+    return {"ok": True, **res, **state}
 
 
 @router.post("/load-demo")
