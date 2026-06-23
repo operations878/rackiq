@@ -6,6 +6,7 @@ import ProfileBadge from "./components/ProfileBadge";
 import Dashboard from "./pages/Dashboard";
 import DataStudio from "./pages/DataStudio";
 import DataHealth from "./pages/DataHealth";
+import Scores from "./pages/Scores";
 
 function Centered({ children }: { children: ReactNode }) {
   return (
@@ -72,7 +73,8 @@ export default function App() {
 
   const onStudio = route === "studio";
   const onHealth = route === "health";
-  const onDashboard = !onStudio && !onHealth;
+  const onScores = route === "scores";
+  const onDashboard = !onStudio && !onHealth && !onScores;
   const quarantine = summary.quarantine_total ?? 0;
 
   return (
@@ -86,6 +88,7 @@ export default function App() {
             </div>
             <nav className="flex items-center gap-1">
               <NavLink label="Dashboard" active={onDashboard} onClick={() => navigate("")} />
+              <NavLink label="Scores" active={onScores} onClick={() => navigate("scores")} />
               <NavLink label="Data Studio" active={onStudio} onClick={() => navigate("studio")} />
               <button
                 onClick={() => navigate("health")}
@@ -109,6 +112,7 @@ export default function App() {
       <main className="mx-auto max-w-7xl px-6 py-6">
         {onStudio && <DataStudio caps={caps} summary={summary} onState={applyState} navigate={navigate} />}
         {onHealth && <DataHealth navigate={navigate} onState={applyState} />}
+        {onScores && <Scores summary={summary} />}
         {onDashboard && <Dashboard summary={summary} caps={caps} navigate={navigate} />}
       </main>
 

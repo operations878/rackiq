@@ -88,10 +88,12 @@ _SAMPLE_EXPORTS = {
     },
     "market_prices": {
         "query": "SELECT price_date, product, terminal, market_price, nyh_basis, street_rack, "
-                 "committed_buys, committed_sells FROM market_prices ORDER BY price_date LIMIT {limit}",
+                 "rack_benchmark, committed_buys, committed_sells FROM market_prices "
+                 "ORDER BY price_date LIMIT {limit}",
         "headers": {
             "price_date": "Date", "product": "Product", "terminal": "Terminal",
             "market_price": "Benchmark", "nyh_basis": "Basis", "street_rack": "Posted Rack",
+            "rack_benchmark": "OPIS Rack",
             "committed_buys": "Committed Buys", "committed_sells": "Committed Sells",
         },
     },
@@ -104,6 +106,29 @@ _SAMPLE_EXPORTS = {
             "tank_id": "Tank", "tank_capacity": "Capacity", "min_heel": "Min Heel",
             "inventory_snapshot": "Book Inventory", "physical_inventory": "Physical Inventory",
             "receipts": "Receipts",
+        },
+    },
+    "quotes": {
+        "query": "SELECT customer_id, quote_time, product, quoted_price, market_price_at_quote, "
+                 "inventory_state, capacity_state, competitor_context, outcome, time_to_decision, "
+                 "final_gallons FROM quotes ORDER BY quote_time LIMIT {limit}",
+        "headers": {
+            "customer_id": "Customer", "quote_time": "Quote Time", "product": "Product",
+            "quoted_price": "Quoted Price", "market_price_at_quote": "Market At Quote",
+            "inventory_state": "Inventory State", "capacity_state": "Capacity State",
+            "competitor_context": "Competitor", "outcome": "Outcome",
+            "time_to_decision": "Mins To Decide", "final_gallons": "Final Gallons",
+        },
+    },
+    "receipts": {
+        "query": "SELECT receipt_datetime, terminal, product, receipt_source, receipt_gross_gallons, "
+                 "receipt_net_gallons, measurement_basis, bl_vs_received_variance FROM receipts "
+                 "ORDER BY receipt_datetime LIMIT {limit}",
+        "headers": {
+            "receipt_datetime": "Receipt Date", "terminal": "Terminal", "product": "Product",
+            "receipt_source": "Source", "receipt_gross_gallons": "Gross Gallons",
+            "receipt_net_gallons": "Net Gallons", "measurement_basis": "Measurement Basis",
+            "bl_vs_received_variance": "BL Variance",
         },
     },
 }

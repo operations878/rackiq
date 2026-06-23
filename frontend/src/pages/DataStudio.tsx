@@ -14,6 +14,7 @@ import { DEFAULT_HYGIENE } from "../api/types";
 import Panel from "../components/Panel";
 import DataCapabilityPanel from "../components/DataCapabilityPanel";
 import Stepper from "../components/studio/Stepper";
+import QuickFeeds from "../components/studio/QuickFeeds";
 import UploadStep from "../components/studio/UploadStep";
 import MappingStep from "../components/studio/MappingStep";
 import CleanStep from "../components/studio/CleanStep";
@@ -259,6 +260,9 @@ export default function DataStudio({
         <section className="space-y-4">
           <Panel>
             <DataCapabilityPanel caps={caps} />
+          </Panel>
+          <Panel>
+            <QuickFeeds summary={summary} onState={onState} />
           </Panel>
           {summary.last_import?.filename && (
             <Panel title="Last import">

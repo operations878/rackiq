@@ -57,7 +57,7 @@ Monorepo with a Python backend and a React frontend.
 
 ## Canonical schema
 
-**26 canonical fields = 3 required + 23 optional**, organized into four canonical data
+**40 canonical fields = 3 required + 37 optional**, organized into six canonical data
 tables plus a `customers` dimension. Defined in `backend/app/schema.py`.
 
 | Table | Grain | Fields |
@@ -65,11 +65,32 @@ tables plus a `customers` dimension. Defined in `backend/app/schema.py`.
 | **lifts** | one lift/load event | **`customer_id`\***, **`lift_datetime`\***, **`net_gallons`\***, `terminal`, `product`, `gross_gallons`, `observed_temp`, `api_gravity`, `unit_price`, `unit_cost` |
 | **inventory_snapshots** | terminal × product × tank × time | `tank_id`, `tank_capacity`, `min_heel`, `inventory_snapshot`, `physical_inventory`, `receipts` (+ keys `snapshot_datetime`, `terminal`, `product`) |
 | **invoices** | one invoice (AR) | `invoice_date`, `due_date`, `paid_date` (NULL = open), `invoice_amount`, `credit_limit` (+ key `customer_id`) |
-| **market_prices** | price_date × product × terminal | `market_price`, `nyh_basis`, `street_rack`, `committed_buys`, `committed_sells` |
+| **market_prices** | price_date × product × terminal | `market_price`, `nyh_basis`, `street_rack`, `committed_buys`, `committed_sells`, `rack_benchmark` |
+| **quotes** *(early feed)* | one quote given | `quoted_price`, `market_price_at_quote`, `inventory_state`, `capacity_state`, `competitor_context`, `outcome` (accept/reject/no_response), `time_to_decision`, `final_gallons` (+ keys `customer_id`, `quote_time`, `product`) |
+| **receipts** *(early feed)* | one receipt landed | `receipt_source` (marine/pipeline/truck), `receipt_gross_gallons`, `receipt_net_gallons`, `measurement_basis` (shore_tank/ship_meter/pipeline_meter/truck_meter), `bl_vs_received_variance` (signed) (+ keys `receipt_datetime`, `terminal`, `product`) |
 | **customers** *(dimension)* | one customer | `customer_id`, `name`, `archetype`, `home_terminal` |
 
 \* = required core field. `terminal`/`product` are detected for presence on **lifts** (their
-primary home); their copies on inventory/market are dimensional keys.
+primary home); their copies on inventory/market/quotes/receipts are dimensional keys.
+
+### Early data feeds — start collecting now, modules consume later
+
+Three feeds let history accumulate before the analytics that read them ship. They are wired
+through the **same** column-mapping + hygiene + capability pipeline as everything else:
+
+1. **`rack_benchmark`** (on `market_prices`) — the daily street/OPIS rack reference. Logged via a
+   quick **daily-entry form** (date · terminal · product · price) *or* CSV/OPIS import. Powers the
+   Pricing Sandbox + elasticity models.
+2. **`quotes`** — the **elasticity training set**: every quote outcome incl. **rejections** (the
+   point). Logged via a fast in-app form (customer resolved through the crosswalk) *or* bulk CSV.
+3. **`receipts`** — receipt detail (source / gross+net gallons / measurement basis / BL-vs-received
+   variance). Optional, capability-gated for **P8**. Imported via the wizard.
+
+These surface as **feed capabilities** that are *never hard-locked*: they report
+`status: "collecting"` with `collecting: {count, target, unit, label}` (e.g. "collecting — N days
+logged") and flip to `enabled` once they cross their target. Running counts also appear on the
+**Data Health** dashboard. Quick-entry endpoints: `POST /api/studio/rack-benchmark`, `POST
+/api/studio/quote` (both append through the hygiene pipeline).
 
 **Derived concepts** (computed from stored columns; nothing is discarded):
 net-vs-gross / VCF shrinkage ← `gross_gallons`,`net_gallons`(+`observed_temp`,`api_gravity`);
@@ -80,13 +101,16 @@ gain/loss ← `physical_inventory` vs `inventory_snapshot`; net position ← `co
 
 ## Capability matrix
 
-`backend/app/capabilities.py` declares **17 features**. Each feature lists the canonical
-fields it `requires` (and optional fields that `enhance` it). At runtime:
+`backend/app/capabilities.py` declares **20 features** (17 analysis + 3 *feed*). Each feature
+lists the canonical fields it `requires` (and optional fields that `enhance` it). At runtime:
 
 - A field is **present** if it has ≥1 non-null value in its primary table.
 - `coverage` = non-null ÷ that table's own row count (an empty sibling table never dilutes
   another table's coverage).
-- A feature is **enabled** iff all its required fields are present.
+- An **analysis** feature is **enabled** iff all its required fields are present (else `locked`).
+- A **feed** feature (`kind:"feed"`) is *never hard-locked*: it reports `status:"collecting"` with
+  `collecting:{count,target,unit,label}` and flips to `enabled` once its count crosses the target.
+  `compute_capabilities` also returns a `feeds` block with the raw running counts.
 
 Served at **`GET /api/capabilities`**:
 
@@ -106,8 +130,9 @@ Served at **`GET /api/capabilities`**:
 | **Demand** | demand_ranking (customer_id, net_gallons) · lift_cadence (customer_id, lift_datetime) · archetype_detection (core 3) · demand_forecast (core 3) · product_mix (net_gallons, product) · terminal_breakdown (net_gallons, terminal) |
 | **Margin** | net_vs_gross (net_gallons, gross_gallons) · margin_analysis (unit_price, unit_cost, net_gallons) · revenue (net_gallons, unit_price) |
 | **Receivables** | ar_aging (invoice_date, due_date, invoice_amount) · dso (invoice_date, paid_date, invoice_amount) · credit_risk_late_payers (due_date, paid_date) |
-| **Inventory** | inventory_days_of_supply (inventory_snapshot, tank_capacity, min_heel) · gain_loss_reconciliation (physical_inventory, inventory_snapshot) · tank_utilization (inventory_snapshot, tank_capacity) |
+| **Inventory** | inventory_days_of_supply (inventory_snapshot, tank_capacity, min_heel) · gain_loss_reconciliation (physical_inventory, inventory_snapshot) · tank_utilization (inventory_snapshot, tank_capacity) · **receipt_detail** *(feed: receipt_source; target 20 receipts)* |
 | **Market** | basis_tracking (market_price, nyh_basis) · position_committed (committed_buys, committed_sells) |
+| **Pricing** | **pricing_sandbox** *(feed: rack_benchmark; target 30 days)* · **quote_elasticity** *(feed: quoted_price + outcome; target 50 quotes)* |
 
 ### Data profiles make the matrix flex
 
@@ -116,15 +141,18 @@ from the **same code** on different data:
 
 | Profile | Populated | Enabled features |
 |---|---|---|
-| `core` | only the 3 required fields (no inventory/invoices/market) | **4** |
+| `core` | only the 3 required fields (no inventory/invoices/market/quotes/receipts) | **4** |
 | `lite` | core + `terminal` + `product` on lifts | **6** |
-| `full` | every canonical field | **17** |
+| `full` | every canonical field (incl. rack_benchmark, quotes, receipts) | **20** |
 
 ```
-rackiq-generate --profile core   #  capabilities enabled: 4/17
-rackiq-generate --profile lite   #  capabilities enabled: 6/17
-rackiq-generate --profile full   #  capabilities enabled: 17/17
+rackiq-generate --profile core   #  capabilities enabled: 4/20
+rackiq-generate --profile lite   #  capabilities enabled: 6/20
+rackiq-generate --profile full   #  capabilities enabled: 20/20
 ```
+
+(The 3 feed capabilities count toward "enabled" only once their history crosses the target;
+the `full` book generates enough rack-benchmark days / quotes / receipts to mature all three.)
 
 ---
 
@@ -163,7 +191,9 @@ fields, preview validation, and commit. Capabilities then flex from the fields a
 *import targets* = structural keys (grain/foreign keys) + that table's canonical fields. Required
 mappings per table (must be set to commit): lifts → `customer_id, lift_datetime, net_gallons`;
 invoices → `customer_id`; inventory → `snapshot_datetime, terminal, product`; market →
-`price_date, product`. Derived in `schema.import_targets(table)` from the single source of truth.
+`price_date, product`; quotes → `customer_id, quote_time, product, quoted_price, outcome`;
+receipts → `receipt_datetime, terminal, product, receipt_source`. Derived in
+`schema.import_targets(table)` from the single source of truth.
 
 **Wizard flow** (`POST` unless noted):
 
@@ -179,6 +209,7 @@ invoices → `customer_id`; inventory → `snapshot_datetime, terminal, product`
 | Audit | `GET …/audit` | recent hygiene transformations |
 | Profiles | `GET/POST /api/studio/profiles`, `DELETE …/{name}` | save/list/delete named **cleaning profiles** (mapping **+ hygiene options**); a re-uploaded file whose columns satisfy a profile auto-applies its mapping *and* its fix settings |
 | History | `GET /api/studio/history` | recent imports (table, filename, rows, mode) |
+| Quick feeds | `/api/studio/rack-benchmark`, `/api/studio/quote` | append a daily rack benchmark / a single quote (resolved via crosswalk) through the hygiene pipeline; bumps the "collecting" counters live |
 | Demo / Reset | `/api/studio/load-demo`, `/api/studio/reset` | load the synthetic book (`core`/`lite`/`full`) or clear the store |
 
 Saved profiles, the import log, the **customer crosswalk**, the **hygiene audit log**, and the
@@ -190,7 +221,8 @@ purpose — merge decisions and held rows are never lost when the book is reload
 **Map Columns**, **Clean** (`CleanStep` = `ProfilingScorecard` + `CustomerMasterPanel` +
 `FixOptions`), **Validate** (stat cards + fixes preview + rule cards with row-level drill-down),
 and **Commit** (rows written + hygiene report + quarantine link). A live **Data Capability** panel
-sits alongside, unlocking features the instant data lands.
+sits alongside, unlocking features the instant data lands, plus a **Quick Feeds** panel
+(`components/studio/QuickFeeds.tsx`) with the rack-benchmark daily-entry and quote-logger forms.
 
 ---
 
@@ -232,9 +264,9 @@ of the wizard plus the standing **Data Health** page, and covers eight jobs:
 (gasoline / distillate / crude). `vcf=1.0` exactly at 60°F; hot → shrink, cold → expand.
 
 **Sample files.** `uv run rackiq-export-samples` writes `samples/{lifts,invoices,market_prices,
-inventory_snapshots}_sample.csv` (+ `lifts_sample.xlsx`) with *friendly* headers (e.g. "Customer",
-"Lift Date", "Sell Price", "Posted Rack") so the fuzzy matcher has something to chew on. Importing
-all four walks capabilities 9 → 12 → 14 → 17. It also writes **deliberately-dirty** Hygiene Studio
+inventory_snapshots,quotes,receipts}_sample.csv` (+ `lifts_sample.xlsx`) with *friendly* headers
+(e.g. "Customer", "Lift Date", "Sell Price", "Posted Rack", "OPIS Rack", "Quoted Price", "Outcome")
+so the fuzzy matcher has something to chew on. Importing them walks the capability matrix up. It also writes **deliberately-dirty** Hygiene Studio
 demo files: `samples/lifts_dirty.csv` (customer NAMES with spelling/ID variants of several
 customers, mixed/bad dates, negative volumes, exact-duplicate rows, stray whitespace) and
 `samples/lifts_barrels.csv` (volumes in barrels, for the unit-standardization toggle). `--no-dirty`
@@ -246,7 +278,10 @@ skips them. Worked screenshots of the merge + fix flow live in `docs/hygiene-stu
 
 `backend/app/generator.py` builds a realistic, deterministic-per-seed "Soundview" book:
 ~40 customers across 3 terminals (Linden / Providence / Albany), products RBOB / ULSD /
-ULSHO, ~21 months, plus matching AR, inventory snapshots, and daily market prices.
+ULSHO, ~21 months, plus matching AR, inventory snapshots, and daily market prices. In `full`
+it also generates the early feeds: a daily `rack_benchmark`, a **quote log** (accepts +
+rejections with a recoverable per-archetype price elasticity), and **receipt detail** derived
+from inventory replenishments (source / measurement basis / BL variance).
 
 **Customer archetypes** (default mix sums to 40, scales with `--n-customers`):
 
@@ -271,11 +306,53 @@ recent invoices left **open** (`paid_date` NULL); inventory book rolls forward
 
 ---
 
+## Customer scoring — VAR lane · sub-scores · base value · archetypes
+
+`backend/app/scoring.py` (engine) + `scoring_config.py` (**every weight/threshold/window is a
+config parameter**) read the **resolved** customer master (ids already rewritten to master at
+commit), compute everything over rolling **30/90/365-day windows + all-time**, flag
+**data-sufficiency** per customer, and **capability-gate every metric** (each carries
+`available: true/false + reason`). DuckDB views back the SQL-friendly facts
+(`v_customer_facts`); Python (pandas/numpy/statsmodels/scipy) does STL, regressions, and
+percentile ranking. Results persist to `customer_scores` + `customer_lane`.
+
+- **Part 1 — VAR base-range (lane) model** on net volume (weekly buckets; monthly for sporadic
+  accounts). *Base volume* = seasonally-aware STL trend+seasonal fitted value (robust
+  seasonal-median fallback for short history). *Base range* = base ± 1 robust σ of the
+  de-seasonalized residual (or a fixed `±%`). *Variability range* = base ± 2σ. **VAR score** =
+  `0.45·in_band + 0.35·tightness + 0.20·(1 − excursion)` (weights configurable),
+  grade A≥80/B/C/D, guard ≥8 lifts over ≥12 weeks. A **cadence lane** scores inter-lift timing;
+  headline VAR blends volume/cadence **70/30**. *(This VARIABILITY score is distinct from any
+  financial VaR — never conflated.)* The per-period base / base-range / variability-range series
+  is persisted and drawn as the **base-range chart** (the leadership screen).
+- **Part 2 — Layer-1 behavioral facts**: order size mean/median/CV, monthly volume, frequency,
+  days-between mean & CV, margin/gal mean & CV, days-since-last, product mix + HHI,
+  rush/split/small-order/cancel rates + friction-tag count, payment terms, days-to-pay mean & CV,
+  credit utilization.
+- **Part 3 — Layer-2 sub-scores** (0–100, percentile-ranked across the active book unless noted):
+  Volume/Timing Steadiness (= VAR lanes), Price Sensitivity (β of accept-incidence vs price−reference,
+  gated on quotes/rack benchmark), **EVR** (demand model vs naive-calendar baseline — the
+  useful-vs-dangerous separator), Discount Efficiency (`incremental_GP / GP_given_up`), Market
+  Sensitivity (signed corr profile), Weather Sensitivity (HDD/CDD β; NOAA fetch pending → seasonal
+  proxy), Quote Score (accept/negotiate/latency/lowest-only), Churn Risk. Plus the **Variability
+  Quality Quadrant** (Explainability = EVR × Profitability) → Strategic Lever / Premium Spot /
+  Managed Cost / Dangerous Noise.
+- **Part 4 — Layer-3 Base Value**: `EGP = annual_gal·margin`; friction & credit costs; `RFAP =
+  EGP − friction − credit`; profit per gallon/rack-hour/credit-$/order; strategic uplift
+  (0.8–1.5); **Base Value** = `100·[0.50·pct(RFAP) + 0.30·pct(profit-per-constraint) +
+  0.20·pct(strategic)] × uplift`, grade A/B/C/D.
+- **Part 5 — Archetype classifier**: a **primary + secondary** of the 12 archetypes from
+  *sub-score signatures* (not hard-coded names), each with a confidence and the standing posture
+  (pricing/terms/allocation) it triggers; ambiguous cases (small top-1/top-2 gap) are flagged.
+- Plus **Account Value** (volume×margin×VAR/100, percentile), **Recency gap** (days since last ÷
+  base cadence), and a **backtest** helper (per-customer one-step MAE by method: naive-last,
+  seasonal, lane-base).
+
 ## API endpoints
 
 All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
-live in `api/routes.py`; the `/api/studio/*` write/upload endpoints are in `api/studio.py`
-(see **Data Studio** above).
+live in `api/routes.py`; `/api/studio/*` write/upload endpoints in `api/studio.py`; the
+`/api/scores/*` scoring endpoints in `api/scores.py` (live-compute with a data-signature cache).
 
 | Endpoint | Purpose |
 |---|---|
@@ -286,6 +363,12 @@ live in `api/routes.py`; the `/api/studio/*` write/upload endpoints are in `api/
 | `GET /api/customers` | per-customer rollups; `avg_margin_per_gal`/`dso_days` are `null` when those capabilities are off — the API itself honors the matrix |
 | `GET /api/market-prices?product=ULSD` | market vs street-rack time series (`available:false` when absent) |
 | `GET /api/monthly-volume` | monthly net gallons (needs only required fields; survives `core`) |
+| `GET /api/scores?window=all` | ranked customers (VAR+grade, base value+grade, archetype, volume, trend) + per-metric `availability` |
+| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, VAR explanation, sub-scores, base value, archetype posture |
+| `GET /api/scores/quadrant?window=` | Explainability × Profitability scatter points with archetype tags |
+| `GET /api/scores/backtest` | per-customer one-step forecast error by method |
+| `GET /api/scores/config` | the scoring config (every weight) + windows + archetypes/posture |
+| `POST /api/scores/recompute` | recompute all windows (+ optional `{overrides}`) and write `customer_scores`/`customer_lane` |
 
 Interactive docs at `http://localhost:8000/docs`.
 
@@ -294,13 +377,19 @@ Interactive docs at `http://localhost:8000/docs`.
 ## Frontend
 
 Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A top nav switches
-between three pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`):
+between four pages via a tiny dependency-free hash router (`lib/useHashRoute.ts`):
 
 - **Dashboard** (`pages/Dashboard.tsx`) — the "Connected — N customers loaded" banner, the live
   **capability-matrix grid** (enabled = green with coverage bar; disabled = grey with the missing
-  fields), a monthly-volume bar chart, a market-price line chart, and a top-customers table
-  (margin/DSO columns appear only when enabled). With no data it shows an empty state that points
-  to Data Studio.
+  fields; *feed* features show an indigo "collecting — N logged" pill), a monthly-volume bar chart,
+  a market-price line chart, and a top-customers table (margin/DSO columns appear only when
+  enabled). With no data it shows an empty state that points to Data Studio.
+- **Scores** (`pages/Scores.tsx`) — the ranked customer table (VAR + grade, base value + grade,
+  primary/secondary archetype, volume, trend), a window selector (30/90/365/all) + recompute,
+  a capability-gated **metric availability** strip, the **Explainability × Profitability quadrant**
+  scatter (`components/scores/QuadrantScatter.tsx`), and a per-customer drill-down rendering the
+  **base-range chart** (`components/scores/BaseRangeChart.tsx`) with the VAR explanation, sub-score
+  bars (greyed when unavailable), base-value breakdown, and archetype posture.
 - **Data Studio** (`pages/DataStudio.tsx`) — the upload → map → **clean** → validate → commit
   wizard with its live "Feed me &lt;field&gt;" capability panel (see **Data Studio** above).
 - **Data Health** (`pages/DataHealth.tsx`) — the standing quality score + drift alerts + quarantine
@@ -352,7 +441,10 @@ backend/
   app/
     schema.py               # ★ canonical field registry + DDL + import targets + hygiene metadata
     db.py                   # DuckDB lifecycle, shared r/w connection + lock, studio + crosswalk/audit/quarantine tables
-    capabilities.py         # ★ FEATURES registry + runtime matrix
+                            #   (scoring caches customer_scores/customer_lane are managed in scoring.ensure_tables)
+    capabilities.py         # ★ FEATURES registry + runtime matrix (incl. "feed" collecting state)
+    scoring.py              # ★ scoring engine: VAR lane, sub-scores, base value, archetypes, backtest
+    scoring_config.py       # ★ ScoringConfig — every weight/threshold/window as a parameter
     generator.py            # parameterized Soundview synthetic data + profiles
     ingest.py               # Data Studio: parse, fuzzy mapping, inspect (+profiling), validate, coerce
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -364,8 +456,9 @@ backend/
     config.py               # settings (db path, CORS, host/port)
     main.py                 # FastAPI app factory (routes + studio routers)
     api/{routes,queries}.py # read endpoints + SQL
-    api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health
-  tests/                    # pytest: test_hygiene_studio.py (units) + test_studio_api.py (e2e flow)
+    api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
+    api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / config / recompute
+  tests/                    # pytest: test_hygiene_studio.py + test_studio_api.py + test_early_feeds.py + test_scoring.py
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -375,14 +468,24 @@ frontend/
     App.tsx, main.tsx, index.css
     lib/{useHashRoute,format}.ts
     api/{client,types}.ts
-    pages/{Dashboard,DataStudio,DataHealth}.tsx
+    pages/{Dashboard,Scores,DataStudio,DataHealth}.tsx
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel}.tsx
-    components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep}.tsx
+    components/scores/{BaseRangeChart,QuadrantScatter}.tsx
+    components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds}.tsx
 CLAUDE.md
 ```
 
 ## Notes & gotchas
-- **numpy < 2.5** on Python 3.11 (2.5 requires 3.12); pinned in `pyproject.toml`.
+- **numpy < 2.5** on Python 3.11 (2.5 requires 3.12); pinned in `pyproject.toml`. The scoring
+  engine adds **statsmodels** (STL) + **scipy** (rank percentiles) — installed by `uv sync`.
+- **Scoring is capability-gated end-to-end**: each metric returns `available + reason`; gated
+  sub-scores (margin, elasticity, EVR, market, quotes, credit) report `available:false` on a thin
+  book and the UI greys them out. `customer_scores`/`customer_lane` are *derived caches* recomputed
+  from canonical data (live-computed on read with a data-signature cache; persisted by `recompute`).
+- **`window` is a reserved word in DuckDB** (window functions) — the scoring tables use
+  `score_window` for the column (the JSON/API still exposes `window`), like the `at`→`ts` rule.
+- The **VARIABILITY** "VAR" score (steadiness, 0–100) is deliberately distinct from any financial
+  **VaR** — they are never conflated in code or UI.
 - DuckDB bulk insert casts each column to its declared schema type, so pandas
   datetime → DATE/TIMESTAMP and `NaT` → NULL are handled in `db.insert_df`.
 - Coverage is measured against each field's **own** table row count.

@@ -200,22 +200,28 @@ def _build_market_prices(cfg: GenConfig, dates, rng):
 
     terminal_markup = {t: 0.020 + 0.012 * i for i, t in enumerate(cfg.terminals)}
     street = {}
+    bench = {}
     rows = []
     for p in cfg.products:
         for t in cfg.terminals:
             rack = market[p] + basis[p] + terminal_markup[t] + rng.normal(0, 0.004, n)
             street[(p, t)] = rack
+            # External street/OPIS rack benchmark: tracks our posting with its own noise.
+            benchmark = market[p] + basis[p] + terminal_markup[t] + rng.normal(0, 0.005, n)
+            bench[(p, t)] = benchmark
             cb = _ou(rng, n, mean=500000, start=float(rng.uniform(300000, 700000)),
                      theta=0.04, vol=35000, floor=0)
             cs = _ou(rng, n, mean=500000, start=float(rng.uniform(300000, 700000)),
                      theta=0.04, vol=35000, floor=0)
             for i in range(n):
                 rows.append((dates[i], p, t, round(float(market[p][i]), 4), round(float(basis[p][i]), 4),
-                             round(float(rack[i]), 4), round(float(cb[i]), 0), round(float(cs[i]), 0)))
+                             round(float(rack[i]), 4), round(float(cb[i]), 0), round(float(cs[i]), 0),
+                             round(float(benchmark[i]), 4)))
     df = pd.DataFrame(rows, columns=["price_date", "product", "terminal", "market_price",
-                                     "nyh_basis", "street_rack", "committed_buys", "committed_sells"])
+                                     "nyh_basis", "street_rack", "committed_buys", "committed_sells",
+                                     "rack_benchmark"])
     df["price_date"] = pd.to_datetime(df["price_date"])
-    px = {"market": market, "basis": basis, "street": street, "cost": cost}
+    px = {"market": market, "basis": basis, "street": street, "cost": cost, "bench": bench}
     return df, px
 
 
@@ -381,6 +387,113 @@ def _build_inventory(cfg: GenConfig, lifts, dates, rng):
     return df
 
 
+# ---- Early feeds: quote log + receipt detail ------------------------------------
+# Per-archetype price elasticity (slope of accept-incidence vs price-over-reference).
+# Higher = more price-sensitive (rejects more as the quote climbs above the rack benchmark).
+_ELASTICITY = {"ratable": 1.6, "weather_distillate": 2.2, "price_chaser": 6.0,
+               "marine": 1.4, "cstore_chain": 3.2}
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _build_quotes(cfg: GenConfig, profiles, lifts, px, dates, rng):
+    """Synthesize a quote log (accepts AND rejections) — the elasticity training set.
+
+    Each quote prices ``quoted_price`` against the street/rack ``reference``; the accept
+    probability falls as the quote climbs above the reference, with a per-archetype
+    elasticity slope, so a downstream model can recover a (negative) price-elasticity β.
+    """
+    cols = schema.column_names(schema.QUOTES)
+    if lifts is None or len(lifts) == 0:
+        return pd.DataFrame(columns=cols)
+    n = len(dates)
+    date_index = {d: i for i, d in enumerate(dates)}
+    lifts2 = lifts.copy()
+    lifts2["d"] = lifts2["lift_datetime"].dt.date
+    span = lifts2.groupby("customer_id")["d"].agg(["min", "max", "count"])
+    prof_by_id = {p["customer_id"]: p for p in profiles}
+
+    inv_states = ["long", "balanced", "balanced", "short"]
+    cap_states = ["open", "balanced", "tight"]
+    comp_ctx = ["none", "competitor_undercut", "competitor_matched", "sole_supplier"]
+
+    rows = []
+    for cid, r in span.iterrows():
+        prof = prof_by_id.get(cid)
+        if prof is None:
+            continue
+        el = _ELASTICITY.get(prof["archetype"], 3.0)
+        home = prof["home_terminal"]
+        products = prof["products"]
+        i0 = date_index.get(r["min"], 0)
+        i1 = date_index.get(r["max"], n - 1)
+        if i1 <= i0:
+            i1 = min(n - 1, i0 + 1)
+        nq = int(max(8, min(140, round(r["count"] * 1.4))))
+        center = -float(prof["discount"])  # we typically quote a touch under the rack
+        for _ in range(nq):
+            di = int(rng.integers(i0, i1 + 1))
+            d = dates[di]
+            p = products[int(rng.integers(0, len(products)))]
+            ref_arr = px["street"].get((p, home))
+            if ref_arr is None:
+                ref_arr = next(iter(px["street"].values()))
+            reference = float(ref_arr[di])
+            cost = float(px["cost"][p][di])
+            offset = float(rng.uniform(-0.06, 0.11))
+            quoted = max(reference + offset, cost + 0.002)
+            spread = quoted - reference
+            paccept = min(0.97, max(0.02, _sigmoid(1.1 - el * ((spread - center) / 0.05))))
+            u = float(rng.random())
+            if u < paccept:
+                outcome, final, ttd = "accept", max(300.0, prof["base_volume"] * (1 + rng.normal(0, prof["cv"]))), max(2.0, float(rng.normal(120, 50)))
+            elif u < paccept + 0.12:
+                outcome, final, ttd = "no_response", None, max(60.0, float(rng.normal(1440, 600)))
+            else:
+                outcome, final, ttd = "reject", None, max(3.0, float(rng.normal(90, 60)))
+            qt = datetime(d.year, d.month, d.day, int(rng.integers(7, 17)), int(rng.integers(0, 60)))
+            rows.append((cid, qt, p, round(quoted, 4), round(reference, 4),
+                         inv_states[int(rng.integers(0, len(inv_states)))],
+                         cap_states[int(rng.integers(0, len(cap_states)))],
+                         comp_ctx[int(rng.integers(0, len(comp_ctx)))],
+                         outcome, round(ttd, 1),
+                         round(float(final), 1) if final is not None else None))
+    df = pd.DataFrame(rows, columns=cols)
+    df["quote_time"] = pd.to_datetime(df["quote_time"])
+    df["final_gallons"] = pd.to_numeric(df["final_gallons"], errors="coerce")
+    return df
+
+
+def _build_receipts(cfg: GenConfig, inventory_df, rng):
+    """Synthesize receipt detail from inventory replenishment events (source / basis / variance)."""
+    cols = schema.column_names(schema.RECEIPTS)
+    if inventory_df is None or len(inventory_df) == 0:
+        return pd.DataFrame(columns=cols)
+    ev = inventory_df[inventory_df["receipts"] > 0.0]
+    basis_for = {"marine": "ship_meter", "pipeline": "pipeline_meter", "truck": "truck_meter"}
+    rows = []
+    for r in ev.itertuples(index=False):
+        net = float(r.receipts)
+        if net > 300000:
+            src = "marine" if rng.random() < 0.7 else "pipeline"
+        elif net > 80000:
+            src = "pipeline" if rng.random() < 0.6 else "marine"
+        else:
+            src = "truck" if rng.random() < 0.6 else "pipeline"
+        gross = net * (1 + abs(float(rng.normal(0, 0.0008))))
+        variance = float(rng.normal(0, 0.001) * net)  # BL vs received (signed)
+        mb = basis_for[src]
+        if src == "marine" and rng.random() < 0.4:
+            mb = "shore_tank"
+        rows.append((r.snapshot_datetime, r.terminal, r.product, src,
+                     round(gross, 1), round(net, 1), mb, round(variance, 1)))
+    df = pd.DataFrame(rows, columns=cols)
+    df["receipt_datetime"] = pd.to_datetime(df["receipt_datetime"])
+    return df
+
+
 # ---- Profile handling -----------------------------------------------------------
 def _profile_optional_fields(profile: str) -> set:
     if profile == "full":
@@ -420,6 +533,8 @@ def generate(cfg: GenConfig, con) -> dict:
     lifts_df = _build_lifts(cfg, profiles, px, dates, ambient, hdd_norm, rng)
     invoices_df = _build_invoices(cfg, lifts_df, profiles, rng)
     inventory_df = _build_inventory(cfg, lifts_df, dates, rng)
+    quotes_df = _build_quotes(cfg, profiles, lifts_df, px, dates, rng)
+    receipts_df = _build_receipts(cfg, inventory_df, rng)
 
     db.drop_all(con)
     db.init_db(con)
@@ -433,6 +548,10 @@ def generate(cfg: GenConfig, con) -> dict:
         db.insert_df(con, schema.INVOICES, invoices_df)
     if _table_enabled(schema.MARKET, allowed):
         db.insert_df(con, schema.MARKET, market_df)
+    if _table_enabled(schema.QUOTES, allowed):
+        db.insert_df(con, schema.QUOTES, quotes_df)
+    if _table_enabled(schema.RECEIPTS, allowed):
+        db.insert_df(con, schema.RECEIPTS, receipts_df)
 
     db.set_meta(con, "profile", cfg.profile)
     db.set_meta(con, "seed", cfg.seed)

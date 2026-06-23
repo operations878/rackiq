@@ -24,17 +24,28 @@ export interface FieldPresence {
   coverage: number;
 }
 
+export interface Collecting {
+  count: number;
+  target: number;
+  unit: string;
+  label: string;
+  rejections?: number;
+}
+
 export interface Feature {
   key: string;
   label: string;
   description: string;
   category: string;
+  kind?: "analysis" | "feed";
+  status?: "enabled" | "collecting" | "locked";
   required_fields: string[];
   optional_fields: string[];
   enabled: boolean;
   missing_fields: string[];
   enhanced_by: string[];
   coverage: number;
+  collecting?: Collecting | null;
 }
 
 export interface Capabilities {
@@ -42,6 +53,7 @@ export interface Capabilities {
   categories: string[];
   fields: Record<string, FieldPresence>;
   features: Feature[];
+  feeds?: Record<string, number>;
   summary: { enabled: number; total: number };
 }
 
@@ -329,6 +341,12 @@ export interface AuditEntry {
   rows_affected: number;
 }
 
+export interface FeedCounts {
+  rack_benchmark_days: number;
+  quotes: { total: number; rejected: number; by_outcome: Record<string, number> };
+  receipts: { rows: number; by_source: Record<string, number> };
+}
+
 export interface DataHealth {
   score: number;
   grade: string;
@@ -340,9 +358,38 @@ export interface DataHealth {
     volume: VolumeDrift | null;
   };
   quarantine: { total: number; by_table: Record<string, number> };
+  feeds?: FeedCounts;
   crosswalk: { size: number; masters: number };
   recent_audit: AuditEntry[];
   profile: string;
+}
+
+// ---- Early data feeds (quick-entry forms) ---------------------------------------
+export interface RackBenchmarkEntry {
+  price_date: string;
+  terminal: string;
+  product: string;
+  rack_benchmark: number;
+}
+
+export interface QuoteEntry {
+  customer_id: string;
+  quote_time: string;
+  product: string;
+  quoted_price: number;
+  outcome: string;
+  market_price_at_quote?: number | null;
+  inventory_state?: string | null;
+  capacity_state?: string | null;
+  competitor_context?: string | null;
+  time_to_decision?: number | null;
+  final_gallons?: number | null;
+}
+
+export interface FeedWriteResponse extends StudioState {
+  ok: boolean;
+  rows_written: number;
+  quarantined: number;
 }
 
 export interface QuarantineRow {
@@ -371,4 +418,151 @@ export interface ImportLogEntry {
   filename: string;
   rows: number;
   mode: string;
+}
+
+// ---- Customer scoring -----------------------------------------------------------
+export interface Availability {
+  available: boolean;
+  reason: string;
+}
+
+export interface VarBlock {
+  score: number | null;
+  grade: string | null;
+  volume_var: number | null;
+  cadence_var: number | null;
+  status: string;
+  base_level: number;
+  base_cadence_days: number | null;
+  in_band_rate: number | null;
+  tightness: number | null;
+  excursion_penalty: number | null;
+  method: string;
+  explanation: string;
+}
+
+export interface BaseValueBlock {
+  score: number;
+  grade: string | null;
+  egp: number;
+  friction_cost: number;
+  credit_cost: number;
+  rfap: number;
+  profit_per_gallon: number | null;
+  profit_per_rackhour: number | null;
+  profit_per_credit_dollar: number | null;
+  profit_per_order: number | null;
+  strategic_uplift: number;
+  annual_gallons: number;
+  available: boolean;
+}
+
+export interface SubScore {
+  value: number | null;
+  available: boolean;
+  reason?: string;
+  note?: string;
+  beta?: number | null;
+  ratio?: number | null;
+  accept_rate?: number | null;
+  collecting?: boolean;
+  profile?: { level: number; momentum: number; volatility: number } | null;
+}
+
+export interface QuadrantBlock {
+  explainability: number | null;
+  profitability: number | null;
+  quadrant: string | null;
+}
+
+export interface ArchetypeBlock {
+  primary: string;
+  secondary: string;
+  confidence: number;
+  ambiguous: boolean;
+  posture: Record<string, string>;
+  scores: Record<string, number>;
+}
+
+export interface LanePoint {
+  period_start: string;
+  base: number;
+  base_lo: number;
+  base_hi: number;
+  var_lo: number;
+  var_hi: number;
+  actual: number;
+}
+
+export interface ScoreCustomer {
+  customer_id: string;
+  name: string;
+  archetype_true: string | null;
+  home_terminal: string | null;
+  window: string;
+  grain: string;
+  data_sufficient: boolean;
+  n_lifts: number;
+  total_net_gallons: number;
+  monthly_volume: number;
+  trend_pct: number;
+  recency_gap: number;
+  var: VarBlock;
+  base_value: BaseValueBlock;
+  account_value: number | null;
+  quadrant: QuadrantBlock;
+  archetype: ArchetypeBlock;
+  subscores: Record<string, SubScore>;
+  lane_series?: LanePoint[];
+  facts?: Record<string, number | string | null | Record<string, number>>;
+}
+
+export interface ScoresResponse {
+  window: string;
+  as_of: string | null;
+  availability: Record<string, Availability>;
+  windows: string[];
+  n_customers: number;
+  customers: ScoreCustomer[];
+}
+
+export interface QuadrantPoint {
+  customer_id: string;
+  name: string;
+  explainability: number;
+  profitability: number;
+  quadrant: string;
+  primary_archetype: string;
+  var_score: number | null;
+  base_value: number;
+  total_net_gallons: number;
+  data_sufficient: boolean;
+}
+
+export interface QuadrantResponse {
+  window: string;
+  as_of: string | null;
+  points: QuadrantPoint[];
+  axes: { x: string; y: string };
+}
+
+export interface CustomerScoreResponse {
+  window: string;
+  as_of: string | null;
+  availability: Record<string, Availability>;
+  customer: ScoreCustomer;
+}
+
+export interface BacktestRow {
+  customer_id: string;
+  name: string;
+  grain: string;
+  mae: Record<string, number>;
+  best: string;
+}
+
+export interface BacktestResponse {
+  customers: BacktestRow[];
+  methods: string[];
+  summary: Record<string, number>;
 }
