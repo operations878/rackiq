@@ -23,6 +23,11 @@ import type {
   QuadrantResponse,
   CustomerScoreResponse,
   BacktestResponse,
+  RegimeConfig,
+  Regime,
+  DailyResponse,
+  ScorecardsResponse,
+  PlaybookResponse,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -149,5 +154,28 @@ export const api = {
     recompute: (overrides?: Record<string, number | string>) =>
       postJSON<{ ok: boolean; computed_at: string; windows: Record<string, number> }>(
         "/scores/recompute", { overrides: overrides ?? null }),
+  },
+
+  // ---- Daily operating dashboard / regime / scorecards / playbook ----
+  regimeConfig: () => getJSON<RegimeConfig>("/regime/config"),
+  daily: (regime: Regime, terminal?: string | null, window = "all") => {
+    const qs = new URLSearchParams({ window });
+    if (terminal) qs.set("terminal", terminal);
+    for (const [k, v] of Object.entries(regime)) qs.set(k, v);
+    return getJSON<DailyResponse>(`/daily?${qs.toString()}`);
+  },
+  dailyPersist: (regime: Regime, window = "all") =>
+    postJSON<{ ok: boolean; run_date: string; computed_at: string; terminals: string[]; rows_written: number }>(
+      "/daily/persist", { regime, window }),
+  scorecards: (regime: Regime, terminal?: string | null, window = "all") => {
+    const qs = new URLSearchParams({ window });
+    if (terminal) qs.set("terminal", terminal);
+    for (const [k, v] of Object.entries(regime)) qs.set(k, v);
+    return getJSON<ScorecardsResponse>(`/scorecards?${qs.toString()}`);
+  },
+  playbook: (terminal?: string | null, window = "all") => {
+    const qs = new URLSearchParams({ window });
+    if (terminal) qs.set("terminal", terminal);
+    return getJSON<PlaybookResponse>(`/playbook?${qs.toString()}`);
   },
 };
