@@ -80,6 +80,14 @@ FEATURES: list[Feature] = [
     Feature("gain_loss_reconciliation", "Gain/Loss Reconciliation",
             "Book vs physical inventory variance (gain/loss).",
             "Inventory", ("physical_inventory", "inventory_snapshot"), ("receipts",)),
+    Feature("reconciliation", "Reconciliation & Loss Control (P8)",
+            "Book-vs-physical gain/loss by tank (gross & net), BOL-grouped disbursements, "
+            "net-recon cross-check, loss-mechanism split (temperature / measurement / physical), "
+            "meter-drift control charts, and dollarized recoverable loss.",
+            "Inventory", ("physical_inventory", "receipt_source"),
+            ("compartment_net_gallons", "compartment_gross_gallons", "compartment_temp",
+             "compartment_api", "compartment_unit_cost", "measurement_basis",
+             "bl_vs_received_variance", "receipts")),
     Feature("tank_utilization", "Tank Utilization",
             "Fill level vs shell capacity.",
             "Inventory", ("inventory_snapshot", "tank_capacity"), ("tank_id",)),

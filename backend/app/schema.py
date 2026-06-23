@@ -46,14 +46,15 @@ INVOICES = "invoices"
 MARKET = "market_prices"
 QUOTES = "quotes"              # early feed: the elasticity training set (accept/reject log)
 RECEIPTS = "receipts"          # early feed: receipt detail (source / measurement / BL variance)
+BOL = "bol_compartments"       # raw compartment rows of a bill-of-lading (rack/truck loadings)
 
 # Canonical data tables whose contents drive capability detection.
-CANONICAL_TABLES = [LIFTS, INVENTORY, INVOICES, MARKET, QUOTES, RECEIPTS]
+CANONICAL_TABLES = [LIFTS, INVENTORY, INVOICES, MARKET, QUOTES, RECEIPTS, BOL]
 # All physical tables (customers is a supporting dimension).
-ALL_TABLES = [CUSTOMERS, LIFTS, INVENTORY, INVOICES, MARKET, QUOTES, RECEIPTS]
+ALL_TABLES = [CUSTOMERS, LIFTS, INVENTORY, INVOICES, MARKET, QUOTES, RECEIPTS, BOL]
 
 
-# ---- Canonical field registry (3 required + 23 optional) ------------------------
+# ---- Canonical field registry (3 required + 42 optional) ------------------------
 CANONICAL_FIELDS: list[Field] = [
     # --- lifts: required core ---
     Field("customer_id", LIFTS, DType.VARCHAR, True, "Customer identifier (core)."),
@@ -102,6 +103,12 @@ CANONICAL_FIELDS: list[Field] = [
     Field("receipt_net_gallons", RECEIPTS, DType.DOUBLE, False, "Net (temperature-corrected) gallons received."),
     Field("measurement_basis", RECEIPTS, DType.VARCHAR, False, "Measurement basis: shore_tank / ship_meter / pipeline_meter / truck_meter."),
     Field("bl_vs_received_variance", RECEIPTS, DType.DOUBLE, False, "Bill-of-lading vs received variance (gallons; signed)."),
+    # --- bol_compartments (raw compartment rows; reconciliation groups by bol_number): optional ---
+    Field("compartment_gross_gallons", BOL, DType.DOUBLE, False, "Gross (observed) gallons in this compartment."),
+    Field("compartment_net_gallons", BOL, DType.DOUBLE, False, "Billed/stated net gallons on the BOL meter ticket for this compartment."),
+    Field("compartment_temp", BOL, DType.DOUBLE, False, "Observed loading temperature for this compartment (deg F)."),
+    Field("compartment_api", BOL, DType.DOUBLE, False, "API gravity at loading for this compartment."),
+    Field("compartment_unit_cost", BOL, DType.DOUBLE, False, "Cost of goods for this compartment ($/gal) — used to dollarize loss."),
 ]
 
 FIELDS_BY_NAME: dict[str, Field] = {f.name: f for f in CANONICAL_FIELDS}
@@ -140,6 +147,16 @@ STRUCTURAL_COLUMNS: dict[str, list[tuple[str, DType]]] = {
         ("receipt_datetime", DType.TIMESTAMP),
         ("terminal", DType.VARCHAR),
         ("product", DType.VARCHAR),
+    ],
+    BOL: [
+        ("bol_number", DType.VARCHAR),       # groups compartments into one disbursement event
+        ("bol_datetime", DType.TIMESTAMP),
+        ("terminal", DType.VARCHAR),
+        ("product", DType.VARCHAR),
+        ("tank_id", DType.VARCHAR),          # the tank this compartment drew from
+        ("meter_id", DType.VARCHAR),         # the loading rack/meter/lane (drift + lane divergence)
+        ("customer_id", DType.VARCHAR),      # who lifted (FK; resolved via the crosswalk)
+        ("compartment_id", DType.VARCHAR),   # compartment identifier within the BOL
     ],
 }
 
@@ -209,6 +226,7 @@ TABLE_LABELS: dict[str, str] = {
     MARKET: "Market Prices",
     QUOTES: "Quote Log (accept/reject)",
     RECEIPTS: "Receipt Detail",
+    BOL: "BOL Compartments (rack loadings)",
 }
 
 # Descriptions for the structural (non-canonical) columns so the mapping UI can explain
@@ -221,6 +239,11 @@ STRUCTURAL_DESCRIPTIONS: dict[str, str] = {
     "customer_id": "Customer identifier (foreign key on this table).",
     "quote_time": "Timestamp the quote was given (grain key).",
     "receipt_datetime": "Timestamp the receipt landed (grain key).",
+    "bol_number": "Bill-of-lading number — groups compartments into one disbursement (grain key).",
+    "bol_datetime": "Timestamp the load left the rack (grain key).",
+    "tank_id": "Tank the compartment drew from (dimensional key).",
+    "meter_id": "Loading rack / meter / lane (dimensional key — drives meter-drift detection).",
+    "compartment_id": "Compartment identifier within the BOL.",
 }
 
 # Columns that must be mapped before a file can be committed into each table.
@@ -231,6 +254,7 @@ REQUIRED_IMPORT_KEYS: dict[str, list[str]] = {
     MARKET: ["price_date", "product"],
     QUOTES: ["customer_id", "quote_time", "product", "quoted_price", "outcome"],
     RECEIPTS: ["receipt_datetime", "terminal", "product", "receipt_source"],
+    BOL: ["bol_number", "bol_datetime", "terminal", "product", "tank_id", "compartment_net_gallons"],
 }
 
 # The single datetime/date column that defines a table's time axis (for date-range stats).
@@ -241,10 +265,11 @@ PRIMARY_TIME_COLUMN: dict[str, str] = {
     MARKET: "price_date",
     QUOTES: "quote_time",
     RECEIPTS: "receipt_datetime",
+    BOL: "bol_datetime",
 }
 
 # Tables a user can import into (customers is derived from lifts, never imported directly).
-IMPORTABLE_TABLES = [LIFTS, INVOICES, INVENTORY, MARKET, QUOTES, RECEIPTS]
+IMPORTABLE_TABLES = [LIFTS, INVOICES, INVENTORY, MARKET, QUOTES, RECEIPTS, BOL]
 
 
 def import_targets(table: str) -> list[dict]:
@@ -281,6 +306,7 @@ CUSTOMER_KEY_COLUMN: dict[str, str] = {
     LIFTS: "customer_id",
     INVOICES: "customer_id",
     QUOTES: "customer_id",
+    BOL: "customer_id",
 }
 
 # Canonical fields that represent a volume in gallons. These are the columns eligible
@@ -290,11 +316,13 @@ VOLUME_FIELDS: set[str] = {
     "inventory_snapshot", "physical_inventory", "receipts",
     "committed_buys", "committed_sells",
     "final_gallons", "receipt_gross_gallons", "receipt_net_gallons",
+    "compartment_gross_gallons", "compartment_net_gallons",
 }
 
 # Canonical fields that represent a per-gallon price or a dollar amount.
 PRICE_FIELDS: set[str] = {"unit_price", "unit_cost", "market_price", "street_rack", "nyh_basis",
-                          "rack_benchmark", "quoted_price", "market_price_at_quote"}
+                          "rack_benchmark", "quoted_price", "market_price_at_quote",
+                          "compartment_unit_cost"}
 
 # Fields that must never be negative (a negative value is a hard data error).
 # Note: bl_vs_received_variance is intentionally excluded — a receipt variance may be signed.
@@ -302,6 +330,7 @@ NONNEGATIVE_FIELDS: set[str] = VOLUME_FIELDS | {
     "unit_price", "unit_cost", "market_price", "street_rack",
     "invoice_amount", "credit_limit", "observed_temp",  # observed_temp in deg F, >0 in practice
     "rack_benchmark", "quoted_price", "market_price_at_quote", "time_to_decision",
+    "compartment_unit_cost",  # compartment_temp omitted: cold loadings can be sub-freezing (signed)
 }
 
 # Inclusive (lo, hi) sane bounds per canonical field for the "within sane bounds" rule.
@@ -333,6 +362,11 @@ FIELD_BOUNDS: dict[str, tuple[float, float]] = {
     "receipt_gross_gallons": (0.0, 200_000_000.0),
     "receipt_net_gallons": (0.0, 200_000_000.0),
     "bl_vs_received_variance": (-50_000_000.0, 50_000_000.0),
+    "compartment_gross_gallons": (0.0, 200_000.0),
+    "compartment_net_gallons": (0.0, 200_000.0),
+    "compartment_temp": (-40.0, 160.0),
+    "compartment_api": (0.0, 100.0),
+    "compartment_unit_cost": (0.0, 50.0),
 }
 
 # Fields a user may fill from a default when missing (low-cardinality dimensional values).
@@ -342,6 +376,7 @@ DEFAULTABLE_FIELDS: dict[str, list[str]] = {
     MARKET: ["terminal", "product"],
     QUOTES: ["product"],
     RECEIPTS: ["terminal", "product"],
+    BOL: ["terminal", "product"],
 }
 
 # Reasonable absolute date window for the "dates in range" rule (catches typo'd years).

@@ -566,3 +566,149 @@ export interface BacktestResponse {
   methods: string[];
   summary: Record<string, number>;
 }
+
+// ---- Reconciliation & loss control (P8) -----------------------------------------
+export interface ReconMechanism {
+  temperature_gal: number | null;
+  measurement_gal: number | null;
+  physical_gal: number | null;
+  temperature_pct?: number;
+  measurement_pct?: number;
+  physical_pct?: number;
+}
+
+export interface ReconControl {
+  mean_pct: number;
+  last_pct: number;
+  ucl_pct: number;
+  lcl_pct: number;
+  n_out: number;
+  run_above: number;
+  persistent_out: boolean;
+  severity: number;
+  trend: string;
+}
+
+export interface ReconTankPeriod {
+  period: string;
+  throughput: number;
+  net_loss_gal: number;
+  gross_loss_gal: number | null;
+  loss_pct: number;
+  temperature_gal: number | null;
+  measurement_gal: number | null;
+  physical_gal: number | null;
+  out_of_control: boolean;
+}
+
+export interface ReconTank {
+  tank_id: string;
+  terminal: string;
+  product: string;
+  meter_id: string | null;
+  throughput_gal: number;
+  net_loss_gal: number;
+  gross_loss_gal: number | null;
+  loss_pct: number;
+  unit_cost: number;
+  dollar_loss_per_yr: number;
+  recoverable_dollar_per_yr: number;
+  mechanism: ReconMechanism;
+  dominant_mechanism: string | null;
+  control: ReconControl;
+  vs_network: string;
+  series: ReconTankPeriod[];
+}
+
+export interface ReconMeter {
+  meter_id?: string;
+  terminal?: string;
+  product?: string;
+  n_bols: number;
+  billed_net: number;
+  recomputed_net: number;
+  delta_gal: number;
+  delta_pct: number;
+  consistency: number;
+  systematic: boolean;
+  trend: string;
+  flag_label: string | null;
+}
+
+export interface ReconReceiptSource {
+  source: string;
+  n: number;
+  gross_gal: number;
+  net_gal: number;
+  bl_variance_gal: number;
+  bl_variance_pct: number;
+  thermal_gap_gal: number;
+  measurement_basis: string | null;
+  label: string;
+}
+
+export interface ReconNetwork {
+  throughput_gal: number;
+  net_loss_gal: number;
+  gross_loss_gal: number | null;
+  loss_pct: number;
+  dollar_loss_per_yr: number;
+  recoverable_dollar_per_yr: number;
+  mechanism: ReconMechanism | null;
+  n_tanks: number;
+  n_bols: number;
+  horizon_days: number;
+  control: { center_pct: number; sigma_pct: number; ucl_pct: number; lcl_pct: number; k: number };
+}
+
+export interface ReconNetSeriesPoint {
+  period: string;
+  throughput: number;
+  net_loss_gal: number;
+  loss_pct: number;
+  anomaly: boolean;
+}
+
+export interface ReconDrift {
+  tank_id: string;
+  meter_id: string;
+  terminal: string;
+  product: string;
+  severity: number;
+  mean_pct: number;
+  last_pct: number;
+  ucl_pct: number;
+  n_out: number;
+  run_above: number;
+  persistent_out: boolean;
+  trend: string;
+  dominant_mechanism: string | null;
+}
+
+export interface Reconciliation {
+  available: boolean;
+  reason?: string;
+  missing_fields?: string[];
+  period_grain: string;
+  has_bol?: boolean;
+  as_of?: string | null;
+  network: ReconNetwork | null;
+  tanks: ReconTank[];
+  net_recon: {
+    available?: boolean;
+    by_meter: ReconMeter[];
+    by_terminal: ReconMeter[];
+    reason?: string;
+    checked_bols?: number;
+    checked_compartments?: number;
+  };
+  receipts: {
+    available?: boolean;
+    by_source: ReconReceiptSource[];
+    vessel_vef_pct?: number | null;
+    pipeline_shrink_pct?: number | null;
+  };
+  loss_tracking: { network_series: ReconNetSeriesPoint[] };
+  meter_drift: { ranked: ReconDrift[]; n_out_of_control: number };
+  note?: string;
+}

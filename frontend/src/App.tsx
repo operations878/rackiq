@@ -7,6 +7,7 @@ import Dashboard from "./pages/Dashboard";
 import DataStudio from "./pages/DataStudio";
 import DataHealth from "./pages/DataHealth";
 import Scores from "./pages/Scores";
+import Reconciliation from "./pages/Reconciliation";
 
 function Centered({ children }: { children: ReactNode }) {
   return (
@@ -74,7 +75,8 @@ export default function App() {
   const onStudio = route === "studio";
   const onHealth = route === "health";
   const onScores = route === "scores";
-  const onDashboard = !onStudio && !onHealth && !onScores;
+  const onRecon = route === "reconciliation";
+  const onDashboard = !onStudio && !onHealth && !onScores && !onRecon;
   const quarantine = summary.quarantine_total ?? 0;
 
   return (
@@ -89,6 +91,7 @@ export default function App() {
             <nav className="flex items-center gap-1">
               <NavLink label="Dashboard" active={onDashboard} onClick={() => navigate("")} />
               <NavLink label="Scores" active={onScores} onClick={() => navigate("scores")} />
+              <NavLink label="Reconciliation" active={onRecon} onClick={() => navigate("reconciliation")} />
               <NavLink label="Data Studio" active={onStudio} onClick={() => navigate("studio")} />
               <button
                 onClick={() => navigate("health")}
@@ -113,6 +116,7 @@ export default function App() {
         {onStudio && <DataStudio caps={caps} summary={summary} onState={applyState} navigate={navigate} />}
         {onHealth && <DataHealth navigate={navigate} onState={applyState} />}
         {onScores && <Scores summary={summary} />}
+        {onRecon && <Reconciliation summary={summary} navigate={navigate} />}
         {onDashboard && <Dashboard summary={summary} caps={caps} navigate={navigate} />}
       </main>
 

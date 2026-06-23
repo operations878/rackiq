@@ -169,6 +169,24 @@ SYNONYMS: dict[str, list[str]] = {
                           "measurement", "basis of measure", "metering"],
     "bl_vs_received_variance": ["bl vs received", "bl variance", "bol variance", "loss gain",
                                 "bill of lading variance", "received variance", "transit loss"],
+    # --- bol_compartments (raw compartment rows; reconciliation groups by BOL) ---
+    # Compartment value fields use only compartment-prefixed aliases so they don't out-rank a
+    # plain lifts file; the bare "net/gross/temp" headers still map via token-overlap similarity.
+    "bol_number": ["bol", "bol number", "bol no", "bill of lading", "b/l", "bl number",
+                   "load number", "ticket number", "load ticket", "bol id"],
+    "bol_datetime": ["bol date", "bol time", "load date", "loading date", "ship date",
+                     "bol datetime", "load datetime"],
+    "meter_id": ["meter", "meter id", "lane", "loading lane", "load arm", "rack meter",
+                 "meter no", "loading arm"],
+    "compartment_id": ["compartment", "compartment id", "comp", "comp id", "compartment no",
+                       "compartment number"],
+    "compartment_gross_gallons": ["compartment gross", "gross loaded", "observed gallons",
+                                  "gross load"],
+    "compartment_net_gallons": ["compartment net", "billed net", "metered net", "ticket net",
+                                "net loaded"],
+    "compartment_temp": ["compartment temp", "load temp", "loading temp"],
+    "compartment_api": ["compartment api", "load api"],
+    "compartment_unit_cost": ["compartment cost", "load cost"],
 }
 
 _SUGGEST_THRESHOLD = 0.52
