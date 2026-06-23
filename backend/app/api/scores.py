@@ -61,11 +61,19 @@ _TABLE_FIELDS = ("customer_id", "name", "archetype_true", "home_terminal", "wind
                  "recency_gap", "var", "base_value", "account_value", "quadrant", "archetype")
 
 
+# A slim set of Layer-1 facts the Book Overview table needs (margin, credit, product mix)
+# without shipping the whole heavy facts blob per row.
+_TABLE_FACTS = ("gross_margin_per_gal_mean", "credit_utilization", "late_rate",
+                "product_mix", "days_since_last_order", "monthly_volume")
+
+
 def _table_row(c: dict) -> dict:
     """Trim a full customer record to the ranked-table fields (drops the heavy lane series)."""
     row = {k: c[k] for k in _TABLE_FIELDS if k in c}
     row["subscores"] = {k: {kk: vv for kk, vv in v.items() if kk != "profile"}
                         for k, v in c["subscores"].items()}
+    facts = c.get("facts") or {}
+    row["facts"] = {k: facts.get(k) for k in _TABLE_FACTS}
     return row
 
 

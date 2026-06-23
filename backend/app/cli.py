@@ -64,6 +64,20 @@ def serve_main() -> None:
     uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=False)
 
 
+def export_playbook_main() -> None:
+    """Generate docs/playbook.md from the archetype plays + regime cheat-sheets (Blueprint G)."""
+    from . import playbook
+    ap = argparse.ArgumentParser(prog="rackiq-export-playbook",
+                                 description="Write the Sales Playbook to docs/playbook.md.")
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    ap.add_argument("--out", default=str(repo_root / "docs" / "playbook.md"))
+    args = ap.parse_args()
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(playbook.render_markdown(), encoding="utf-8")
+    print(f"Wrote playbook → {out_path}")
+
+
 # Friendly (non-canonical) headers so the exported samples exercise Data Studio's fuzzy
 # column matcher rather than mapping 1:1 by name.
 _SAMPLE_EXPORTS = {
