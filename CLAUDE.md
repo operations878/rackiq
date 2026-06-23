@@ -194,7 +194,9 @@ fields, preview validation, and commit. Capabilities then flex from the fields a
 mappings per table (must be set to commit): lifts → `customer_id, lift_datetime, net_gallons`;
 invoices → `customer_id`; inventory → `snapshot_datetime, terminal, product`; market →
 `price_date, product`; quotes → `customer_id, quote_time, product, quoted_price, outcome`;
-receipts → `receipt_datetime, terminal, product, receipt_source`. Derived in
+receipts → `receipt_datetime, terminal, product, receipt_source`; bol_compartments →
+`bol_number, bol_datetime, compartment_net_gallons` (terminal/product/tank_id are optional,
+defaultable dimensional keys — a partial BOL feed still imports). Derived in
 `schema.import_targets(table)` from the single source of truth.
 
 **Wizard flow** (`POST` unless noted):
@@ -635,6 +637,16 @@ CLAUDE.md
 - **Hygiene fixes are opt-in and ordered** (trim → drop-empty → units → defaults → net-60 →
   resolve-customers); exact-duplicate removal is lossless, grain-aware duplicate *lifts* are
   quarantined (not dropped) when that toggle is on.
+- **Coercion is forgiving (use everything, quarantine little).** `ingest.coerce_column` treats
+  textual missing-value tokens (`N/A`, `-`, `TBD`, Excel `#REF!`/`#VALUE!` …) as blanks → NULL,
+  **not** parse errors, and recovers decorated numbers (thousands separators, `$`/`%`,
+  accounting negatives `(123)`, a Unicode minus, the Excel text-number apostrophe). A *parse
+  error* is only a value with real content that still won't coerce; `validate` returns per-field
+  `parse_error_samples` + a `required_status` (mapped? all-null?) so the UI explains a failing
+  "required present" rule instead of a bare ∅.
+- **Validate counts reconcile:** `clean_rows + quarantine_count + dropped_rows == rows_after_fixes`.
+  Failing rows are HELD (quarantined) by default; only with `quarantine_failures` off are they
+  dropped — and that count is surfaced (`dropped_rows` / commit `dropped`), never a silent 0/0.
 - **`at` is a reserved word in DuckDB** — the audit/quarantine tables use `ts` for the timestamp
   column (the JSON still exposes `at`).
 - **Crosswalk resolution happens at commit** (variant ids are rewritten to master ids before the

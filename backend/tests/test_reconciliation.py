@@ -32,9 +32,13 @@ def test_bol_compartments_is_canonical_and_importable():
     assert schema.BOL in schema.IMPORTABLE_TABLES
     assert schema.FIELDS_BY_NAME["compartment_net_gallons"].table == schema.BOL
     assert schema.customer_key_column(schema.BOL) == "customer_id"
-    # the grain/grouping key + tank are required to commit
-    for k in ("bol_number", "bol_datetime", "tank_id", "compartment_net_gallons"):
+    # A meaningful compartment row needs its disbursement id, timestamp, and billed volume.
+    for k in ("bol_number", "bol_datetime", "compartment_net_gallons"):
         assert k in schema.required_import_keys(schema.BOL)
+    # terminal / product / tank_id sharpen reconciliation but are optional & defaultable, so
+    # a partial BOL feed is stored and used rather than quarantined wholesale.
+    for k in ("terminal", "product", "tank_id"):
+        assert k not in schema.required_import_keys(schema.BOL)
     # compartment_temp must stay signed (cold loadings can be sub-freezing)
     assert "compartment_temp" not in schema.NONNEGATIVE_FIELDS
 

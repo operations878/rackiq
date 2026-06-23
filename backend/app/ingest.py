@@ -350,8 +350,67 @@ def inspect(df: pd.DataFrame, filename: str) -> dict:
 
 
 # ---- Coercion -------------------------------------------------------------------
+# Textual stand-ins for "missing" that should coerce to NULL (a blank) rather than be
+# counted as parse errors. Exported books routinely type empty cells as a dash, "N/A", or
+# leave an Excel error cell behind; treating these as blanks is what lets a column with a
+# handful of junk cells still import cleanly instead of inflating the parse-error count and
+# (worse) tipping every row into quarantine.
+_NULL_TOKENS = {
+    "", "-", "--", "---", "—", "–", "n/a", "n/a.", "na", "n.a.", "#n/a",
+    "null", "none", "nil", "nan", "tbd", "tba", "?", "??", "unknown", "unk",
+    "#ref!", "#value!", "#name?", "#div/0!", "#null!", "#num!", ".", "..",
+}
+
+_PARSE_SAMPLE_LIMIT = 6
+
+
+def _is_empty(v: object) -> bool:
+    """True for a genuinely empty cell (None / NaN / whitespace-only)."""
+    return (v is None
+            or (isinstance(v, float) and pd.isna(v))
+            or (isinstance(v, str) and v.strip() == ""))
+
+
+def _is_missing(v: object) -> bool:
+    """True for an empty cell OR a textual missing-value token (``N/A``, ``-`` …)."""
+    if _is_empty(v):
+        return True
+    return isinstance(v, str) and v.strip().lower() in _NULL_TOKENS
+
+
+def _fail_samples(series: pd.Series, mask: pd.Series, k: int = _PARSE_SAMPLE_LIMIT) -> list[str]:
+    """A few distinct raw values that failed to coerce — for user-facing diagnostics."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in series[mask]:
+        s = str(v).strip()
+        if s and s.lower() != "nan" and s not in seen:
+            seen.add(s)
+            out.append(s)
+        if len(out) >= k:
+            break
+    return out
+
+
 def _clean_numeric(series: pd.Series) -> pd.Series:
-    cleaned = series.map(lambda v: re.sub(r"[,$%\s]", "", v) if isinstance(v, str) else v)
+    """Strip the common, recoverable numeric decorations before parsing.
+
+    Handles thousands separators, currency / percent signs, accounting-style negatives
+    ``(123)``, a Unicode minus, and the Excel text-number leading apostrophe.
+    """
+    def _conv(v):
+        if not isinstance(v, str):
+            return v
+        s = v.strip().replace("−", "-")         # Unicode minus → ASCII hyphen
+        neg = s.startswith("(") and s.endswith(")")  # accounting negative, e.g. (1,234)
+        if neg:
+            s = s[1:-1]
+        s = s.lstrip("'")                            # Excel text-number leading apostrophe
+        s = re.sub(r"[,$%\s]", "", s)               # thousands / currency / percent / spaces
+        if neg and s and not s.startswith("-"):
+            s = "-" + s
+        return s
+    cleaned = series.map(_conv)
     return pd.to_numeric(cleaned, errors="coerce")
 
 
@@ -381,46 +440,53 @@ def _parse_mixed_dates(series: pd.Series) -> pd.Series:
     return out
 
 
-def coerce_column(series: pd.Series, dtype: str) -> tuple[pd.Series, int]:
-    """Coerce a source column to a canonical dtype; return (coerced, parse_error_count).
+def coerce_column(series: pd.Series, dtype: str) -> tuple[pd.Series, int, list[str]]:
+    """Coerce a source column to a canonical dtype.
 
-    A parse error is a value that was non-blank in the source but failed to coerce.
+    Returns ``(coerced, parse_error_count, failing_samples)``. A *parse error* is a value
+    that carried real content in the source but could not be coerced; textual missing-value
+    tokens (``N/A``, ``-``, Excel error cells …) are treated as blanks (→ NULL), never as
+    parse errors, so a few junk cells don't quarantine an otherwise-good column.
     """
-    non_blank = series.map(lambda v: not (v is None
-                                          or (isinstance(v, float) and pd.isna(v))
-                                          or (isinstance(v, str) and v.strip() == "")))
     if dtype in ("DOUBLE", "INTEGER"):
+        non_blank = ~series.map(_is_missing)
         out = _clean_numeric(series)
-        errors = int((non_blank & out.isna()).sum())
+        err = non_blank & out.isna()
     elif dtype in ("TIMESTAMP", "DATE"):
+        non_blank = ~series.map(_is_missing)
         out = _parse_mixed_dates(series)
-        errors = int((non_blank & out.isna()).sum())
-    else:  # VARCHAR
-        out = series.map(lambda v: None if (v is None or (isinstance(v, float) and pd.isna(v)))
-                         else str(v).strip())
-        errors = 0
-    return out, errors
+        err = non_blank & out.isna()
+    else:  # VARCHAR — only genuinely-empty cells become NULL; content is preserved verbatim.
+        out = series.map(lambda v: None if _is_empty(v) else str(v).strip())
+        err = pd.Series(False, index=series.index)
+    n_err = int(err.sum())
+    samples = _fail_samples(series, err) if n_err else []
+    return out, n_err, samples
 
 
 def build_mapped_frame(
     df: pd.DataFrame, table: str, mapping: dict[str, str]
-) -> tuple[pd.DataFrame, dict[str, int]]:
+) -> tuple[pd.DataFrame, dict[str, int], dict[str, list[str]]]:
     """Apply a {source_col: target} mapping, coercing each target to its declared type.
 
-    Returns the canonical-named frame and a per-target parse-error count. Unmapped source
-    columns are dropped; targets not in ``mapping`` are simply absent (left NULL on insert).
+    Returns the canonical-named frame, a per-target parse-error count, and per-target samples
+    of the values that failed to coerce (for diagnostics). Unmapped source columns are
+    dropped; targets not in ``mapping`` are simply absent (left NULL on insert).
     """
     types = schema.column_types(table)
     out = pd.DataFrame(index=df.index)
     parse_errors: dict[str, int] = {}
+    parse_samples: dict[str, list[str]] = {}
     for src, target in mapping.items():
         if not target or src not in df.columns:
             continue
         dt = types.get(target)
-        coerced, errors = coerce_column(df[src], dt.value if dt else "VARCHAR")
+        coerced, errors, samples = coerce_column(df[src], dt.value if dt else "VARCHAR")
         out[target] = coerced
         parse_errors[target] = errors
-    return out, parse_errors
+        if samples:
+            parse_samples[target] = samples
+    return out, parse_errors, parse_samples
 
 
 # ---- Validation -----------------------------------------------------------------
@@ -440,10 +506,10 @@ def validate(df: pd.DataFrame, table: str, mapping: dict[str, str]) -> dict:
         target_counts.setdefault(target, []).append(src)
     duplicate_targets = {t: srcs for t, srcs in target_counts.items() if len(srcs) > 1}
 
-    mapped, parse_errors = build_mapped_frame(df, table, mapping)
+    mapped, parse_errors, parse_samples = build_mapped_frame(df, table, mapping)
     n_rows = int(len(mapped))
 
-    # Per-field null rates (post-coercion) and parse errors.
+    # Per-field null rates (post-coercion), parse errors, and sample failing values.
     fields_report = []
     for src, target in mapping.items():
         if target not in mapped.columns:
@@ -455,7 +521,18 @@ def validate(df: pd.DataFrame, table: str, mapping: dict[str, str]) -> dict:
             "target": target,
             "null_rate": round(nulls / n_rows, 4) if n_rows else 0.0,
             "parse_errors": parse_errors.get(target, 0),
+            "parse_error_samples": parse_samples.get(target, []),
+            "all_null": bool(n_rows and nulls == n_rows),
         })
+
+    # Status of every required key: mapped? and (if mapped) did every value land null?
+    # This is what lets the UI say *why* "required fields present" fails — an unmapped key
+    # vs. a key whose source column is blank/unparseable — instead of a bare ∅.
+    required_status = []
+    for r in required:
+        is_mapped = r in mapped_targets
+        is_all_null = bool(is_mapped and r in mapped.columns and n_rows and mapped[r].isna().all())
+        required_status.append({"field": r, "mapped": is_mapped, "all_null": is_all_null})
 
     # Date range over the table's primary time column (if mapped).
     time_col = schema.PRIMARY_TIME_COLUMN.get(table)
@@ -480,14 +557,22 @@ def validate(df: pd.DataFrame, table: str, mapping: dict[str, str]) -> dict:
     warnings: list[str] = []
     for fr in fields_report:
         if fr["parse_errors"]:
+            ex = fr.get("parse_error_samples") or []
+            ex_txt = f" (e.g. {', '.join(repr(x) for x in ex[:3])})" if ex else ""
             warnings.append(
                 f"{fr['parse_errors']} value(s) in '{fr['source']}' could not be parsed as "
-                f"{schema.column_types(table).get(fr['target']).value} and will become null.")
+                f"{schema.column_types(table).get(fr['target']).value} and will become null{ex_txt}.")
+    for rs in required_status:
+        if rs["all_null"]:
+            warnings.append(
+                f"Required field '{rs['field']}' is mapped but every value is blank or "
+                f"unparseable — those rows can't be stored until it's remapped or filled.")
     if duplicate_rows:
         warnings.append(f"{duplicate_rows} exact-duplicate row(s) will be removed by the "
                         "hygiene pipeline.")
     if droppable:
-        warnings.append(f"{droppable} row(s) are missing a required key and will be dropped.")
+        warnings.append(f"{droppable} row(s) are missing a required key and will be held "
+                        "for review (quarantined) rather than dropped.")
 
     errors: list[str] = []
     for r in missing_required:
@@ -510,6 +595,7 @@ def validate(df: pd.DataFrame, table: str, mapping: dict[str, str]) -> dict:
         "total_parse_errors": total_parse_errors,
         "fields": fields_report,
         "missing_required": missing_required,
+        "required_status": required_status,
         "warnings": warnings,
         "errors": errors,
         "can_commit": len(errors) == 0,

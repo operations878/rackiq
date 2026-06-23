@@ -254,6 +254,14 @@ export interface ValidateFieldReport {
   target: string;
   null_rate: number;
   parse_errors: number;
+  parse_error_samples?: string[];
+  all_null?: boolean;
+}
+
+export interface RequiredStatus {
+  field: string;
+  mapped: boolean;
+  all_null: boolean;
 }
 
 export interface ValidateResponse {
@@ -267,6 +275,7 @@ export interface ValidateResponse {
   total_parse_errors: number;
   fields: ValidateFieldReport[];
   missing_required: string[];
+  required_status?: RequiredStatus[];
   warnings: string[];
   errors: string[];
   can_commit: boolean;
@@ -276,6 +285,8 @@ export interface ValidateResponse {
   rule_errors: number;
   rule_warnings: number;
   quarantine_count: number;
+  dropped_rows?: number;
+  rows_after_fixes?: number;
   clean_rows: number;
 }
 
@@ -292,6 +303,7 @@ export interface CommitResponse {
   rows_written: number;
   rows_in_file: number;
   quarantined: number;
+  dropped?: number;
   hygiene: HygieneStep[];
   rules: RuleResult[];
   saved_profile: string | null;

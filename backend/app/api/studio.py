@@ -168,7 +168,7 @@ def _raw_by_target(up_df: pd.DataFrame, index, mapping: dict[str, str], table: s
 
 def _coerce_fix(up, table: str, mapping: dict[str, str], options: dict | None):
     """Map -> coerce -> apply hygiene fixes. Returns (fixed_df, report, audit)."""
-    mapped, _ = ingest.build_mapped_frame(up.df, table, mapping)
+    mapped, _, _ = ingest.build_mapped_frame(up.df, table, mapping)
     return hygiene.apply_fixes(mapped, table, options, _con())
 
 
@@ -216,7 +216,7 @@ def crosswalk_propose(req: ProposeRequest):
     if not key_col:
         raise HTTPException(status_code=400,
                             detail=f"{schema.TABLE_LABELS.get(req.table, req.table)} has no customer key to resolve.")
-    mapped, _ = ingest.build_mapped_frame(up.df, req.table, req.mapping)
+    mapped, _, _ = ingest.build_mapped_frame(up.df, req.table, req.mapping)
     if key_col not in mapped.columns:
         raise HTTPException(status_code=400, detail=f"Map a column to '{key_col}' before resolving customers.")
 
@@ -289,8 +289,18 @@ def validate(req: ValidateRequest):
     base["fixes_preview"] = report
     base["rule_errors"] = rules["n_errors"]
     base["rule_warnings"] = rules["n_warnings"]
-    base["quarantine_count"] = rules["quarantine_count"] if (req.options or {}).get("quarantine_failures", True) else 0
-    base["clean_rows"] = int(len(fixed) - rules["quarantine_count"])
+
+    # Honest, reconciling counts: clean + quarantined + dropped == rows after hygiene fixes.
+    # Failing rows are HELD for review by default (quarantine_failures); only when the user
+    # opts out are they dropped — and we surface that count instead of hiding it (a 0/0 that
+    # silently loses every row is exactly the confusion we're fixing).
+    n_fixed = int(len(fixed))
+    n_failing = int(rules["quarantine_count"])
+    quarantine_on = bool((req.options or {}).get("quarantine_failures", True))
+    base["rows_after_fixes"] = n_fixed
+    base["quarantine_count"] = n_failing if quarantine_on else 0
+    base["dropped_rows"] = 0 if quarantine_on else n_failing
+    base["clean_rows"] = max(0, n_fixed - n_failing)
     return base
 
 
@@ -330,6 +340,7 @@ def commit(req: CommitRequest):
 
         # Route failing rows to quarantine (held for review) unless the user opted out.
         n_quarantined = 0
+        n_dropped = 0
         if len(quarantined):
             if opts.quarantine_failures:
                 n_quarantined = _quarantine_rows(con, req.table, up.filename, quarantined,
@@ -337,8 +348,9 @@ def commit(req: CommitRequest):
                 audit.append({"step": "quarantine", "rows_affected": n_quarantined,
                               "detail": f"Held {n_quarantined} failing row(s) for review."})
             else:
-                audit.append({"step": "drop_invalid", "rows_affected": int(len(quarantined)),
-                              "detail": f"Dropped {len(quarantined)} invalid row(s) (quarantine disabled)."})
+                n_dropped = int(len(quarantined))
+                audit.append({"step": "drop_invalid", "rows_affected": n_dropped,
+                              "detail": f"Dropped {n_dropped} invalid row(s) (quarantine disabled)."})
 
         if req.table == schema.LIFTS:
             db.rebuild_customers_from_lifts(con, replace=(req.mode == "replace"))
@@ -365,6 +377,7 @@ def commit(req: CommitRequest):
         "rows_written": rows_written,
         "rows_in_file": int(len(up.df)),
         "quarantined": n_quarantined,
+        "dropped": n_dropped,
         "hygiene": report,
         "rules": rules["rules"],
         "saved_profile": req.save_profile or None,
@@ -471,7 +484,7 @@ def _reimport_table(con, table: str, rows: list[dict], edits: dict) -> tuple[int
             continue
         if dt in (schema.DType.DATE, schema.DType.TIMESTAMP):
             raw_dates[col] = df[col].copy()
-        coerced, _ = ingest.coerce_column(df[col], dt.value)
+        coerced, _, _ = ingest.coerce_column(df[col], dt.value)
         df[col] = coerced
 
     # Re-importing hand-fixed rows: respect the corrected values (don't recompute net).
@@ -564,7 +577,7 @@ def _append_entries(con, table: str, records: list[dict], filename: str,
             continue
         if dt in (schema.DType.DATE, schema.DType.TIMESTAMP):
             raw_dates[col] = df[col].copy()
-        coerced, _ = ingest.coerce_column(df[col], dt.value)
+        coerced, _, _ = ingest.coerce_column(df[col], dt.value)
         df[col] = coerced
 
     opts = hygiene.HygieneOptions(net_correction="off", resolve_customers=resolve,
