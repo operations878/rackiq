@@ -3,6 +3,7 @@ import { api } from "./api/client";
 import type { Summary, Capabilities, StudioState } from "./api/types";
 import { useHashRoute } from "./lib/useHashRoute";
 import ProfileBadge from "./components/ProfileBadge";
+import VarHome from "./pages/VarHome";
 import Dashboard from "./pages/Dashboard";
 import DataStudio from "./pages/DataStudio";
 import DataHealth from "./pages/DataHealth";
@@ -91,11 +92,13 @@ export default function App() {
   const scorecardId = route.startsWith("scorecard/") ? route.slice("scorecard/".length) : undefined;
   const quarantine = summary.quarantine_total ?? 0;
 
+  const primary: NavItem = { key: "", label: "VAR Home", icon: "◆", match: (b) => b === "" };
+
   const sections: NavSection[] = [
     {
       title: "Operate",
       items: [
-        { key: "", label: "Daily Operating", icon: "◎", match: (b) => b === "" },
+        { key: "daily", label: "Daily Operating", icon: "◎", match: (b) => b === "daily" },
         { key: "demand", label: "Demand Cockpit", icon: "↗", match: (b) => b === "demand" },
         { key: "pricing", label: "Pricing Sandbox", icon: "◇", match: (b) => b === "pricing" },
         { key: "scorecards", label: "Scorecards", icon: "▤", match: (b) => b === "scorecards" || b === "scorecard" },
@@ -130,17 +133,26 @@ export default function App() {
             <h1 className="text-lg font-bold tracking-tight">RackIQ</h1>
             <p className="text-[11px] text-slate-500">Demand &amp; Margin Intelligence</p>
           </div>
-          <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-4">
-            {sections.map((sec) => (
-              <div key={sec.title}>
-                <div className="px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-400">{sec.title}</div>
-                <div className="space-y-0.5">
-                  {sec.items.map((item) => (
-                    <SideLink key={item.key} item={item} active={item.match(base)} onClick={() => navigate(item.key)} />
-                  ))}
+          <nav className="flex-1 space-y-4 overflow-y-auto px-3 py-4">
+            {/* Primary spine: the VAR home */}
+            <SideLink item={primary} active={primary.match(base)} onClick={() => navigate(primary.key)} />
+
+            {/* Everything else, one click away but visually secondary */}
+            <div className="px-3 pt-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+              More / Advanced
+            </div>
+            <div className="space-y-4 opacity-90">
+              {sections.map((sec) => (
+                <div key={sec.title}>
+                  <div className="px-3 pb-1.5 text-[10px] font-medium uppercase tracking-wider text-slate-400/80">{sec.title}</div>
+                  <div className="space-y-0.5">
+                    {sec.items.map((item) => (
+                      <SideLink key={item.key} item={item} active={item.match(base)} onClick={() => navigate(item.key)} />
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
           </nav>
           <div className="border-t border-slate-200 px-4 py-3">
             <ProfileBadge profile={caps.profile} enabled={caps.summary.enabled} total={caps.summary.total} />
@@ -152,7 +164,8 @@ export default function App() {
 
         {/* Main content */}
         <main className="min-w-0 flex-1 px-6 py-6">
-          {base === "" && <DailyOps summary={summary} navigate={navigate} />}
+          {base === "" && <VarHome summary={summary} navigate={navigate} />}
+          {base === "daily" && <DailyOps summary={summary} navigate={navigate} />}
           {base === "demand" && <DemandCockpit summary={summary} navigate={navigate} />}
           {base === "pricing" && <Pricing summary={summary} navigate={navigate} />}
           {(base === "scorecards" || base === "scorecard") && <Scorecards summary={summary} customerId={scorecardId} />}

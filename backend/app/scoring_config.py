@@ -32,6 +32,15 @@ class ScoringConfig:
     var_min_lifts: int = 8
     var_min_weeks: int = 12
 
+    # ---- VAR advanced statistics (diagnostics only — these NEVER change the score) ----
+    # The headline VAR formula above is frozen; these parameters drive the transparency /
+    # statistics layer (bootstrap CI on base volume, steadiness drift test, trend test).
+    var_bootstrap_iters: int = 400        # residual-bootstrap resamples for the base-volume CI
+    var_bootstrap_ci: float = 0.90        # central CI mass reported for the base volume
+    var_steadiness_min_periods: int = 6   # need this many periods to call a steadiness trend
+    var_steadiness_delta_band: float = 0.10   # |Δ in-band rate| below this ⇒ "steady"
+    var_trend_sig_p: float = 0.10         # Mann-Kendall / drift p-value significance threshold
+
     # ---- Data sufficiency (is an account "established"?) ------------------------
     suff_min_lifts: int = 12
     suff_min_days: int = 90

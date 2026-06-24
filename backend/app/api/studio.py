@@ -283,6 +283,97 @@ def crosswalk_clear():
     return {"ok": True}
 
 
+# Header keywords that identify the two columns of a hand-built name map.
+_RAW_NAME_KEYWORDS = ("raw", "bol", "variant", "source", "original", "consignee", "as is")
+_CODED_NAME_KEYWORDS = ("coded", "master", "clean", "mapped", "canonical", "standard", "resolved")
+
+
+def _detect_name_map_columns(df: pd.DataFrame) -> tuple[str, str]:
+    """Pick the (raw, coded) columns of a two-column name map by header keywords; fall back to
+    positional (first column = raw, second = coded), which matches the documented layout."""
+    cols = list(df.columns)
+    lower = {c: str(c).lower() for c in cols}
+    raw_col = next((c for c in cols if any(k in lower[c] for k in _RAW_NAME_KEYWORDS)), None)
+    coded_col = next((c for c in cols if c != raw_col and any(k in lower[c] for k in _CODED_NAME_KEYWORDS)), None)
+    if raw_col is None or coded_col is None:
+        raw_col, coded_col = cols[0], cols[1]
+    return raw_col, coded_col
+
+
+@router.post("/crosswalk/upload-names")
+async def crosswalk_upload_names(file: UploadFile = File(...)):
+    """Upload a hand-built two-column CSV (Raw BOL Account Name → Coded Account Name).
+
+    Loads every row as a CONFIRMED crosswalk entry (human source of truth — overrides fuzzy
+    merges), then RE-APPLIES the crosswalk across the whole store so already-loaded lifts /
+    invoices / quotes / BOLs regroup under their coded master name and every score/forecast
+    recomputes on the master customer. Re-uploadable: re-run any time to extend the mapping.
+    """
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+    try:
+        df = ingest.parse_file(content, file.filename or "name-map")
+    except ingest.IngestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if df is None or len(df.columns) < 2:
+        raise HTTPException(status_code=400,
+                            detail="A customer name map needs two columns: the raw account name "
+                                   "and the coded (master) name.")
+
+    raw_col, coded_col = _detect_name_map_columns(df)
+    pairs = list(zip(df[raw_col].tolist(), df[coded_col].tolist()))
+
+    with db.lock():
+        con = _con()
+        loaded = crosswalk.load_name_map(con, pairs, _now())
+        applied = db.reapply_crosswalk(con)
+        db.set_meta(con, "last_import_at", _now())  # bust scoring / demand / pricing caches
+        db.log_hygiene_audit(con, _now_us(), schema.LIFTS, file.filename or "name-map", [
+            {"step": "crosswalk_name_map", "rows_affected": loaded["loaded"],
+             "detail": f"Loaded {loaded['loaded']} raw→coded name mapping(s) "
+                       f"({loaded['masters']} master name(s)); confirmed, overrides fuzzy."},
+            {"step": "crosswalk_reapply", "rows_affected": applied["total_remapped"],
+             "detail": f"Re-resolved {applied['total_remapped']} existing row(s) to master ids."},
+        ])
+        db.log_import(con, _now(), schema.CUSTOMERS, file.filename or "name-map",
+                      loaded["loaded"], "name_map")
+        unmapped = db.unmapped_customers(con)
+        state = _state(con)
+        crosswalk_size = len(db.get_crosswalk(con))
+        masters = db.crosswalk_master_count(con)
+
+    return {
+        "ok": True,
+        "raw_column": raw_col,
+        "coded_column": coded_col,
+        "loaded": loaded["loaded"],
+        "masters": loaded["masters"],
+        "remapped": applied["remapped"],
+        "total_remapped": applied["total_remapped"],
+        "unmapped": unmapped,
+        "n_unmapped": len(unmapped),
+        "crosswalk_size": crosswalk_size,
+        "crosswalk_masters": masters,
+        **state,
+    }
+
+
+@router.get("/unmapped-customers")
+def unmapped_customers_list():
+    """Raw customer names not yet covered by the confirmed crosswalk (shown as-is, add them)."""
+    with db.lock():
+        con = _con()
+        rows = db.unmapped_customers(con)
+        return {
+            "unmapped": rows,
+            "n_unmapped": len(rows),
+            "crosswalk_masters": db.crosswalk_master_count(con),
+            "crosswalk_size": len(db.get_crosswalk(con)),
+            "customers_total": db.row_count(con, schema.CUSTOMERS),
+        }
+
+
 @router.post("/validate")
 def validate(req: ValidateRequest):
     up = ingest.get_upload(req.upload_id)
