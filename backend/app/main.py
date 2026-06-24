@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import __version__
 from .api.daily import router as daily_router
 from .api.demand import router as demand_router
+from .api.pricing import router as pricing_router
 from .api.reconciliation import router as reconciliation_router
 from .api.routes import router
 from .api.scores import router as scores_router
@@ -30,6 +31,7 @@ def create_app() -> FastAPI:
     app.include_router(reconciliation_router)
     app.include_router(daily_router)
     app.include_router(demand_router)
+    app.include_router(pricing_router)
 
     @app.get("/")
     def root():
