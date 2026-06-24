@@ -446,6 +446,48 @@ export interface Availability {
   reason: string;
 }
 
+export interface VarComponent {
+  key: string;
+  label: string;
+  value: number | null;
+  weight: number;
+  contribution: number;
+  description: string;
+}
+
+export interface VarSteadiness {
+  direction: "improving" | "deteriorating" | "steady" | "insufficient";
+  delta: number | null;
+  in_band_recent: number | null;
+  in_band_prior: number | null;
+  z: number | null;
+  p_value: number | null;
+  significant?: boolean;
+}
+
+export interface VarCadence {
+  base_cadence_days: number | null;
+  score: number | null;
+  in_band_rate: number | null;
+  tightness: number | null;
+  cv: number | null;
+  sigma_days?: number | null;
+}
+
+export interface VarDiagnostics {
+  n_periods: number;
+  r2: number | null;
+  coef_variation: number | null;
+  robust_sigma: number | null;
+  forecastability: number | null;
+  skill: { mae_model: number; mae_naive: number; skill_vs_naive: number; predictability: number } | null;
+  trend_test: { tau: number; p_value: number; significant: boolean; direction: string } | null;
+  residuals: { acf1: number | null; ljung_box_p: number | null; white_noise: boolean | null };
+  base_ci: { base: number; lo: number; hi: number; se: number; ci: number } | null;
+  stl: { trend_strength: number; seasonal_strength: number } | null;
+  n_outliers_3sigma: number;
+}
+
 export interface VarBlock {
   score: number | null;
   grade: string | null;
@@ -455,10 +497,51 @@ export interface VarBlock {
   base_level: number;
   base_cadence_days: number | null;
   in_band_rate: number | null;
-  tightness: number | null;
-  excursion_penalty: number | null;
-  method: string;
-  explanation: string;
+  tightness?: number | null;
+  excursion_penalty?: number | null;
+  method?: string;
+  explanation?: string;
+  // Transparency / statistics layer (added by the VAR deepening — never changes the score):
+  sigma?: number | null;
+  base_range?: [number, number];
+  variability_range?: [number, number];
+  components?: VarComponent[] | null;
+  cadence?: VarCadence;
+  steadiness?: VarSteadiness | null;
+  diagnostics?: VarDiagnostics | null;
+  descriptor?: string;
+  plain?: string;
+}
+
+// ---- Customer name map / crosswalk coverage -------------------------------------
+export interface UnmappedCustomer {
+  customer_id: string;
+  name: string;
+  lift_count: number;
+  total_net_gallons: number;
+  last_lift: string | null;
+}
+
+export interface UnmappedResponse {
+  unmapped: UnmappedCustomer[];
+  n_unmapped: number;
+  crosswalk_masters: number;
+  crosswalk_size: number;
+  customers_total: number;
+}
+
+export interface NameMapResult extends StudioState {
+  ok: boolean;
+  raw_column: string;
+  coded_column: string;
+  loaded: number;
+  masters: number;
+  remapped: Record<string, number>;
+  total_remapped: number;
+  unmapped: UnmappedCustomer[];
+  n_unmapped: number;
+  crosswalk_size: number;
+  crosswalk_masters: number;
 }
 
 export interface BaseValueBlock {

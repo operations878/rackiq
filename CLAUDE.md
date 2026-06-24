@@ -183,7 +183,15 @@ fields, preview validation, and commit. Capabilities then flex from the fields a
   negatives, unparsed-dates, whitespace, constant) + an overall 0–100 score.
 - `app/crosswalk.py` — the **Customer Master crosswalk** (entity resolution / de-duplication):
   fuzzy-clusters customer key variants into proposed merge groups with a confidence score,
-  persists confirm/reject decisions, and rewrites variant ids → master id on every commit.
+  persists confirm/reject decisions, and rewrites variant ids → master id on every commit. Also
+  **`load_name_map`** — load a hand-built **raw BOL account name → coded (master) name** CSV as
+  `status='confirmed', source='name_map'` entries that are the human source of truth and **override
+  any fuzzy/auto merge** for the same key (variant_key = raw name; master_id = master_name = the
+  coded name, so all raw spellings collapse into one customer **shown by the coded name**). Paired
+  with **`db.reapply_crosswalk`**, which re-resolves the *already-loaded* store (lifts / invoices /
+  quotes / BOLs) to master ids and rebuilds the customers dim — so a name-map upload regroups +
+  renames history too (not just future imports). `db.unmapped_customers` lists raw names still
+  unmapped (name == id and not a confirmed master).
 - `app/validation.py` — the **rule engine**: required-present, **edi-control-row** (junk), dates-
   parseable, dates-in-range, **volume-corrections**, value-bounds, duplicate-lifts, price≥cost —
   each with a severity, a count, and **drill-down rows**; rules with `action="quarantine"` feed the
@@ -230,6 +238,7 @@ defaultable dimensional keys — a partial BOL feed still imports). Derived in
 | Commit | `/api/studio/commit` | coerce → `apply_fixes` → run rules → **split quarantine** → **group by BOL** (clean rows) → write (replace/append) → derive `customers` (names from crosswalk) → log audit → recompute capabilities; returns `rows_in_file`, `clean_rows`, `lifts_after_grouping`/`rows_written`, `corrections`, `quarantined` + `quarantine_reasons`, hygiene report |
 | Targets | `GET /api/studio/targets` | static registry powering the mapping dropdowns (+ `customer_key_column`, `defaultable_fields`) |
 | Crosswalk | `POST …/crosswalk/propose`, `…/crosswalk/confirm`, `GET …/crosswalk`, `DELETE …/crosswalk/{key}`, `POST …/crosswalk/clear` | propose merge groups, persist confirm/reject, browse/edit the master crosswalk |
+| Name map | `POST …/crosswalk/upload-names` (multipart), `GET …/unmapped-customers` | upload a hand-built two-column **raw→coded** CSV as confirmed masters (overrides fuzzy), then **re-apply across the whole store** (regroup + rename, busts the score/forecast caches) and return the still-**unmapped** raw names. Re-uploadable to keep extending the map |
 | Quarantine | `GET …/quarantine`, `POST …/quarantine/reimport`, `…/quarantine/discard` | review held rows, fix-and-re-import (with edits), or discard |
 | Data health | `GET …/data-health` | the standing quality-score + drift report |
 | Audit | `GET …/audit` | recent hygiene transformations |
@@ -368,6 +377,22 @@ percentile ranking. Results persist to `customer_scores` + `customer_lane`.
   headline VAR blends volume/cadence **70/30**. *(This VARIABILITY score is distinct from any
   financial VaR — never conflated.)* The per-period base / base-range / variability-range series
   is persisted and drawn as the **base-range chart** (the leadership screen).
+- **Part 1b — VAR transparency + statistics layer** (diagnostics; these **never change the score**,
+  which is frozen). Every customer's `var` block carries: the **base volume**, **base range (±1σ)**
+  and **variability range (±2σ)** as concrete numbers; the **three score components broken out**
+  (in-band rate · tightness · excursion control, each with value, weight, and contribution); the
+  **cadence lane** (typical days-between, timing consistency, its own CV); a **steadiness-trend
+  test** (two-proportion z-test on in-band rate, recent half vs prior → improving / steady /
+  deteriorating + p-value); a **plain-English read** (e.g. *"7 Oil buys about 8,400 gal every ~6
+  days and stays within their usual range 82% of the time — very predictable"*) and a two-word
+  `descriptor`; plus an **advanced diagnostics** bundle: **forecastability** (1 − normalized
+  spectral entropy), **predictability** (one-step skill score vs naïve-last), **Mann–Kendall** trend
+  test (τ + p), lane **R²** and **CV**, residual **white-noise** test (lag-1 ACF + Ljung–Box),
+  a **bootstrap confidence interval** on the base volume, and Hyndman **STL trend/seasonal
+  strengths**. All guarded (`_safe`) so a degenerate series never breaks scoring; every parameter
+  (`var_bootstrap_iters`, `var_steadiness_delta_band`, `var_trend_sig_p`, …) lives in `ScoringConfig`.
+  The ranked `/api/scores` list ships a **slim** var (the table fields); the full layer rides on
+  `/api/scores/customer/{id}`.
 - **Part 2 — Layer-1 behavioral facts**: order size mean/median/CV, monthly volume, frequency,
   days-between mean & CV, margin/gal mean & CV, days-since-last, product mix + HHI,
   rush/split/small-order/cancel rates + friction-tag count, payment terms, days-to-pay mean & CV,
@@ -446,7 +471,8 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/market-prices?product=ULSD` | market vs street-rack time series (`available:false` when absent) |
 | `GET /api/monthly-volume` | monthly net gallons (needs only required fields; survives `core`) |
 | `GET /api/scores?window=all` | ranked customers (VAR+grade, base value+grade, archetype, volume, trend) + per-metric `availability` |
-| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, VAR explanation, sub-scores, base value, archetype posture |
+| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, the full **VAR statistics layer** (base/variability ranges, score-component breakdown, cadence lane, steadiness-trend test, plain-English read, advanced diagnostics), sub-scores, base value, archetype posture |
+| `POST /api/studio/crosswalk/upload-names` · `GET /api/studio/unmapped-customers` | upload the hand-built raw→coded name map (confirmed; re-applied across the store) · list raw names still unmapped |
 | `GET /api/scores/quadrant?window=` | Explainability × Profitability scatter points with archetype tags |
 | `GET /api/scores/backtest` | per-customer one-step forecast error by method |
 | `GET /api/scores/config` | the scoring config (every weight) + windows + archetypes/posture |
@@ -580,11 +606,27 @@ restates spreads as absolute quote prices for display.
 
 Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A **left-nav dashboard
 shell** (`App.tsx`) switches between modules via a tiny dependency-free hash router
-(`lib/useHashRoute.ts`), grouped into **Operate** / **Analyze** / **Data**. The app **HOME** is
-the Daily Operating Dashboard.
+(`lib/useHashRoute.ts`). The nav leads with a single prominent **VAR Home** (the app's default
+landing / spine); **every other module sits one click away under a de-emphasized “More / Advanced”
+area** grouped into **Operate** / **Analyze** / **Data**. Nothing is removed — the focus is
+presentation: the home screen serves understanding demand & VAR; secondary metrics move off it.
+
+**Home (the spine)**
+- **VAR Home — Demand Predictability** (`pages/VarHome.tsx`, route `""`, default landing) — a clean,
+  scannable screen centered on the VAR score. Top: a plain-language explainer of what the VAR score
+  *is* ("how predictable each customer's buying is — high = steady & forecastable, low = erratic")
+  plus a **bottom-up total-book forecast summary** (run-rate ±band from each customer's base-volume
+  lane, predictable-volume share, volume-weighted avg VAR, grade mix). Main: the customer list
+  **ranked by VAR** — coded name · VAR+grade · base volume · base cadence · trend arrow — kept
+  deliberately few-columned, with a **“show more columns”** toggle (monthly volume, archetype).
+  Click a customer → the **base-range chart** as the hero (base line, ±1σ lane, ±2σ band, actual
+  lifts) with a **legend/key**, the **plain-English read** of their pattern, the **score-component
+  breakdown** (`components/scores/VarBreakdown.tsx`), the **cadence lane**, the **steadiness-trend**
+  result, and a foldaway **Advanced statistics** panel. The **Customer Name Map** + unmapped-names
+  panel (`components/studio/NameMapPanel.tsx`) sits at the bottom.
 
 **Operate**
-- **Daily Operating Dashboard** (`pages/DailyOps.tsx`, route `""`/home) — Blueprint C. One view per
+- **Daily Operating Dashboard** (`pages/DailyOps.tsx`, route `daily`) — Blueprint C. One view per
   terminal, the **nine ranked panels** (lists, not charts), and the **regime selector**
   (`components/RegimeSelector.tsx`) that re-ranks everything live by calling `/api/daily`. A
   "Persist worklist (§14)" button writes `daily_recommendations`. Rows deep-link to the scorecard.
@@ -692,9 +734,11 @@ backend/
   app/
     schema.py               # ★ canonical field registry + DDL + import targets + hygiene metadata
     db.py                   # DuckDB lifecycle, shared r/w connection + lock, studio + crosswalk/audit/quarantine tables
+                            #   (+ reapply_crosswalk: re-resolve the whole store to master ids; unmapped_customers)
                             #   (scoring caches customer_scores/customer_lane are managed in scoring.ensure_tables)
     capabilities.py         # ★ FEATURES registry + runtime matrix (incl. "feed" collecting state)
-    scoring.py              # ★ scoring engine: VAR lane, sub-scores, base value, archetypes, backtest
+    scoring.py              # ★ scoring engine: VAR lane (+ transparency/statistics layer: components, ranges,
+                            #   cadence, steadiness test, plain read, bootstrap CI, MK/STL/forecastability), sub-scores, base value, archetypes, backtest
     scoring_config.py       # ★ ScoringConfig — every weight/threshold/window as a parameter
     reconciliation.py       # ★ P8 loss-control engine: book vs physical, BOL-grouped disbursements,
                             #   net-recon cross-check, mechanism split, meter-drift control charts, $loss
@@ -708,7 +752,7 @@ backend/
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping (BOL/EDI aliases, 2-tier threshold), inspect (+profiling), validate, coerce (mixed + Excel-serial dates)
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
-    crosswalk.py            # ★ Customer Master crosswalk — fuzzy merge groups, confirm/reject, apply
+    crosswalk.py            # ★ Customer Master crosswalk — fuzzy merge groups, confirm/reject, apply, load_name_map (raw→coded)
     validation.py           # rule engine: required-only gating (+ EDI-control-row junk), negatives-as-corrections, drill-down + quarantine index
     hygiene.py              # configurable cleaning pipeline (HygieneOptions, apply_fixes, group_by_bol, ASTM D1250 vcf)
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
@@ -722,7 +766,7 @@ backend/
     api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
     api/demand.py           # /api/demand/cockpit / persist / forecasts / config (the Demand Cockpit)
     api/pricing.py          # /api/pricing (sandbox + recommendations) / recommendations / config / recompute (cached base)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_regime + test_reconciliation + test_demand + test_pricing
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_name_map + test_regime + test_reconciliation + test_demand + test_pricing
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -733,19 +777,35 @@ frontend/
     App.tsx, main.tsx, index.css       # App.tsx = the left-nav dashboard shell (Operate/Analyze/Data)
     lib/{useHashRoute,format}.ts, lib/scoreui.tsx
     api/{client,types}.ts
-    pages/{DailyOps,DemandCockpit,Pricing,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx
+    pages/{VarHome,DailyOps,DemandCockpit,Pricing,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx   # VarHome = the default landing (route "")
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
-    components/scores/{BaseRangeChart,QuadrantScatter}.tsx
+    components/scores/{BaseRangeChart,QuadrantScatter,VarBreakdown}.tsx   # VarBreakdown = the VAR statistics layer
     components/demand/{DemandForecastChart,BurnDownChart}.tsx
     components/pricing/{MarginCurveChart}.tsx
     components/reconciliation/{MechanismBar,ControlChart,LossTrendChart}.tsx
-    components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds}.tsx
+    components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds,NameMapPanel}.tsx   # NameMapPanel = raw→coded upload + unmapped list
 CLAUDE.md
 ```
 
 ## Notes & gotchas
 - **numpy < 2.5** on Python 3.11 (2.5 requires 3.12); pinned in `pyproject.toml`. The scoring
   engine adds **statsmodels** (STL) + **scipy** (rank percentiles) — installed by `uv sync`.
+- **Customer identity vs. display.** The Consignee **Number** stays the internal stable key /
+  crosswalk variant key; the UI **always shows the coded (master) Name**, falling back to the raw
+  name only when unmapped (never a bare number). The hand-built **name map** (`raw → coded`) is the
+  source of truth — `status='confirmed', source='name_map'`, **overriding fuzzy merges** — and is
+  **re-uploadable** to keep extending. Uploading it runs `db.reapply_crosswalk`, which rewrites
+  `customer_id` across lifts/invoices/quotes/BOLs to the master id and rebuilds the customers dim, so
+  **all raw spellings of one customer roll up into one master** and VAR/forecasts/charts recompute on
+  it. The upload bumps `last_import_at`, busting the scores/demand/pricing/reconciliation caches.
+  "Unmapped" = a customer whose `name == customer_id` and is not a confirmed master.
+- **The VAR statistics layer is diagnostics only — the headline score is frozen.** Components,
+  base/variability ranges, cadence lane, steadiness-trend test, plain-English read, and the advanced
+  diagnostics (forecastability, predictability skill, Mann–Kendall, residual white-noise, bootstrap
+  base-volume CI, STL strengths) *explain* the VAR number without changing its math
+  (`var_w_in_band·in_band + var_w_tightness·tightness + var_w_excursion·(1−excursion)`, blended 70/30
+  with cadence). Every stat is wrapped in `_safe(...)` so a degenerate/short series returns `None`
+  rather than breaking scoring; thresholds live in `ScoringConfig`.
 - **Pricing works in contemporaneous spread space.** The sandbox/engine measure every lift against
   the rack benchmark *on its own date* (`cost_rel`, `current_spread`), so margin at a posted spread
   `s` is `s − cost_rel` — the absolute street level and its seasonal trend cancel, and multi-product

@@ -5,7 +5,7 @@ export default function Panel({
   children,
   right,
 }: {
-  title?: string;
+  title?: ReactNode;
   children: ReactNode;
   right?: ReactNode;
 }) {

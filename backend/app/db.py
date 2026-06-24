@@ -236,6 +236,91 @@ def rebuild_customers_from_lifts(con: duckdb.DuckDBPyConnection, replace: bool) 
     """)
 
 
+# ---- Crosswalk re-application across the whole store (name-map upload) -----------
+# Tables that carry a customer key the crosswalk resolves (lifts is the dimension's source).
+_CUSTOMER_KEY_TABLES = [schema.LIFTS, schema.INVOICES, schema.QUOTES, schema.BOL]
+
+
+def reapply_crosswalk(con: duckdb.DuckDBPyConnection) -> dict:
+    """Re-resolve EVERY already-loaded row to its confirmed master id, then rebuild the
+    customers dimension with the resolved coded names.
+
+    The crosswalk normally resolves on *future* imports; this regroups + renames data that was
+    loaded BEFORE the mapping existed (e.g. after a hand-built name-map upload). All raw names
+    mapping to one coded name collapse into a single master customer, so VAR / forecasts / charts
+    recompute on the master. Idempotent (a row already at its master id is skipped).
+    """
+    remapped: dict[str, int] = {}
+    for table in _CUSTOMER_KEY_TABLES:
+        if row_count(con, table) == 0:
+            continue
+        moved = con.execute(f"""
+            SELECT count(*) FROM {table} t
+            JOIN customer_crosswalk cw ON TRIM(CAST(t.customer_id AS VARCHAR)) = cw.variant_key
+            WHERE cw.status = 'confirmed' AND cw.master_id IS NOT NULL
+              AND cw.master_id <> t.customer_id
+        """).fetchone()[0]
+        if moved:
+            con.execute(f"""
+                UPDATE {table} SET customer_id = cw.master_id
+                FROM customer_crosswalk cw
+                WHERE TRIM(CAST({table}.customer_id AS VARCHAR)) = cw.variant_key
+                  AND cw.status = 'confirmed' AND cw.master_id IS NOT NULL
+                  AND cw.master_id <> {table}.customer_id
+            """)
+            remapped[table] = int(moved)
+
+    # Rebuild the customers dimension: drop stale variant rows, add new masters, apply coded names.
+    con.execute("""
+        DELETE FROM customers
+        WHERE customer_id NOT IN (SELECT DISTINCT customer_id FROM lifts WHERE customer_id IS NOT NULL)
+    """)
+    con.execute("""
+        INSERT INTO customers (customer_id, name, archetype, home_terminal)
+        SELECT t.customer_id, t.customer_id, 'imported', t.home_terminal
+        FROM (SELECT customer_id, mode(terminal) AS home_terminal FROM lifts
+              WHERE customer_id IS NOT NULL GROUP BY customer_id) t
+        WHERE t.customer_id NOT IN (SELECT customer_id FROM customers)
+    """)
+    con.execute("""
+        UPDATE customers SET name = cw.master_name
+        FROM customer_crosswalk cw
+        WHERE cw.master_id = customers.customer_id
+          AND cw.status = 'confirmed' AND cw.master_name IS NOT NULL
+    """)
+    return {"remapped": remapped, "total_remapped": sum(remapped.values())}
+
+
+def unmapped_customers(con: duckdb.DuckDBPyConnection, limit: int = 500) -> list[dict]:
+    """Customers still shown by their raw id (name == id) and NOT resolved to a confirmed
+    crosswalk master — i.e. raw BOL account names the hand-built name-map doesn't cover yet."""
+    rows = con.execute("""
+        SELECT c.customer_id, c.name,
+               count(l.customer_id)            AS lifts,
+               coalesce(sum(l.net_gallons), 0) AS gal,
+               max(l.lift_datetime)            AS last_lift
+        FROM customers c
+        LEFT JOIN lifts l USING (customer_id)
+        WHERE c.name = c.customer_id
+          AND c.customer_id NOT IN (
+              SELECT master_id FROM customer_crosswalk
+              WHERE status = 'confirmed' AND master_id IS NOT NULL)
+        GROUP BY 1, 2
+        ORDER BY gal DESC
+        LIMIT ?
+    """, [limit]).fetchall()
+    return [{"customer_id": r[0], "name": r[1], "lift_count": int(r[2]),
+             "total_net_gallons": round(float(r[3]), 1),
+             "last_lift": str(r[4].date()) if r[4] else None} for r in rows]
+
+
+def crosswalk_master_count(con: duckdb.DuckDBPyConnection) -> int:
+    row = con.execute(
+        "SELECT count(DISTINCT master_id) FROM customer_crosswalk WHERE status = 'confirmed'"
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 # ---- Import profiles (saved column mappings + cleaning options) -----------------
 def save_import_profile(con, name: str, target_table: str, mapping_json: str,
                         source_columns_json: str, created_at: str,

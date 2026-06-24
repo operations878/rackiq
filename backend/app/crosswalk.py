@@ -278,3 +278,52 @@ def master_names(con) -> dict[str, str]:
         if info.get("status") == "confirmed" and info.get("master_id"):
             out.setdefault(info["master_id"], info.get("master_name") or info["master_id"])
     return out
+
+
+def load_name_map(con, pairs: list[tuple[object, object]], now: str) -> dict:
+    """Load a hand-built {raw BOL account name -> coded master name} mapping as CONFIRMED
+    crosswalk entries.
+
+    This is the human source of truth: every entry is written ``status='confirmed'`` and
+    ``source='name_map'`` so it OVERRIDES any prior fuzzy/auto decision for the same raw key
+    (the upsert is keyed on ``variant_key``). Both the variant id and the master id display as
+    the **coded name**, so all raw names sharing a coded name collapse into one customer shown
+    by that clean name. ``pairs`` is ``[(raw_name, coded_name), ...]``.
+    """
+    from . import db
+
+    raw_to_coded: dict[str, str] = {}
+    for raw, coded in pairs:
+        r = ("" if raw is None else str(raw)).strip()
+        c = ("" if coded is None else str(coded)).strip()
+        if not r or not c:
+            continue
+        raw_to_coded[r] = c  # last write wins for a repeated raw name
+
+    def resolve(key: str) -> str:
+        """Follow chains (raw → coded → coded') to a terminal master, guarding against cycles."""
+        seen: set[str] = set()
+        cur = key
+        while cur in raw_to_coded and cur not in seen and raw_to_coded[cur] != cur:
+            seen.add(cur)
+            cur = raw_to_coded[cur]
+        return cur
+
+    entries: list[dict] = []
+    masters: set[str] = set()
+    for raw, coded in raw_to_coded.items():
+        master = resolve(coded) or coded
+        masters.add(master)
+        entries.append({"variant_key": raw, "master_id": master, "master_name": master,
+                        "confidence": 1.0, "status": "confirmed", "source": "name_map",
+                        "updated_at": now})
+    # Pin each master as a self-mapped confirmed entry (locks its display name + anchors future
+    # fuzzy matches) — but never clobber a master string that is itself a raw key being mapped on.
+    for m in masters:
+        if m not in raw_to_coded:
+            entries.append({"variant_key": m, "master_id": m, "master_name": m,
+                            "confidence": 1.0, "status": "confirmed", "source": "name_map",
+                            "updated_at": now})
+
+    written = db.upsert_crosswalk_entries(con, entries)
+    return {"loaded": len(raw_to_coded), "masters": len(masters), "entries_written": written}

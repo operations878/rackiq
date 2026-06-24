@@ -67,9 +67,25 @@ _TABLE_FACTS = ("gross_margin_per_gal_mean", "credit_utilization", "late_rate",
                 "product_mix", "days_since_last_order", "monthly_volume")
 
 
+def _slim_var(v: dict) -> dict:
+    """Just the VAR fields the ranked list needs — drops the heavy diagnostics/components."""
+    st = v.get("steadiness") or {}
+    return {
+        "score": v.get("score"), "grade": v.get("grade"), "status": v.get("status"),
+        "base_level": v.get("base_level"), "sigma": v.get("sigma"),
+        "base_cadence_days": v.get("base_cadence_days"), "in_band_rate": v.get("in_band_rate"),
+        "descriptor": v.get("descriptor"), "plain": v.get("plain"),
+        "base_range": v.get("base_range"), "variability_range": v.get("variability_range"),
+        "volume_var": v.get("volume_var"), "cadence_var": v.get("cadence_var"),
+        "steadiness": {"direction": st.get("direction")} if v.get("steadiness") else None,
+    }
+
+
 def _table_row(c: dict) -> dict:
     """Trim a full customer record to the ranked-table fields (drops the heavy lane series)."""
     row = {k: c[k] for k in _TABLE_FIELDS if k in c}
+    if "var" in row:
+        row["var"] = _slim_var(row["var"])
     row["subscores"] = {k: {kk: vv for kk, vv in v.items() if kk != "profile"}
                         for k, v in c["subscores"].items()}
     facts = c.get("facts") or {}

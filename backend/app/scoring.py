@@ -281,11 +281,15 @@ def _lane(periods: pd.DataFrame, cfg: ScoringConfig, grain: str) -> dict:
         "var_hi": round(float(vh), 1), "actual": round(float(a), 1),
     } for s, f, bl, bh, vl, vh, a in zip(starts, fitted, base_lo, base_hi, var_lo, var_hi, y)]
 
+    diagnostics = _lane_diagnostics(y, fitted, resid, starts, grain, sigma, cfg)
+    steadiness = _steadiness_trend(y, base_lo, base_hi, cfg)
+
     return {
         "base_level": round(base_level, 1), "sigma": round(sigma, 1),
         "in_band_rate": round(in_band, 3), "tightness": round(tightness, 3),
         "excursion_penalty": round(excursion, 3), "score": round(score, 1),
         "method": method, "n_periods": n, "series": series,
+        "diagnostics": diagnostics, "steadiness": steadiness,
     }
 
 
@@ -293,7 +297,8 @@ def _cadence_lane(gaps: np.ndarray, cfg: ScoringConfig) -> dict:
     """Cadence lane: base cadence (typical days between lifts) with its own band + sub-score."""
     if len(gaps) < 2:
         return {"base_cadence_days": float(np.median(gaps)) if len(gaps) else None,
-                "score": None, "in_band_rate": None, "tightness": None}
+                "score": None, "in_band_rate": None, "tightness": None,
+                "excursion_penalty": None, "sigma": None, "cv": None}
     base = float(np.median(gaps))
     sigma = _robust_sigma(gaps)
     lo, hi = base - cfg.base_range_sigma_k * sigma, base + cfg.base_range_sigma_k * sigma
@@ -305,7 +310,194 @@ def _cadence_lane(gaps: np.ndarray, cfg: ScoringConfig) -> dict:
                      + cfg.var_w_excursion * (1.0 - excursion))
     return {"base_cadence_days": round(base, 2), "score": round(score, 1),
             "in_band_rate": round(in_band, 3), "tightness": round(tightness, 3),
-            "excursion_penalty": round(excursion, 3)}
+            "excursion_penalty": round(excursion, 3), "sigma": round(sigma, 2),
+            "cv": round(sigma / base, 3) if base else None}
+
+
+# ---- Part 1b: advanced VAR statistics (diagnostics — these NEVER change the score) ----
+# A transparency/statistics layer on top of the (frozen) VAR lane: it explains *why* a
+# customer is predictable and how confident we are, without touching the headline number.
+def _safe(fn, default=None):
+    """Run a stat that may fail on degenerate input; never let it break scoring."""
+    try:
+        v = fn()
+        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            return default
+        return v
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _spectral_entropy_forecastability(y: np.ndarray) -> float | None:
+    """Forecastability (0–100) = 1 − normalized spectral entropy of the demand series.
+
+    A series whose power concentrates at a few frequencies (regular cycles) is highly
+    forecastable; white-noise demand spreads power evenly → entropy max → forecastability 0.
+    """
+    n = len(y)
+    if n < 6:
+        return None
+    yy = y - y.mean()
+    if not np.any(yy):
+        return 100.0  # perfectly flat ⇒ perfectly forecastable
+    spec = np.abs(np.fft.rfft(yy)) ** 2
+    spec = spec[1:]  # drop the DC (mean) component
+    s = float(spec.sum())
+    if s <= 0 or len(spec) < 2:
+        return None
+    p = spec / s
+    p = p[p > 0]
+    H = float(-np.sum(p * np.log(p)))
+    Hmax = math.log(len(spec))
+    return round(_clamp(1.0 - H / Hmax) * 100.0, 1) if Hmax > 0 else None
+
+
+def _one_step_skill(y: np.ndarray, starts, grain: str) -> dict | None:
+    """Predictability via a one-step skill score: 1 − MAE(seasonal lane) / MAE(naive-last)."""
+    n = len(y)
+    if n < 6:
+        return None
+    e_model, e_naive = [], []
+    for t in range(3, n):
+        fit, _ = _stl_or_seasonal(y[:t], starts[:t], grain)
+        pred = fit[-1] if len(fit) else float(np.median(y[:t]))
+        e_model.append(abs(y[t] - pred))
+        e_naive.append(abs(y[t] - y[t - 1]))
+    if not e_naive:
+        return None
+    mae_model, mae_naive = float(np.mean(e_model)), float(np.mean(e_naive))
+    if mae_naive <= 0:
+        return None
+    skill = 1.0 - mae_model / mae_naive
+    return {"mae_model": round(mae_model, 1), "mae_naive": round(mae_naive, 1),
+            "skill_vs_naive": round(skill, 3), "predictability": round(_clamp(skill) * 100.0, 1)}
+
+
+def _mann_kendall(y: np.ndarray, p_sig: float) -> dict | None:
+    """Non-parametric Mann–Kendall trend test (Kendall's τ) — robust to outliers & non-normal."""
+    if len(y) < 6:
+        return None
+    from scipy.stats import kendalltau
+    tau, p = kendalltau(np.arange(len(y)), y)
+    if tau is None or math.isnan(tau):
+        return None
+    direction = "flat"
+    if p < p_sig:
+        direction = "rising" if tau > 0 else "falling"
+    return {"tau": round(float(tau), 3), "p_value": round(float(p), 4),
+            "significant": bool(p < p_sig), "direction": direction}
+
+
+def _residual_diagnostics(resid: np.ndarray) -> dict:
+    """Lag-1 autocorrelation + Ljung–Box white-noise test on the lane residuals.
+
+    White-noise residuals (high p) mean the lane has captured the structure — what's left is
+    irreducible noise; significant autocorrelation means there's pattern the lane misses.
+    """
+    n = len(resid)
+    out = {"acf1": None, "ljung_box_p": None, "white_noise": None}
+    if n < 5:
+        return out
+    r = resid - resid.mean()
+    denom = float(np.sum(r * r))
+    if denom > 0:
+        out["acf1"] = round(float(np.sum(r[1:] * r[:-1]) / denom), 3)
+
+    def _lb():
+        from statsmodels.stats.diagnostic import acorr_ljungbox
+        lags = max(1, min(10, n // 2))
+        res = acorr_ljungbox(resid, lags=[lags], return_df=True)
+        return float(res["lb_pvalue"].iloc[-1])
+
+    p = _safe(_lb)
+    if p is not None:
+        out["ljung_box_p"] = round(p, 4)
+        out["white_noise"] = bool(p > 0.05)
+    return out
+
+
+def _bootstrap_base_ci(fitted: np.ndarray, resid: np.ndarray, cfg: ScoringConfig) -> dict | None:
+    """Residual bootstrap of the expected base volume → a confidence band on the lane line."""
+    n = len(resid)
+    if n < 5:
+        return None
+    base = float(fitted[-1])
+    rc = resid - resid.mean()
+    rng = np.random.default_rng(20240601 + n)  # deterministic per series length
+    samples = base + rng.choice(rc, size=(int(cfg.var_bootstrap_iters), n), replace=True).mean(axis=1)
+    lo_q = (1 - cfg.var_bootstrap_ci) / 2 * 100.0
+    hi_q = (1 + cfg.var_bootstrap_ci) / 2 * 100.0
+    lo, hi = np.percentile(samples, [lo_q, hi_q])
+    return {"base": round(base, 1), "lo": round(float(max(0.0, lo)), 1), "hi": round(float(hi), 1),
+            "se": round(float(samples.std()), 1), "ci": cfg.var_bootstrap_ci}
+
+
+def _stl_strengths(y: np.ndarray, grain: str) -> dict | None:
+    """Hyndman STL feature strengths: trend strength & seasonal strength in [0, 1]."""
+    period = 52 if grain == "weekly" else 12
+    if len(y) < 2 * period or period < 2:
+        return None
+
+    def _calc():
+        from statsmodels.tsa.seasonal import STL
+        res = STL(pd.Series(y), period=period, robust=True).fit()
+        trend, seasonal, remainder = res.trend.to_numpy(), res.seasonal.to_numpy(), res.resid.to_numpy()
+        var_r = float(np.var(remainder))
+        ts = max(0.0, 1.0 - var_r / max(1e-9, float(np.var(remainder + trend))))
+        ss = max(0.0, 1.0 - var_r / max(1e-9, float(np.var(remainder + seasonal))))
+        return {"trend_strength": round(ts, 3), "seasonal_strength": round(ss, 3)}
+
+    return _safe(_calc)
+
+
+def _steadiness_trend(y: np.ndarray, base_lo: np.ndarray, base_hi: np.ndarray,
+                      cfg: ScoringConfig) -> dict:
+    """Is the customer getting MORE or LESS steady? Two-proportion z-test on the in-band rate
+    of the recent half of the history vs the prior half (same lane)."""
+    n = len(y)
+    in_mask = ((y >= base_lo) & (y <= base_hi)).astype(float)
+    if n < cfg.var_steadiness_min_periods:
+        return {"direction": "insufficient", "delta": None, "in_band_recent": None,
+                "in_band_prior": None, "z": None, "p_value": None, "significant": False}
+    half = n // 2
+    prior, recent = in_mask[:half], in_mask[half:]
+    p1, p2 = float(prior.mean()), float(recent.mean())
+    delta = p2 - p1
+    n1, n2 = len(prior), len(recent)
+    pool = (float(prior.sum()) + float(recent.sum())) / (n1 + n2)
+    se = math.sqrt(pool * (1 - pool) * (1 / n1 + 1 / n2)) if 0 < pool < 1 else 0.0
+    z = delta / se if se > 0 else 0.0
+    p_value = None
+    if se > 0:
+        from scipy.stats import norm
+        p_value = round(float(2 * norm.sf(abs(z))), 4)
+    direction = ("improving" if delta >= cfg.var_steadiness_delta_band
+                 else "deteriorating" if delta <= -cfg.var_steadiness_delta_band else "steady")
+    return {"direction": direction, "delta": round(delta, 3), "in_band_recent": round(p2, 3),
+            "in_band_prior": round(p1, 3), "z": round(float(z), 2), "p_value": p_value,
+            "significant": bool(p_value is not None and p_value < cfg.var_trend_sig_p)}
+
+
+def _lane_diagnostics(y: np.ndarray, fitted: np.ndarray, resid: np.ndarray,
+                      starts, grain: str, sigma: float, cfg: ScoringConfig) -> dict:
+    """Bundle the advanced statistics for one customer's volume lane (all guarded)."""
+    n = len(y)
+    r2 = (_safe(lambda: round(float(1 - np.sum(resid ** 2) / np.sum((y - y.mean()) ** 2)), 3))
+          if n >= 3 and np.var(y) > 0 else None)
+    cv = _safe(lambda: round(float(sigma / abs(np.mean(y))), 3)) if n and np.mean(y) else None
+    return {
+        "n_periods": n,
+        "r2": r2,
+        "coef_variation": cv,
+        "robust_sigma": round(float(sigma), 1),
+        "forecastability": _spectral_entropy_forecastability(y),
+        "skill": _one_step_skill(y, starts, grain),
+        "trend_test": _mann_kendall(y, cfg.var_trend_sig_p),
+        "residuals": _residual_diagnostics(resid),
+        "base_ci": _bootstrap_base_ci(fitted, resid, cfg),
+        "stl": _stl_strengths(y, grain),
+        "n_outliers_3sigma": int(np.sum(np.abs(resid) > 3 * sigma)) if sigma > 0 else 0,
+    }
 
 
 # ---- Per-customer computation ---------------------------------------------------
@@ -905,13 +1097,7 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all") -
             "total_net_gallons": round(float(core["periods"]["actual"].sum()), 1),
             "monthly_volume": facts["monthly_volume"], "trend_pct": core["trend_pct"],
             "recency_gap": round((core["days_since_last"] or 0.0) / cad, 2),
-            "var": {"score": core["var_score"], "grade": core["var_grade"],
-                    "volume_var": core["volume_var"], "cadence_var": core["cadence_var"],
-                    "status": core["var_status"], "base_level": core["lane"]["base_level"],
-                    "base_cadence_days": core["base_cadence_days"],
-                    "in_band_rate": core["lane"]["in_band_rate"], "tightness": core["lane"]["tightness"],
-                    "excursion_penalty": core["lane"]["excursion_penalty"], "method": core["lane"]["method"],
-                    "explanation": _var_explanation(core, cfg)},
+            "var": _var_block(core, facts, name_by_id.get(cid, cid), cfg),
             "lane_series": core["lane"]["series"],
             "base_value": {"score": base_value[cid], "grade": grade(base_value[cid], cfg),
                            "egp": round(bv["egp"], 0), "friction_cost": round(bv["friction"], 0),
@@ -945,6 +1131,119 @@ def _var_explanation(core: dict, cfg: ScoringConfig) -> str:
             f"periods inside the base range, tightness {lane['tightness']:.2f}, "
             f"{lane['excursion_penalty']:.0%} beyond ±2σ. Base ≈ {lane['base_level']:,.0f} gal/"
             f"{core['grain'][:-2]}; fit: {lane['method']}.")
+
+
+def _fmt_gal(x) -> str:
+    """Compact gallons for a plain-English sentence: 8400 → '8,400', 1.2e6 → '1.2MM'."""
+    if x is None:
+        return "—"
+    if abs(x) >= 1e6:
+        return f"{x / 1e6:.1f}MM"
+    return f"{round(float(x)):,}"
+
+
+def _descriptor(grade: str | None, status: str) -> str:
+    """A two-word steadiness label for the ranked list."""
+    if status != "ok" or grade is None:
+        return "Thin history"
+    return {"A": "Very predictable", "B": "Fairly predictable",
+            "C": "Somewhat erratic", "D": "Erratic"}.get(grade, "—")
+
+
+def _plain_read(core: dict, facts: dict, name: str, cfg: ScoringConfig) -> str:
+    """One non-technical sentence an ops person reads and immediately gets.
+
+    e.g. "7 Oil buys about 8,400 gal every ~6 days and stays within their usual range 82% of
+    the time — very predictable."
+    """
+    nm = name or "This account"
+    if core["var_status"] != "ok":
+        return (f"{nm} doesn't have enough history yet to read a reliable buying pattern "
+                f"({core['n_lifts']} lift(s) so far).")
+    size = facts.get("order_size_median") or facts.get("order_size_mean")
+    cad = core.get("base_cadence_days")
+    ib = core["lane"].get("in_band_rate") or 0.0
+    desc = {"A": "very predictable", "B": "fairly predictable",
+            "C": "somewhat up-and-down", "D": "erratic and hard to plan around"}.get(core["var_grade"], "")
+    if cad is None:
+        cad_phrase = ""
+    elif cad >= 26:
+        cad_phrase = "about once a month"
+    elif cad >= 12:
+        cad_phrase = f"every ~{round(cad)} days"
+    elif cad >= 2:
+        cad_phrase = f"every ~{round(cad)} days"
+    else:
+        cad_phrase = "almost daily"
+    head = f"{nm} buys about {_fmt_gal(size)} gal {cad_phrase}".rstrip()
+    sentence = f"{head} and stays within their usual range {round(ib * 100)}% of the time — {desc}."
+    st = core["lane"].get("steadiness") or {}
+    if st.get("direction") == "improving":
+        sentence += " Their steadiness has been improving lately."
+    elif st.get("direction") == "deteriorating":
+        sentence += " Their steadiness has been slipping lately."
+    return sentence
+
+
+def _var_block(core: dict, facts: dict, name: str, cfg: ScoringConfig) -> dict:
+    """Assemble the full VAR block: the (frozen) score + the transparency/statistics layer.
+
+    The headline ``score``/``grade``/``volume_var``/``cadence_var`` are unchanged; everything
+    else here EXPLAINS that number — the base range, the variability range, the three score
+    components, the cadence lane, the steadiness drift test, and the advanced diagnostics.
+    """
+    lane = core["lane"]
+    base = lane["base_level"]
+    sig = lane.get("sigma") or 0.0
+    if cfg.base_range_mode == "percent":
+        bhalf = cfg.base_range_pct * abs(base)
+        vhalf = (cfg.variability_sigma_k / max(cfg.base_range_sigma_k, 1e-9)) * bhalf
+    else:
+        bhalf = cfg.base_range_sigma_k * sig
+        vhalf = cfg.variability_sigma_k * sig
+    base_range = [round(max(0.0, base - bhalf), 1), round(base + bhalf, 1)]
+    var_range = [round(max(0.0, base - vhalf), 1), round(base + vhalf, 1)]
+
+    components = None
+    if lane.get("in_band_rate") is not None:
+        excursion_ctrl = 1.0 - (lane.get("excursion_penalty") or 0.0)
+        components = [
+            {"key": "in_band", "label": "In-band rate", "value": lane["in_band_rate"],
+             "weight": cfg.var_w_in_band,
+             "contribution": round(100 * cfg.var_w_in_band * lane["in_band_rate"], 1),
+             "description": "How often they buy within their normal range."},
+            {"key": "tightness", "label": "Lane tightness", "value": lane.get("tightness"),
+             "weight": cfg.var_w_tightness,
+             "contribution": round(100 * cfg.var_w_tightness * (lane.get("tightness") or 0.0), 1),
+             "description": "How narrow that normal range is — less scatter around the base."},
+            {"key": "excursion_control", "label": "Excursion control", "value": round(excursion_ctrl, 3),
+             "weight": cfg.var_w_excursion,
+             "contribution": round(100 * cfg.var_w_excursion * excursion_ctrl, 1),
+             "description": "How rarely they swing far outside their range (wild outliers)."},
+        ]
+
+    cad = core["cadence"]
+    cadence_block = {"base_cadence_days": cad.get("base_cadence_days"), "score": cad.get("score"),
+                     "in_band_rate": cad.get("in_band_rate"), "tightness": cad.get("tightness"),
+                     "cv": cad.get("cv"), "sigma_days": cad.get("sigma")}
+
+    return {
+        "score": core["var_score"], "grade": core["var_grade"],
+        "volume_var": core["volume_var"], "cadence_var": core["cadence_var"],
+        "status": core["var_status"], "base_level": base,
+        "base_cadence_days": core["base_cadence_days"],
+        "in_band_rate": lane.get("in_band_rate"), "tightness": lane.get("tightness"),
+        "excursion_penalty": lane.get("excursion_penalty"), "method": lane.get("method"),
+        "sigma": lane.get("sigma"),
+        "base_range": base_range, "variability_range": var_range,
+        "components": components,
+        "cadence": cadence_block,
+        "steadiness": lane.get("steadiness"),
+        "diagnostics": lane.get("diagnostics"),
+        "descriptor": _descriptor(core["var_grade"], core["var_status"]),
+        "plain": _plain_read(core, facts, name, cfg),
+        "explanation": _var_explanation(core, cfg),
+    }
 
 
 # ---- Persistence + backtest -----------------------------------------------------

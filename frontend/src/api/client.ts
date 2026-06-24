@@ -13,6 +13,8 @@ import type {
   HygieneOptions,
   ProposeResponse,
   CrosswalkEntry,
+  UnmappedResponse,
+  NameMapResult,
   DataHealth,
   QuarantineResponse,
   AuditEntry,
@@ -135,6 +137,14 @@ export const api = {
       if (!res.ok) throw new Error(await readError(res, "/studio/crosswalk"));
     },
     crosswalkClear: () => postJSON<{ ok: boolean }>("/studio/crosswalk/clear", {}),
+    async uploadNames(file: File): Promise<NameMapResult> {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(`${BASE}/studio/crosswalk/upload-names`, { method: "POST", body: fd });
+      if (!res.ok) throw new Error(await readError(res, "/studio/crosswalk/upload-names"));
+      return (await res.json()) as NameMapResult;
+    },
+    unmappedCustomers: () => getJSON<UnmappedResponse>("/studio/unmapped-customers"),
 
     // ---- Data health, quarantine, audit ----
     dataHealth: () => getJSON<DataHealth>("/studio/data-health"),
