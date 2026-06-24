@@ -31,6 +31,8 @@ import type {
   PlaybookResponse,
   DemandCockpit,
   DemandForecastsResponse,
+  PricingResponse,
+  PricingRecommendationsResponse,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -219,5 +221,24 @@ export const api = {
       if (product) qs.set("product", product);
       return getJSON<DemandForecastsResponse>(`/demand/forecasts?${qs.toString()}`);
     },
+  },
+
+  // ---- Pricing Sandbox + Engine (Blueprint I) ----
+  pricing: {
+    get: (opts: { terminal?: string | null; window?: string; regime?: Regime } = {}) => {
+      const qs = new URLSearchParams({ window: opts.window ?? "all" });
+      if (opts.terminal) qs.set("terminal", opts.terminal);
+      for (const [k, v] of Object.entries(opts.regime ?? {})) qs.set(k, v);
+      return getJSON<PricingResponse>(`/pricing?${qs.toString()}`);
+    },
+    recommendations: (opts: { terminal?: string | null; window?: string; regime?: Regime } = {}) => {
+      const qs = new URLSearchParams({ window: opts.window ?? "all" });
+      if (opts.terminal) qs.set("terminal", opts.terminal);
+      for (const [k, v] of Object.entries(opts.regime ?? {})) qs.set(k, v);
+      return getJSON<PricingRecommendationsResponse>(`/pricing/recommendations?${qs.toString()}`);
+    },
+    config: () =>
+      getJSON<{ config: Record<string, number | string | boolean | Record<string, number>>; windows: string[] }>(
+        "/pricing/config"),
   },
 };

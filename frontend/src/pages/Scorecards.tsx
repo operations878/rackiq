@@ -1,10 +1,45 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
-import type { Regime, RegimeConfig, Scorecard, ScorecardsResponse, Summary } from "../api/types";
+import type { PricingRecommendation, Regime, RegimeConfig, Scorecard, ScorecardsResponse, Summary } from "../api/types";
 import Panel from "../components/Panel";
 import RegimeSelector from "../components/RegimeSelector";
 import { ScorePill, Bar, ArchetypeTag } from "../lib/scoreui";
 import { humanize } from "../lib/format";
+
+function PricingInline({ rec }: { rec: PricingRecommendation }) {
+  const up = rec.price_gap > 0.003;
+  const down = rec.price_gap < -0.003;
+  return (
+    <div className="rounded-lg border border-cyan-200 bg-cyan-50/60 p-3">
+      <div className="flex items-center justify-between">
+        <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-800">Pricing engine (Blueprint I)</div>
+        {rec.underpriced && <span className="rounded bg-cyan-600 px-1.5 py-0.5 text-[10px] font-semibold text-white">underpriced</span>}
+      </div>
+      <div className="mt-1.5 grid grid-cols-3 gap-2 text-center">
+        <div>
+          <div className="text-[9px] uppercase text-slate-400">Recommend</div>
+          <div className="text-sm font-bold text-slate-900">${rec.recommended_price.toFixed(3)}</div>
+          <div className={`text-[10px] font-medium ${up ? "text-emerald-600" : down ? "text-rose-600" : "text-slate-400"}`}>
+            {up ? "▲ +" : down ? "▼ " : "→ "}{(rec.price_gap * 100).toFixed(1)}¢ vs ${rec.current_price.toFixed(3)}
+          </div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase text-slate-400">P(accept)</div>
+          <div className="text-sm font-bold text-slate-900">{(rec.accept_prob * 100).toFixed(0)}%</div>
+          <div className="text-[10px] text-slate-400">at recommend</div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase text-slate-400">Exp. GP</div>
+          <div className="text-sm font-bold text-emerald-700">${Math.round(rec.expected_gp).toLocaleString()}</div>
+          <div className="text-[10px] text-slate-400">{rec.gp_uplift >= 0 ? "+" : ""}${Math.round(rec.gp_uplift).toLocaleString()}/yr</div>
+        </div>
+      </div>
+      {rec.shadow_price > 0 && (
+        <div className="mt-1.5 text-[10px] text-rose-600">Shadow price +{(rec.shadow_price * 100).toFixed(1)}¢ — supply binding, no discount below street.</div>
+      )}
+    </div>
+  );
+}
 
 const SUBSCORE_ORDER = [
   "volume_steadiness", "timing_steadiness", "price_sensitivity", "evr", "discount_efficiency",
@@ -49,7 +84,7 @@ function RegimeBreakdown({ card, config }: { card: Scorecard; config: RegimeConf
   );
 }
 
-function FullCard({ card, config }: { card: Scorecard; config: RegimeConfig }) {
+function FullCard({ card, config, pricing }: { card: Scorecard; config: RegimeConfig; pricing?: PricingRecommendation }) {
   const a = card.archetype;
   const bv = card.base_value;
   return (
@@ -94,6 +129,7 @@ function FullCard({ card, config }: { card: Scorecard; config: RegimeConfig }) {
             <div><span className="text-slate-400">Terms:</span> {a.posture?.terms}</div>
             <div><span className="text-slate-400">Allocation:</span> {a.posture?.allocation}</div>
           </div>
+          {pricing && <PricingInline rec={pricing} />}
         </div>
       </div>
 
@@ -115,6 +151,7 @@ export default function Scorecards({ summary, customerId }: { summary: Summary; 
   const [regime, setRegime] = useState<Regime | null>(null);
   const [terminal, setTerminal] = useState<string | null>(null);
   const [data, setData] = useState<ScorecardsResponse | null>(null);
+  const [pricing, setPricing] = useState<Record<string, PricingRecommendation>>({});
   const [selected, setSelected] = useState<string | null>(customerId ?? null);
   const [error, setError] = useState<string | null>(null);
 
@@ -128,6 +165,13 @@ export default function Scorecards({ summary, customerId }: { summary: Summary; 
       setData(d);
       setSelected((cur) => cur ?? d.cards[0]?.customer_id ?? null);
     }).catch((e) => setError(String(e)));
+    // Pricing-engine recommendations (Blueprint I), keyed by customer, surfaced inline per card.
+    // Capability-gated: leaves the inline block empty when unit_price / rack_benchmark are absent.
+    api.pricing.recommendations({ regime, terminal }).then((p) => {
+      const map: Record<string, PricingRecommendation> = {};
+      for (const r of p.recommendations?.recommendations ?? []) map[r.customer_id] = r;
+      setPricing(map);
+    }).catch(() => setPricing({}));
   }, [regime, terminal]);
   useEffect(reload, [reload]);
 
@@ -179,7 +223,7 @@ export default function Scorecards({ summary, customerId }: { summary: Summary; 
         </section>
         <section className="xl:col-span-3">
           <Panel title="Scorecard">
-            {card ? <FullCard card={card} config={config} /> : <div className="text-sm text-slate-500">Select an account.</div>}
+            {card ? <FullCard card={card} config={config} pricing={pricing[card.customer_id]} /> : <div className="text-sm text-slate-500">Select an account.</div>}
           </Panel>
           <div className="mt-5">
             <Panel title="Archetype coverage — one exemplar per archetype present">

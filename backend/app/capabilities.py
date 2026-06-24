@@ -104,6 +104,14 @@ FEATURES: list[Feature] = [
             "History accumulates now; the reconciliation module consumes it in P8.",
             "Inventory", ("receipt_source",), ("measurement_basis", "receipt_net_gallons"),
             kind="feed", count_metric="receipt_rows", count_target=20, count_unit="receipts"),
+    # --- Pricing: the Sandbox + Engine analysis feature (Blueprint I) ---
+    Feature("pricing_engine", "Pricing Sandbox & Engine (Blueprint I)",
+            "Interactive rack-vs-street spread what-if (expected volume & margin per customer via "
+            "elasticity β, the margin-maximizing post) plus the recommendation engine: a per-segment "
+            "acceptance model from the quote log and a GP-maximizing quote price per account, with "
+            "the shadow price of the binding constraint as a floor.",
+            "Pricing", ("unit_price", "rack_benchmark"),
+            ("unit_cost", "quoted_price", "outcome", "market_price_at_quote", "final_gallons")),
     # --- Pricing: early feeds (collect now, modules consume later) ---
     Feature("pricing_sandbox", "Pricing Sandbox (rack benchmark)",
             "Daily street/OPIS rack benchmark time series — the reference the Pricing "
