@@ -863,3 +863,125 @@ export interface PlaybookResponse {
   regime_cheatsheet: RegimeCheat[];
   morning_routine: MorningStep[];
 }
+
+// ---- Demand Cockpit -------------------------------------------------------------
+export interface DemandHistoryPoint {
+  period_start: string;
+  actual: number;
+}
+export interface DemandForecastPoint {
+  period_start: string;
+  p10: number;
+  p50: number;
+  p90: number;
+  sigma?: number;
+}
+export interface DemandCustomerForecast {
+  customer_id: string;
+  name: string;
+  method: string;
+  n_periods: number;
+  var_score: number | null;
+  mape: number | null;
+  bias: number | null;
+  next_p50: number;
+  horizon_p50: number;
+}
+export interface DemandAccuracy {
+  mape: number | null;
+  bias: number | null;
+  n: number;
+  method?: string;
+  by_method: Record<string, number>;
+}
+export interface DemandInventory {
+  inventory: number;
+  capacity: number;
+  min_heel: number;
+  as_of: string | null;
+}
+export interface BurndownPoint {
+  day: number;
+  date: string;
+  p50: number;
+  fast: number;
+  slow: number;
+  heel: number;
+  capacity: number;
+}
+export interface DemandBurndown {
+  horizon_days: number;
+  breach_day: number | null;
+  series: BurndownPoint[];
+}
+export interface DemandRecommendation {
+  mode: string; // buy | target_only | no_demand
+  supply_gap: boolean;
+  service_level: number;
+  lead_time_days: number;
+  review_period_days: number;
+  lot_size: number | null;
+  daily_demand_p50: number;
+  daily_demand_sigma: number;
+  safety_stock: number;
+  reorder_point_above_heel: number;
+  order_up_to_above_heel: number;
+  target_cover_days: number;
+  headline: string;
+  // buy mode
+  inventory?: number;
+  capacity?: number;
+  min_heel?: number;
+  available_above_heel?: number;
+  days_of_cover?: number | null;
+  days_to_reorder?: number;
+  buy_by_date?: string | null;
+  buy_quantity?: number | null;
+  quantity_capped?: boolean;
+  ullage?: number;
+  // target_only mode
+  target_inventory?: number | null;
+  gap_note?: string;
+}
+export interface DemandCockpit {
+  terminal: string | null;
+  terminals: string[];
+  product: string;
+  products: string[];
+  window: string;
+  windows: string[];
+  grain: string;
+  as_of: string | null;
+  n_customers: number;
+  availability: Record<string, Availability>;
+  history: DemandHistoryPoint[];
+  forecast: DemandForecastPoint[];
+  customer_forecasts: DemandCustomerForecast[];
+  accuracy: DemandAccuracy;
+  inventory: DemandInventory | null;
+  days_of_cover: number | null;
+  burndown: DemandBurndown | null;
+  recommendation: DemandRecommendation | null;
+  inputs?: { service_level: number; lead_time_days: number; lot_size: number | null };
+  config?: Record<string, number | string | boolean>;
+}
+export interface DemandForecastRow {
+  terminal: string;
+  product: string;
+  score_window: string;
+  computed_at: string;
+  grain: string;
+  h_index: number;
+  period_start: string;
+  p10: number;
+  p50: number;
+  p90: number;
+  daily_p50?: number;
+  [k: string]: number | string | undefined;
+}
+export interface DemandForecastsResponse {
+  level: string;
+  computed_at: string | null;
+  count: number;
+  rows: DemandForecastRow[];
+}

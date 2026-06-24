@@ -29,6 +29,8 @@ import type {
   DailyResponse,
   ScorecardsResponse,
   PlaybookResponse,
+  DemandCockpit,
+  DemandForecastsResponse,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -186,5 +188,36 @@ export const api = {
     const qs = new URLSearchParams({ window });
     if (terminal) qs.set("terminal", terminal);
     return getJSON<PlaybookResponse>(`/playbook?${qs.toString()}`);
+  },
+
+  // ---- Demand Cockpit (per-terminal operating forecast) ----
+  demand: {
+    cockpit: (opts: {
+      terminal?: string | null;
+      product?: string | null;
+      window?: string;
+      serviceLevel?: number;
+      leadTimeDays?: number;
+      lotSize?: number | null;
+    }) => {
+      const qs = new URLSearchParams({ window: opts.window ?? "all" });
+      if (opts.terminal) qs.set("terminal", opts.terminal);
+      if (opts.product) qs.set("product", opts.product);
+      if (opts.serviceLevel != null) qs.set("service_level", String(opts.serviceLevel));
+      if (opts.leadTimeDays != null) qs.set("lead_time_days", String(opts.leadTimeDays));
+      if (opts.lotSize != null && opts.lotSize > 0) qs.set("lot_size", String(opts.lotSize));
+      return getJSON<DemandCockpit>(`/demand/cockpit?${qs.toString()}`);
+    },
+    persist: (window = "all") =>
+      postJSON<{ ok: boolean; computed_at: string; window: string; terminals: string[];
+        products: string[]; customer_rows: number; terminal_rows: number }>(
+        "/demand/persist", { window }),
+    forecasts: (level: "terminal" | "customer" = "terminal", terminal?: string | null,
+                product?: string | null) => {
+      const qs = new URLSearchParams({ level });
+      if (terminal) qs.set("terminal", terminal);
+      if (product) qs.set("product", product);
+      return getJSON<DemandForecastsResponse>(`/demand/forecasts?${qs.toString()}`);
+    },
   },
 };
