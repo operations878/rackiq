@@ -58,7 +58,8 @@ def _check_window(window: str) -> str:
 
 _TABLE_FIELDS = ("customer_id", "name", "archetype_true", "home_terminal", "window", "grain",
                  "data_sufficient", "n_lifts", "total_net_gallons", "monthly_volume", "trend_pct",
-                 "recency_gap", "var", "base_value", "account_value", "quadrant", "archetype")
+                 "recency_gap", "var", "base_value", "account_value", "quadrant", "archetype",
+                 "forecast", "var_trend")
 
 
 # A slim set of Layer-1 facts the Book Overview table needs (margin, credit, product mix)
@@ -108,6 +109,32 @@ def scores(window: str = Query(default="all")):
     }
 
 
+@router.get("/book-forecast")
+def book_forecast(window: str = Query(default="all"),
+                  terminal: str | None = Query(default=None),
+                  product: str | None = Query(default=None)):
+    """Bottom-up book demand forecast (7/30/90 days) summed from every customer's lane,
+    optionally filtered by terminal / product, plus the A/B-vs-C/D forecastability headline."""
+    window = _check_window(window)
+    with db.lock():
+        con = _con()
+        scoring.ensure_tables(con)
+        res = _result(con, DEFAULT_CONFIG, window)
+    terms, prods = set(), set()
+    for c in res["customers"]:
+        for key in ((c.get("facts") or {}).get("tp_share") or {}):
+            t, _, p = key.partition("|")
+            if t and t != "(unknown)":
+                terms.add(t)
+            if p and p != "(unknown)":
+                prods.add(p)
+    agg = scoring.aggregate_book_forecast(res["customers"], DEFAULT_CONFIG,
+                                          terminal or None, product or None)
+    return {"window": window, "as_of": res["as_of"], "windows": WINDOWS,
+            "terminal": terminal or None, "product": product or None,
+            "terminals": sorted(terms), "products": sorted(prods), **agg}
+
+
 @router.get("/config")
 def config():
     return {"config": DEFAULT_CONFIG.to_dict(), "windows": WINDOWS,
@@ -149,6 +176,10 @@ def customer(customer_id: str, window: str = Query(default="all")):
     match = next((c for c in res["customers"] if c["customer_id"] == customer_id), None)
     if match is None:
         raise HTTPException(status_code=404, detail=f"No scored customer '{customer_id}' in window {window}.")
+    # Lane breaks: upgrade this one customer's weather to a live NOAA/ERA5 fetch (cached per
+    # terminal). The bulk list stays on the fast seasonal proxy; only the opened account fetches.
+    with db.lock():
+        match["excursions"] = scoring.customer_excursions(_con(), match, DEFAULT_CONFIG)
     return {"window": window, "as_of": res["as_of"], "availability": res["availability"],
             "customer": match}
 

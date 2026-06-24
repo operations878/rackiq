@@ -41,6 +41,28 @@ class ScoringConfig:
     var_steadiness_delta_band: float = 0.10   # |Δ in-band rate| below this ⇒ "steady"
     var_trend_sig_p: float = 0.10         # Mann-Kendall / drift p-value significance threshold
 
+    # ---- Forward projection (VAR → forecast) -----------------------------------
+    # The lane describes the past; these turn it into a forward expectation. Expected volume
+    # over the next H days = base_per_period · (H / period_days); the band scales with the lane
+    # width (√-of-periods aggregation), so a tight lane (high VAR) forecasts narrow and a wide
+    # lane (low VAR) forecasts wide. NOTHING here touches the VAR score.
+    forecast_horizons: tuple = (7, 30, 90)    # days projected forward (per-customer + book)
+    forecast_band_z: float = 1.0          # band half-width in σ (1.0 ≈ a 68% "likely" range)
+    forecast_max_horizon_days: int = 90   # how far the dotted lane continuation is drawn
+
+    # ---- Excursion (lane-break) weather pattern --------------------------------
+    excursion_min_breaks: int = 3         # need this many lane breaks to call a weather pattern
+    excursion_pattern_share: float = 0.6  # ≥ this share of breaks on snap weeks ⇒ a pattern
+    weather_snap_quantile: float = 0.70   # a period is a cold-snap/hot-spell at/above this HDD/CDD quantile
+
+    # ---- VAR trend over time (tightening / widening) ---------------------------
+    # Re-fit the lane at an earlier as-of and compare the VAR score: is the lane tightening
+    # (more reliable) or widening (becoming a problem)? Drives the home-page "movers" list.
+    var_trend_lookback_days: int = 365    # trailing window each trend point is scored over
+    var_trend_month_days: int = 30        # "this month vs prior" shift
+    var_trend_quarter_days: int = 90      # "this quarter vs prior" shift
+    var_trend_move_band: float = 3.0      # |ΔVAR| below this ⇒ "steady" (else tighten/widen)
+
     # ---- Data sufficiency (is an account "established"?) ------------------------
     suff_min_lifts: int = 12
     suff_min_days: int = 90

@@ -393,6 +393,31 @@ percentile ranking. Results persist to `customer_scores` + `customer_lane`.
   (`var_bootstrap_iters`, `var_steadiness_delta_band`, `var_trend_sig_p`, …) lives in `ScoringConfig`.
   The ranked `/api/scores` list ships a **slim** var (the table fields); the full layer rides on
   `/api/scores/customer/{id}`.
+- **Part 1c — VAR AS A FORECAST** (the core purpose — turns the lane from a description of the past
+  into a forward tool; the VAR math is untouched). Four pieces, all config-driven
+  (`forecast_horizons`, `forecast_band_z`, `excursion_*`, `var_trend_*`):
+  1. **Per-customer forward projection** (`_forward_projection`): expected volume over the next
+     **7/30/90 days** = base run-rate · (H ÷ period_days), with a confidence band that scales with
+     the lane width (`band = z·σ·√k`) — a **tight lane (high VAR) projects narrow, a wide lane (low
+     VAR) projects wide**. The base is the trailing **run-rate** (their normal pace, robust to a
+     sparse seasonal endpoint that would otherwise collapse erratic accounts to zero). Surfaced as a
+     plain sentence (*"Expect ~X gal over the next 30 days (likely Y–Z) … if they hold their
+     pattern"*) and a **dotted forward continuation** of the base-range chart (`forecast_series`).
+  2. **Book-level bottom-up forecast** (`aggregate_book_forecast` → `GET /api/scores/book-forecast`):
+     sums every customer's projection into a total expected-demand band (variances add,
+     `band = z·√Σσ²`), **filterable by terminal/product** via each customer's `tp_share` volume mix.
+  3. **Excursion explanation** (`_excursions`): every lift outside the variability range tagged
+     **spike / shortfall / no-show** with the **weather that period** (HDD/CDD), then a pattern note
+     (*"3 of 4 lane breaks landed on cold-snap weeks — looks weather-driven, not random"*) that
+     **separates predictable-looking-erratic from truly random**. Weather comes from `weather.py`
+     (live NOAA/ERA5 auto-fetch, cached, seasonal-proxy fallback). The bulk list computes breaks on
+     the free proxy; the per-customer detail (`scoring.customer_excursions`) re-runs with the live
+     fetch for just that terminal.
+  4. **VAR trend over time** (`_var_trend`): re-fits the (cheap, diagnostics-free) lane at an earlier
+     as-of and compares the VAR score — **tightening** (more reliable) vs **widening** (a developing
+     problem), this month-vs-prior and quarter-vs-prior — driving the home-page **movers** list and
+     the **forecastability** headline (A/B-steady vs C/D-erratic share of forecast volume, with its
+     quarter-over-quarter trend).
 - **Part 2 — Layer-1 behavioral facts**: order size mean/median/CV, monthly volume, frequency,
   days-between mean & CV, margin/gal mean & CV, days-since-last, product mix + HHI,
   rush/split/small-order/cancel rates + friction-tag count, payment terms, days-to-pay mean & CV,
@@ -401,8 +426,9 @@ percentile ranking. Results persist to `customer_scores` + `customer_lane`.
   Volume/Timing Steadiness (= VAR lanes), Price Sensitivity (β of accept-incidence vs price−reference,
   gated on quotes/rack benchmark), **EVR** (demand model vs naive-calendar baseline — the
   useful-vs-dangerous separator), Discount Efficiency (`incremental_GP / GP_given_up`), Market
-  Sensitivity (signed corr profile), Weather Sensitivity (HDD/CDD β; NOAA fetch pending → seasonal
-  proxy), Quote Score (accept/negotiate/latency/lowest-only), Churn Risk. Plus the **Variability
+  Sensitivity (signed corr profile), Weather Sensitivity (HDD/CDD β on the seasonal proxy; live
+  NOAA/ERA5 weather powers the lane-break explanations), Quote Score (accept/negotiate/latency/
+  lowest-only), Churn Risk. Plus the **Variability
   Quality Quadrant** (Explainability = EVR × Profitability) → Strategic Lever / Premium Spot /
   Managed Cost / Dangerous Noise.
 - **Part 4 — Layer-3 Base Value**: `EGP = annual_gal·margin`; friction & credit costs; `RFAP =
@@ -471,7 +497,8 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/market-prices?product=ULSD` | market vs street-rack time series (`available:false` when absent) |
 | `GET /api/monthly-volume` | monthly net gallons (needs only required fields; survives `core`) |
 | `GET /api/scores?window=all` | ranked customers (VAR+grade, base value+grade, archetype, volume, trend) + per-metric `availability` |
-| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, the full **VAR statistics layer** (base/variability ranges, score-component breakdown, cadence lane, steadiness-trend test, plain-English read, advanced diagnostics), sub-scores, base value, archetype posture |
+| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, the full **VAR statistics layer** (base/variability ranges, score-component breakdown, cadence lane, steadiness-trend test, plain-English read, advanced diagnostics), the **forward projection** (7/30/90-day expected band + dotted `forecast_series`), the **lane-break list** (excursions tagged spike/shortfall/no-show + live-weather pattern), the **VAR trend** (tightening/widening), sub-scores, base value, archetype posture |
+| `GET /api/scores/book-forecast?window=&terminal=&product=` | the **bottom-up book demand forecast** (7/30/90-day expected band summed from every customer's lane, filterable by terminal/product) + the **forecastability** split (A/B-steady vs C/D-erratic volume share, with the quarter-over-quarter trend) |
 | `POST /api/studio/crosswalk/upload-names` · `GET /api/studio/unmapped-customers` | upload the hand-built raw→coded name map (confirmed; re-applied across the store) · list raw names still unmapped |
 | `GET /api/scores/quadrant?window=` | Explainability × Profitability scatter points with archetype tags |
 | `GET /api/scores/backtest` | per-customer one-step forecast error by method |
@@ -613,17 +640,24 @@ presentation: the home screen serves understanding demand & VAR; secondary metri
 
 **Home (the spine)**
 - **VAR Home — Demand Predictability** (`pages/VarHome.tsx`, route `""`, default landing) — a clean,
-  scannable screen centered on the VAR score. Top: a plain-language explainer of what the VAR score
-  *is* ("how predictable each customer's buying is — high = steady & forecastable, low = erratic")
-  plus a **bottom-up total-book forecast summary** (run-rate ±band from each customer's base-volume
-  lane, predictable-volume share, volume-weighted avg VAR, grade mix). Main: the customer list
-  **ranked by VAR** — coded name · VAR+grade · base volume · base cadence · trend arrow — kept
-  deliberately few-columned, with a **“show more columns”** toggle (monthly volume, archetype).
-  Click a customer → the **base-range chart** as the hero (base line, ±1σ lane, ±2σ band, actual
-  lifts) with a **legend/key**, the **plain-English read** of their pattern, the **score-component
-  breakdown** (`components/scores/VarBreakdown.tsx`), the **cadence lane**, the **steadiness-trend**
-  result, and a foldaway **Advanced statistics** panel. The **Customer Name Map** + unmapped-names
-  panel (`components/studio/NameMapPanel.tsx`) sits at the bottom.
+  scannable screen centered on the VAR score *as a forecast*. Top: a plain-language explainer (VAR =
+  "how predictable each customer's buying is — high = steady & forecastable, low = erratic"), then
+  the **bottom-up book demand forecast** (`BookForecastPanel`, `GET /api/scores/book-forecast`) — the
+  prominent *"Across all customers, expect ~X gal in the next 30 days (range Y–Z)"* headline with
+  **7/30/90-day** cards and **terminal/product filter** dropdowns — and the **forecastability
+  summary** (the A/B-steady vs C/D-erratic volume split as a two-segment bar + one headline % with
+  its quarter trend). Below sits the **VAR movers** worklist (`MoversPanel`: who tightened / widened
+  most this quarter). Main: the customer list **ranked by VAR** — coded name · VAR+grade · **next-30d
+  forecast** · **trend badge** — with a **"show more columns"** toggle (cadence, archetype). Click a
+  customer → the **plain-English read**, the **forward projection** card
+  (`components/scores/ForwardProjection.tsx`), the **base-range chart** as the hero now **continued
+  forward as a dotted projection** past a "forecast →" boundary (base line, ±1σ lane, ±2σ band,
+  actual lifts) with a **legend/key**, the **lane-break list** (`components/scores/LaneBreaks.tsx` —
+  excursions tagged spike/shortfall/no-show + the weather pattern note), a **VAR-trend badge**
+  (`components/scores/VarTrendBadge.tsx`), the **score-component breakdown**
+  (`components/scores/VarBreakdown.tsx`), the **cadence lane**, the **steadiness-trend** result, and a
+  foldaway **Advanced statistics** panel. The **Customer Name Map** + unmapped-names panel
+  (`components/studio/NameMapPanel.tsx`) sits at the bottom.
 
 **Operate**
 - **Daily Operating Dashboard** (`pages/DailyOps.tsx`, route `daily`) — Blueprint C. One view per
@@ -737,9 +771,10 @@ backend/
                             #   (+ reapply_crosswalk: re-resolve the whole store to master ids; unmapped_customers)
                             #   (scoring caches customer_scores/customer_lane are managed in scoring.ensure_tables)
     capabilities.py         # ★ FEATURES registry + runtime matrix (incl. "feed" collecting state)
-    scoring.py              # ★ scoring engine: VAR lane (+ transparency/statistics layer: components, ranges,
-                            #   cadence, steadiness test, plain read, bootstrap CI, MK/STL/forecastability), sub-scores, base value, archetypes, backtest
-    scoring_config.py       # ★ ScoringConfig — every weight/threshold/window as a parameter
+    scoring.py              # ★ scoring engine: VAR lane (+ transparency/statistics layer; + VAR-as-forecast:
+                            #   forward projection, lane-break excursions+weather, book bottom-up forecast, VAR trend), sub-scores, base value, archetypes, backtest
+    scoring_config.py       # ★ ScoringConfig — every weight/threshold/window/forecast-horizon as a parameter
+    weather.py              # ★ HDD/CDD feed: live NOAA/ERA5 auto-fetch (no key) → weather_daily cache → seasonal proxy fallback (explains lane breaks)
     reconciliation.py       # ★ P8 loss-control engine: book vs physical, BOL-grouped disbursements,
                             #   net-recon cross-check, mechanism split, meter-drift control charts, $loss
     reconciliation_config.py# ★ ReconConfig — control limits / thresholds / period grain as parameters
@@ -779,7 +814,7 @@ frontend/
     api/{client,types}.ts
     pages/{VarHome,DailyOps,DemandCockpit,Pricing,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx   # VarHome = the default landing (route "")
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
-    components/scores/{BaseRangeChart,QuadrantScatter,VarBreakdown}.tsx   # VarBreakdown = the VAR statistics layer
+    components/scores/{BaseRangeChart,QuadrantScatter,VarBreakdown,ForwardProjection,LaneBreaks,VarTrendBadge}.tsx   # BaseRangeChart draws the dotted forward projection; ForwardProjection/LaneBreaks/VarTrendBadge = VAR-as-forecast UI
     components/demand/{DemandForecastChart,BurnDownChart}.tsx
     components/pricing/{MarginCurveChart}.tsx
     components/reconciliation/{MechanismBar,ControlChart,LossTrendChart}.tsx
@@ -806,6 +841,26 @@ CLAUDE.md
   (`var_w_in_band·in_band + var_w_tightness·tightness + var_w_excursion·(1−excursion)`, blended 70/30
   with cadence). Every stat is wrapped in `_safe(...)` so a degenerate/short series returns `None`
   rather than breaking scoring; thresholds live in `ScoringConfig`.
+- **VAR-as-a-forecast is a layer ON TOP of VAR — it never changes the score.** The forward
+  projection, book bottom-up forecast, excursion weather, and VAR trend all read the frozen lane.
+  The per-customer forward base is the **trailing run-rate** (mean of recent per-period actuals), NOT
+  the seasonal endpoint `fitted[-1]` — that endpoint collapses to ~0 for sparse/erratic accounts
+  (most periods empty → median 0), which would wrongly drop them from the book forecast and inflate
+  the predictable share to 100%. The book band assumes independent customers (`z·√Σσ²`); terminal/
+  product filtering uses each customer's `tp_share` volume mix. The **VAR trend** re-fits the lane at
+  `as_of − {30,90}d` over a trailing `var_trend_lookback_days` window using the cheap
+  diagnostics-free light path (`_customer_core(..., light=True)`, STL skipped) — it is
+  **window-independent** (always from `as_of`), so it reads the same on every display window.
+- **Weather (HDD/CDD) is best-effort with a deterministic fallback.** `weather.py` auto-fetches real
+  degree-days from the **key-less Open-Meteo archive (ERA5 — the reanalysis behind NOAA's products)**
+  per terminal lat/lon, caches them in `weather_daily`, and falls back to a **seasonal climatology
+  proxy** (matching the generator's ambient curve) when offline or past the ~5-day archive horizon —
+  so excursion patterns work with no network at all. A process-wide circuit breaker stops retrying
+  after the first failure; the archive's recent-edge lag is excluded from the fetch trigger so a call
+  never re-fetches chasing un-fillable days. The **bulk** scores list computes lane breaks on the free
+  proxy (`live=False`); only the **opened customer detail** re-runs with the live fetch
+  (`scoring.customer_excursions`, `live=True`) for that one terminal. Under pytest the fetch is
+  disabled (proxy only) for determinism. `weather_daily` survives reset/demo (not a canonical table).
 - **Pricing works in contemporaneous spread space.** The sandbox/engine measure every lift against
   the rack benchmark *on its own date* (`cost_rel`, `current_spread`), so margin at a posted spread
   `s` is `s − cost_rel` — the absolute street level and its seasonal trend cancel, and multi-product
@@ -893,5 +948,8 @@ CLAUDE.md
 - Uploads are cached in-process by `upload_id`; a server restart between map/commit means
   re-uploading the file (the UI surfaces this as "upload expired").
 - **Tests:** `uv run pytest` (dev group adds `pytest` + `httpx`); covers VCF, profiling, crosswalk,
-  validation, the hygiene pipeline, scoring, the reconciliation engine (BOL grouping, mechanism
-  split, net-recon, meter drift, dollarize), and the full API flow against a throwaway DuckDB.
+  validation, the hygiene pipeline, scoring (incl. **VAR-as-forecast**: forward projection band,
+  tighter-band-for-higher-VAR, excursion weather pattern, VAR trend, book bottom-up forecast +
+  terminal filter, the `/api/scores/book-forecast` endpoint), the reconciliation engine (BOL
+  grouping, mechanism split, net-recon, meter drift, dollarize), and the full API flow against a
+  throwaway DuckDB. Weather fetch is disabled under pytest (deterministic seasonal proxy).

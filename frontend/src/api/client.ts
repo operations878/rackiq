@@ -25,6 +25,7 @@ import type {
   QuadrantResponse,
   CustomerScoreResponse,
   BacktestResponse,
+  BookForecast,
   Reconciliation,
   RegimeConfig,
   Regime,
@@ -163,6 +164,12 @@ export const api = {
     list: (window = "all") => getJSON<ScoresResponse>(`/scores?window=${window}`),
     customer: (id: string, window = "all") =>
       getJSON<CustomerScoreResponse>(`/scores/customer/${encodeURIComponent(id)}?window=${window}`),
+    bookForecast: (opts: { window?: string; terminal?: string | null; product?: string | null } = {}) => {
+      const qs = new URLSearchParams({ window: opts.window ?? "all" });
+      if (opts.terminal) qs.set("terminal", opts.terminal);
+      if (opts.product) qs.set("product", opts.product);
+      return getJSON<BookForecast>(`/scores/book-forecast?${qs.toString()}`);
+    },
     quadrant: (window = "all") => getJSON<QuadrantResponse>(`/scores/quadrant?window=${window}`),
     backtest: () => getJSON<BacktestResponse>("/scores/backtest"),
     config: () => getJSON<{ config: Record<string, number | string>; windows: string[]; archetypes: string[] }>("/scores/config"),

@@ -597,6 +597,104 @@ export interface LanePoint {
   actual: number;
 }
 
+// ---- VAR as a forecast: forward projection, lane breaks, trend over time --------
+export interface ForecastHorizon {
+  days: number;
+  expected: number;
+  lo: number;
+  hi: number;
+  expected_orders: number | null;
+}
+
+export interface ForecastBlock {
+  available: boolean;
+  grain: string;
+  reason?: string;
+  period_days?: number;
+  base_per_period?: number;
+  sigma_per_period?: number;
+  band_z?: number;
+  horizons: ForecastHorizon[];
+  plain?: string;
+}
+
+/** A forward (forecast) lane point — same shape as a LanePoint but with no actual yet. */
+export interface LaneForecastPoint {
+  period_start: string;
+  base: number;
+  base_lo: number;
+  base_hi: number;
+  var_lo: number;
+  var_hi: number;
+}
+
+export interface Excursion {
+  period_start: string;
+  kind: "spike" | "shortfall" | "no_show";
+  actual: number;
+  expected: number;
+  delta_pct: number | null;
+  var_range: [number, number];
+  hdd: number | null;
+  cdd: number | null;
+  cold_snap: boolean;
+  hot_spell: boolean;
+  weather_source: string | null;
+}
+
+export interface ExcursionPattern {
+  type: "cold_snap" | "hot_spell" | "random" | "too_few" | "none";
+  n_breaks: number;
+  n_cold_snap?: number;
+  n_hot_spell?: number;
+  note: string;
+}
+
+export interface ExcursionsBlock {
+  available: boolean;
+  n_breaks: number;
+  breaks: Excursion[];
+  pattern: ExcursionPattern | null;
+  weather_source: string | null;
+}
+
+export interface VarTrendComparison {
+  direction: "tightening" | "widening" | "steady" | "insufficient";
+  delta: number | null;
+  score_now: number | null;
+  score_prior: number | null;
+  grade_now: string | null;
+  grade_prior: string | null;
+  note: string;
+}
+
+export interface VarTrendBlock {
+  available: boolean;
+  score_now?: number | null;
+  grade_now?: string | null;
+  lookback_days?: number;
+  comparisons: { month?: VarTrendComparison; quarter?: VarTrendComparison };
+}
+
+export interface BookForecast {
+  window: string;
+  as_of: string | null;
+  windows: string[];
+  terminal: string | null;
+  product: string | null;
+  terminals: string[];
+  products: string[];
+  horizons: { days: number; expected: number; lo: number; hi: number }[];
+  ref_horizon_days: number;
+  n_customers: number;
+  grade_volume: Record<string, number>;
+  predictable_volume: number;
+  erratic_volume: number;
+  predictable_share: number | null;
+  predictable_share_prior: number | null;
+  predictable_share_delta: number | null;
+}
+
 export interface ScoreCustomer {
   customer_id: string;
   name: string;
@@ -618,6 +716,10 @@ export interface ScoreCustomer {
   subscores: Record<string, SubScore>;
   lane_series?: LanePoint[];
   facts?: Record<string, number | string | null | Record<string, number>>;
+  forecast?: ForecastBlock;
+  forecast_series?: LaneForecastPoint[];
+  excursions?: ExcursionsBlock;
+  var_trend?: VarTrendBlock;
 }
 
 export interface ScoresResponse {
