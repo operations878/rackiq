@@ -172,6 +172,19 @@ def _coerce_fix(up, table: str, mapping: dict[str, str], options: dict | None):
     return hygiene.apply_fixes(mapped, table, options, _con())
 
 
+def _reason_breakdown(rules: dict) -> dict[str, int]:
+    """Count quarantined rows by reason, e.g. {'required_present': 2, 'edi_control_row': 5}."""
+    out: dict[str, int] = {}
+    for reasons in rules.get("quarantine_reasons", {}).values():
+        for rsn in reasons:
+            out[rsn] = out.get(rsn, 0) + 1
+    return out
+
+
+def _correction_count(rules: dict) -> int:
+    return next((r["count"] for r in rules.get("rules", []) if r["key"] == "volume_corrections"), 0)
+
+
 # ---- Endpoints ------------------------------------------------------------------
 @router.get("/targets")
 def targets():
@@ -279,6 +292,7 @@ def validate(req: ValidateRequest):
         raise HTTPException(status_code=400, detail=f"Unknown target table '{req.table}'.")
 
     base = ingest.validate(up.df, req.table, req.mapping)  # mapping validity + field stats
+    opts = hygiene.HygieneOptions.from_dict(req.options)
 
     with db.lock():
         fixed, report, _audit = _coerce_fix(up, req.table, req.mapping, req.options)
@@ -301,6 +315,13 @@ def validate(req: ValidateRequest):
     base["quarantine_count"] = n_failing if quarantine_on else 0
     base["dropped_rows"] = 0 if quarantine_on else n_failing
     base["clean_rows"] = max(0, n_fixed - n_failing)
+
+    # Preview BOL grouping on the rows that would actually be kept: how many lifts result.
+    good = fixed.drop(index=rules["quarantine_index"]) if rules["quarantine_index"] else fixed
+    grouped = hygiene.group_by_bol(good, req.table) if opts.group_bol else good
+    base["lifts_after_grouping"] = int(len(grouped))
+    base["corrections"] = _correction_count(rules)
+    base["quarantine_reasons"] = _reason_breakdown(rules)
     return base
 
 
@@ -330,6 +351,12 @@ def commit(req: CommitRequest):
         q_index = rules["quarantine_index"]
         quarantined = fixed.loc[q_index] if q_index else fixed.iloc[0:0]
         good = fixed.drop(index=q_index) if q_index else fixed
+        clean_rows = int(len(good))               # rows that passed the rules (pre-grouping)
+
+        # Collapse the compartment rows of each BOL into a single lift (sum gross + net). Runs on
+        # the CLEAN rows only, so junk/heartbeat rows never land inside a group.
+        if opts.group_bol:
+            good = hygiene.group_by_bol(good, req.table, report, audit)
 
         if opts.dedupe_exact:
             good = hygiene.dedupe_exact(good, report, audit)
@@ -376,8 +403,12 @@ def commit(req: CommitRequest):
         "mode": req.mode,
         "rows_written": rows_written,
         "rows_in_file": int(len(up.df)),
+        "clean_rows": clean_rows,                 # passed the rules (compartment-level)
+        "lifts_after_grouping": rows_written,     # after BOL grouping (== rows written)
+        "corrections": _correction_count(rules),  # negative volumes kept & tagged
         "quarantined": n_quarantined,
         "dropped": n_dropped,
+        "quarantine_reasons": _reason_breakdown(rules),
         "hygiene": report,
         "rules": rules["rules"],
         "saved_profile": req.save_profile or None,

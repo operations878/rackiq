@@ -85,21 +85,25 @@ def parse_file(content: bytes, filename: str) -> pd.DataFrame:
 # similarity and token overlap, so this list only needs the non-obvious aliases.
 SYNONYMS: dict[str, list[str]] = {
     "customer_id": ["customer", "cust", "customer id", "customer number", "cust no",
-                    "account", "acct", "account number", "buyer", "client", "bill to"],
+                    "account", "acct", "account number", "buyer", "client", "bill to",
+                    # BOL/EDI exports name the buyer the "consignee" (Consignee Number is the id).
+                    "consignee", "consignee number", "consignee no", "consignee num",
+                    "consignee #", "consignee id"],
     "lift_datetime": ["lift date", "lift time", "date", "datetime", "timestamp",
                       "load date", "ship date", "delivery date", "transaction date",
                       "bol date", "pickup date", "lift dt"],
     "net_gallons": ["net gallons", "net gal", "net", "net qty", "net quantity",
-                    "net volume", "gallons", "volume", "qty", "quantity", "net gals"],
+                    "net volume", "gallons", "volume", "qty", "quantity", "net gals",
+                    "net amount"],
     "terminal": ["terminal", "term", "rack", "location", "origin", "supply point",
-                 "loading terminal", "branch"],
+                 "loading terminal", "branch", "terminal name"],
     "product": ["product", "grade", "fuel", "item", "material", "prod", "product code",
-                "commodity"],
+                "commodity", "product name"],
     "gross_gallons": ["gross gallons", "gross gal", "gross", "gross qty", "gross volume",
-                      "gross gals", "observed gallons"],
+                      "gross gals", "observed gallons", "gross amount"],
     "observed_temp": ["temp", "temperature", "observed temp", "obs temp", "deg f",
                       "product temp", "load temp"],
-    "api_gravity": ["api", "api gravity", "gravity", "api grav", "deg api"],
+    "api_gravity": ["api", "api gravity", "gravity", "api grav", "deg api", "gravity api"],
     "unit_price": ["price", "unit price", "sell price", "sale price", "rack price",
                    "price per gallon", "ppg", "selling price", "invoice price"],
     "unit_cost": ["cost", "unit cost", "cogs", "acquisition cost", "laid in cost",
@@ -189,7 +193,9 @@ SYNONYMS: dict[str, list[str]] = {
     "compartment_unit_cost": ["compartment cost", "load cost"],
 }
 
-_SUGGEST_THRESHOLD = 0.52
+_SUGGEST_THRESHOLD = 0.52          # required keys: map generously (we want the core 3 found)
+_OPTIONAL_SUGGEST_THRESHOLD = 0.72  # optional fields: only when confident, so a loose header
+#                                     ("Rack Driver ID") never auto-fills a numeric field with junk
 
 
 def _norm(s: object) -> str:
@@ -229,12 +235,16 @@ def suggest_for_table(headers: list[str], table: str) -> dict[str, dict]:
     never auto-mapped to the same canonical field.
     """
     targets = [t["name"] for t in schema.import_targets(table)]
-    # Rank all (header, target) pairs above threshold, then assign greedily.
+    required = set(schema.required_import_keys(table))
+    # Rank all (header, target) pairs above threshold, then assign greedily. Required keys use
+    # a generous threshold (they must be found); optional fields use a stricter one so a weakly
+    # similar header isn't auto-mapped into a canonical field it doesn't belong in.
     pairs = []
     for h in headers:
         for t in targets:
             s = score_header(h, t)
-            if s >= _SUGGEST_THRESHOLD:
+            thr = _SUGGEST_THRESHOLD if t in required else _OPTIONAL_SUGGEST_THRESHOLD
+            if s >= thr:
                 pairs.append((s, h, t))
     pairs.sort(reverse=True)
     used_headers: set[str] = set()
@@ -414,11 +424,37 @@ def _clean_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
-def _parse_mixed_dates(series: pd.Series) -> pd.Series:
-    """Parse a column of possibly-mixed date formats, salvaging day-first values.
+# Excel stores dates as a serial number of days since its 1899-12-30 epoch (e.g. 45474 ==
+# 2024-07-01). A date column exported to CSV/text — or an unformatted xlsx cell — often carries
+# that raw serial instead of a formatted date; pandas would (wrongly) read it as epoch-nanoseconds
+# or fail. We convert serials in a plausible modern band. This runs ONLY inside date coercion, so
+# a numeric NON-date column (a customer number like 42023, a dollar amount) is never touched.
+_EXCEL_EPOCH = pd.Timestamp("1899-12-30")
+_SERIAL_MIN, _SERIAL_MAX = 20000.0, 80000.0   # ~1954-10 .. ~2119 — wider than any real ship date
+_SERIAL_RE = re.compile(r"^\d{4,6}(\.0+)?$")
 
-    First pass infers per-value formats; any non-blank value that still failed is retried
-    day-first (so "13/02/2024" and "02/13/2024" can coexist in one column).
+
+def _excel_serial(v: object) -> "pd.Timestamp | None":
+    """If ``v`` is an Excel date serial in the plausible band, the date it denotes, else None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) and not (isinstance(v, float) and pd.isna(v)):
+        x = float(v)
+    elif isinstance(v, str) and _SERIAL_RE.match(v.strip()):
+        x = float(v.strip())
+    else:
+        return None
+    if _SERIAL_MIN <= x <= _SERIAL_MAX:
+        return _EXCEL_EPOCH + pd.to_timedelta(x, unit="D")
+    return None
+
+
+def _parse_mixed_dates(series: pd.Series) -> pd.Series:
+    """Parse a column of possibly-mixed date formats, salvaging serials and day-first values.
+
+    Order: parse natively (handles real datetimes + ISO/US strings), override any Excel serial
+    numbers with their true date, then retry whatever is still unparsed day-first (so
+    "13/02/2024" and "02/13/2024" can coexist in one column).
     """
     import warnings
 
@@ -434,6 +470,12 @@ def _parse_mixed_dates(series: pd.Series) -> pd.Series:
                                           or (isinstance(v, float) and pd.isna(v))
                                           or (isinstance(v, str) and v.strip() == "")))
     out = _to_dt(series)
+    # Excel serials: override whatever the native parse made of a serial number.
+    serial = series.map(_excel_serial)
+    has_serial = serial.notna()
+    if has_serial.any():
+        out = out.copy()
+        out.loc[has_serial] = serial[has_serial]
     remaining = non_blank & out.isna()
     if remaining.any():
         out.loc[remaining] = _to_dt(series[remaining], dayfirst=True)

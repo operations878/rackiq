@@ -91,6 +91,37 @@ def run_rules(df: pd.DataFrame, table: str, options: dict | None,
         rules.append(r)
         _quarantine(miss, "required_present")
 
+    # 1b) Genuine EDI control / heartbeat rows: BOL number 0 AND gross 0 AND net 0 (often product
+    #     code "ZZZ"). They carry no lift and ARE held as junk — the one quarantine we keep for
+    #     "good wide BOL exports". A blank/zero BOL with a *real* volume is NOT junk (it stays).
+    junk_specs = {
+        schema.LIFTS: ("bol_number", "gross_gallons", "net_gallons"),
+        schema.BOL: ("bol_number", "compartment_gross_gallons", "compartment_net_gallons"),
+    }
+    if table in junk_specs:
+        bcol, gcol, ncol = junk_specs[table]
+        # Only a BOL-bearing file can have BOL control rows; need net to judge "no volume".
+        if bcol in df.columns and ncol in df.columns:
+            def _zeroish(col):
+                if col not in df.columns:
+                    return pd.Series(True, index=df.index)
+                return pd.to_numeric(df[col], errors="coerce").fillna(0) == 0
+            def _bol_zero():
+                if bcol not in df.columns:
+                    return pd.Series(True, index=df.index)
+                raw = df[bcol]
+                blank = raw.map(lambda v: v is None
+                                or (isinstance(v, float) and pd.isna(v))
+                                or (isinstance(v, str) and v.strip() == ""))
+                return blank | (pd.to_numeric(raw, errors="coerce").fillna(-1) == 0)
+            junk_mask = _bol_zero() & _zeroish(gcol) & _zeroish(ncol)
+            cols = [c for c in (bcol, gcol, ncol) if c in df.columns]
+            r = _rule("edi_control_row", "EDI control / heartbeat rows", "warning", junk_mask,
+                      df, cols, "quarantine",
+                      "{n} EDI control row(s) (BOL 0, gross 0, net 0) held as junk.")
+            rules.append(r)
+            _quarantine(junk_mask, "edi_control_row")
+
     # 2) Dates parseable (non-blank in source but failed to coerce to a date).
     date_targets = [f.name for f in schema.CANONICAL_FIELDS
                     if f.table == table and f.dtype in (schema.DType.DATE, schema.DType.TIMESTAMP)]
@@ -123,16 +154,18 @@ def run_rules(df: pd.DataFrame, table: str, options: dict | None,
                            df, date_targets, "none",
                            "{n} date(s) fall outside %d–%d." % (schema.MIN_REASONABLE_YEAR, hi.year)))
 
-    # 4) Volumes non-negative (a negative volume is invalid → quarantine).
+    # 4) Negative volumes are legitimate reversals / corrections — KEEP them, never quarantine.
+    #    They are tagged and listed for review (and they sum correctly under BOL grouping, so a
+    #    reversal compartment nets out against the load it corrects).
     vol_fields = [f for f in schema.volume_fields_for_table(table) if f in df.columns]
     neg_mask = falsemask()
     for f in vol_fields:
         neg_mask |= (df[f].notna() & (df[f] < 0))
     if vol_fields:
-        r = _rule("volume_nonnegative", "Volumes non-negative", "error", neg_mask, df,
-                  vol_fields, "quarantine", "{n} row(s) have a negative volume.")
-        rules.append(r)
-        _quarantine(neg_mask, "volume_nonnegative")
+        rules.append(_rule(
+            "volume_corrections", "Negative volumes (corrections / reversals)", "info",
+            neg_mask, df, vol_fields, "none",
+            "{n} row(s) carry a negative volume — kept and tagged as a correction/reversal."))
 
     # 5) Numeric fields within sane bounds (likely unit mismatch / fat-finger).
     bound_fields = [f.name for f in schema.CANONICAL_FIELDS
@@ -140,7 +173,11 @@ def run_rules(df: pd.DataFrame, table: str, options: dict | None,
     bounds_mask = falsemask()
     for f in bound_fields:
         lob, hib = schema.FIELD_BOUNDS[f]
-        bounds_mask |= (df[f].notna() & ((df[f] < lob) | (df[f] > hib)))
+        if f in schema.VOLUME_FIELDS:
+            # A negative volume is a correction (own rule), not a unit mismatch — flag only highs.
+            bounds_mask |= (df[f].notna() & (df[f] > hib))
+        else:
+            bounds_mask |= (df[f].notna() & ((df[f] < lob) | (df[f] > hib)))
     if bound_fields:
         rules.append(_rule("value_bounds", "Values within sane bounds", "warning", bounds_mask,
                            df, bound_fields, "none",
