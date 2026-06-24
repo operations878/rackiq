@@ -10,6 +10,7 @@ import Scores from "./pages/Scores";
 import Reconciliation from "./pages/Reconciliation";
 import DailyOps from "./pages/DailyOps";
 import DemandCockpit from "./pages/DemandCockpit";
+import Pricing from "./pages/Pricing";
 import BookOverview from "./pages/BookOverview";
 import Radar from "./pages/Radar";
 import Scorecards from "./pages/Scorecards";
@@ -96,6 +97,7 @@ export default function App() {
       items: [
         { key: "", label: "Daily Operating", icon: "◎", match: (b) => b === "" },
         { key: "demand", label: "Demand Cockpit", icon: "↗", match: (b) => b === "demand" },
+        { key: "pricing", label: "Pricing Sandbox", icon: "◇", match: (b) => b === "pricing" },
         { key: "scorecards", label: "Scorecards", icon: "▤", match: (b) => b === "scorecards" || b === "scorecard" },
         { key: "playbook", label: "Sales Playbook", icon: "✺", match: (b) => b === "playbook" },
       ],
@@ -152,6 +154,7 @@ export default function App() {
         <main className="min-w-0 flex-1 px-6 py-6">
           {base === "" && <DailyOps summary={summary} navigate={navigate} />}
           {base === "demand" && <DemandCockpit summary={summary} navigate={navigate} />}
+          {base === "pricing" && <Pricing summary={summary} navigate={navigate} />}
           {(base === "scorecards" || base === "scorecard") && <Scorecards summary={summary} customerId={scorecardId} />}
           {base === "playbook" && <Playbook summary={summary} />}
           {base === "overview" && <BookOverview summary={summary} navigate={navigate} />}

@@ -993,3 +993,145 @@ export interface DemandForecastsResponse {
   count: number;
   rows: DemandForecastRow[];
 }
+
+// ---- Pricing Sandbox + Engine (Blueprint I) -------------------------------------
+export interface PricingCollectingFeed {
+  count: number;
+  target: number;
+  unit: string;
+  matured: boolean;
+}
+export interface PricingAvailability {
+  available: boolean;
+  missing_fields: string[];
+  reason: string;
+  has_cost: boolean;
+  acceptance_source: string;
+  collecting: { rack_benchmark: PricingCollectingFeed; quotes: PricingCollectingFeed };
+}
+export interface AcceptanceSegment {
+  n: number;
+  b_spread: number;
+  intercept: number;
+}
+export interface AcceptanceSummary {
+  source: string; // quote_model | elasticity_proxy
+  features: string[];
+  n_quotes: number;
+  n_accept: number;
+  b_spread: number | null;
+  segments: Record<string, AcceptanceSegment>;
+  pooled: AcceptanceSegment | null;
+}
+export interface SandboxCustomer {
+  customer_id: string;
+  name: string;
+  archetype: string;
+  product: string | null;
+  terminal: string | null;
+  beta: number;
+  beta_pctl: number | null;
+  margin_pctl: number | null;
+  elasticity_class: "price_driven" | "captive" | "mixed";
+  base_annual_gallons: number;
+  cost: number | null;
+  reference: number;
+  current_price: number;
+  current_spread: number;
+  margin_per_gal: number | null;
+  forecast_source: string;
+  volume_curve: number[];
+  margin_curve: (number | null)[];
+}
+export interface MarginCurvePoint {
+  spread: number;
+  margin: number | null;
+  volume: number;
+}
+export interface PricingSandbox {
+  grid: number[];
+  has_cost: boolean;
+  current_spread: number;
+  current_margin: number | null;
+  current_volume: number;
+  realized_margin: number | null;
+  optimal_spread: number | null;
+  optimal_margin: number | null;
+  optimal_volume: number | null;
+  margin_uplift: number | null;
+  total_margin_curve: MarginCurvePoint[];
+  n_customers: number;
+  n_price_driven: number;
+  n_captive: number;
+  customers: SandboxCustomer[];
+}
+export interface PricingRecommendation {
+  customer_id: string;
+  name: string;
+  archetype: string;
+  secondary_archetype: string;
+  home_terminal: string | null;
+  product: string | null;
+  terminal: string | null;
+  reference: number;
+  cost: number | null;
+  current_price: number;
+  current_spread: number;
+  recommended_price: number;
+  recommended_spread: number;
+  price_gap: number;
+  accept_prob: number;
+  current_accept_prob: number;
+  expected_gallons: number;
+  expected_gp: number;
+  current_gp: number;
+  gp_uplift: number;
+  margin_per_gal: number;
+  rec_margin_per_gal: number;
+  shadow_price: number;
+  floor_spread: number;
+  beta: number;
+  elasticity_class: string;
+  underpriced: boolean;
+  direction: "raise" | "cut" | "hold";
+  base_value: number;
+  forecast_source: string;
+}
+export interface PricingRecommendations {
+  regime: Regime;
+  regime_label: string;
+  shadow_price: number;
+  has_cost: boolean;
+  acceptance_source: string;
+  n: number;
+  current_gp_per_yr: number;
+  optimized_gp_per_yr: number;
+  gp_uplift_per_yr: number;
+  n_underpriced: number;
+  recommendations: PricingRecommendation[];
+  top_underpriced: PricingRecommendation[];
+}
+export interface PricingResponse {
+  window: string;
+  terminal: string | null;
+  terminals: string[];
+  products: string[];
+  as_of: string | null;
+  config: Record<string, number | string | boolean | Record<string, number>>;
+  available: boolean;
+  availability: PricingAvailability;
+  acceptance: AcceptanceSummary | null;
+  sandbox: PricingSandbox | null;
+  recommendations: PricingRecommendations | null;
+}
+export interface PricingRecommendationsResponse {
+  window: string;
+  terminal: string | null;
+  terminals: string[];
+  products: string[];
+  as_of: string | null;
+  available: boolean;
+  availability: PricingAvailability;
+  acceptance: AcceptanceSummary | null;
+  recommendations: PricingRecommendations | null;
+}

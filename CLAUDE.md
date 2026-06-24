@@ -107,7 +107,7 @@ gain/loss ← `physical_inventory` vs `inventory_snapshot`; net position ← `co
 
 ## Capability matrix
 
-`backend/app/capabilities.py` declares **21 features** (18 analysis + 3 *feed*). Each feature
+`backend/app/capabilities.py` declares **22 features** (19 analysis + 3 *feed*). Each feature
 lists the canonical fields it `requires` (and optional fields that `enhance` it). At runtime:
 
 - A field is **present** if it has ≥1 non-null value in its primary table.
@@ -127,7 +127,7 @@ Served at **`GET /api/capabilities`**:
   "fields":   { "unit_cost": {"present":true,"nonnull":6541,"applicable":6541,"coverage":1.0}, ... },
   "features": [ { "key":"margin_analysis","enabled":true,"missing_fields":[],
                   "enhanced_by":["product","terminal"],"coverage":1.0, ... } ],
-  "summary":  { "enabled": 21, "total": 21 }
+  "summary":  { "enabled": 22, "total": 22 }
 }
 ```
 
@@ -138,7 +138,7 @@ Served at **`GET /api/capabilities`**:
 | **Receivables** | ar_aging (invoice_date, due_date, invoice_amount) · dso (invoice_date, paid_date, invoice_amount) · credit_risk_late_payers (due_date, paid_date) |
 | **Inventory** | inventory_days_of_supply (inventory_snapshot, tank_capacity, min_heel) · gain_loss_reconciliation (physical_inventory, inventory_snapshot) · tank_utilization (inventory_snapshot, tank_capacity) · **reconciliation** (physical_inventory, receipt_source — the P8 loss-control module; enhanced by bol_compartments) · **receipt_detail** *(feed: receipt_source; target 20 receipts)* |
 | **Market** | basis_tracking (market_price, nyh_basis) · position_committed (committed_buys, committed_sells) |
-| **Pricing** | **pricing_sandbox** *(feed: rack_benchmark; target 30 days)* · **quote_elasticity** *(feed: quoted_price + outcome; target 50 quotes)* |
+| **Pricing** | **pricing_engine** (unit_price, rack_benchmark — the Sandbox + Engine, Blueprint I; enhanced by quoted_price/outcome/unit_cost) · **pricing_sandbox** *(feed: rack_benchmark; target 30 days)* · **quote_elasticity** *(feed: quoted_price + outcome; target 50 quotes)* |
 
 ### Data profiles make the matrix flex
 
@@ -149,12 +149,12 @@ from the **same code** on different data:
 |---|---|---|
 | `core` | only the 3 required fields (no inventory/invoices/market/quotes/receipts) | **4** |
 | `lite` | core + `terminal` + `product` on lifts | **6** |
-| `full` | every canonical field (incl. rack_benchmark, quotes, receipts, bol_compartments) | **21** |
+| `full` | every canonical field (incl. rack_benchmark, quotes, receipts, bol_compartments) | **22** |
 
 ```
-rackiq-generate --profile core   #  capabilities enabled: 4/21
-rackiq-generate --profile lite   #  capabilities enabled: 6/21
-rackiq-generate --profile full   #  capabilities enabled: 21/21
+rackiq-generate --profile core   #  capabilities enabled: 4/22
+rackiq-generate --profile lite   #  capabilities enabled: 6/22
+rackiq-generate --profile full   #  capabilities enabled: 22/22
 ```
 
 (The 3 feed capabilities count toward "enabled" only once their history crosses the target;
@@ -432,7 +432,9 @@ live in `api/routes.py`; `/api/studio/*` write/upload endpoints in `api/studio.p
 `api/reconciliation.py` (both live-compute with a data-signature cache), the
 **daily-operating / regime / scorecard / playbook** endpoints in `api/daily.py`, and the
 **Demand Cockpit** endpoints in `api/demand.py` (heavy forecast cached per scope, the
-service-level slider re-derives only the cheap action).
+service-level slider re-derives only the cheap action), and the **Pricing Sandbox + Engine**
+endpoints in `api/pricing.py` (the per-customer base + acceptance model cached per scope; the
+spread slider, customer toggles, and regime selector re-derive only the cheap parts).
 
 | Endpoint | Purpose |
 |---|---|
@@ -462,6 +464,10 @@ service-level slider re-derives only the cheap action).
 | `POST /api/demand/persist` | recompute & write the per-customer + terminal forecast distributions (`demand_forecast_customer`/`demand_forecast_terminal`) — the P6/P7/P10 read contract |
 | `GET /api/demand/forecasts?terminal=&product=&level=&window=` | read back the persisted forecast distributions (terminal or customer level) |
 | `GET /api/demand/config` | the demand-cockpit config (horizon, service-level / lead-time defaults, band weights) |
+| `GET /api/pricing?terminal=&window=&<regime axes>` | the **Pricing Sandbox + Engine** (Blueprint I): availability/lock + acceptance-model summary + the sandbox (per-customer volume/margin response curves over the spread grid, the margin-maximizing post, price-driven vs. captive flags) + the regime-aware GP-maximizing recommendations (`available:false` + missing feeds when locked) |
+| `GET /api/pricing/recommendations?terminal=&window=&<regime axes>` | per-customer GP-maximizing quote price + accept-prob + expected GP + today's ranked underpriced accounts (regime-aware; surfaced inline on each scorecard) |
+| `GET /api/pricing/config` | the pricing config (spread/price grids, shadow-price schedule, acceptance-model priors) |
+| `POST /api/pricing/recompute` | recompute the full payload with `{overrides, window, terminal, regime}` (busts the cache) |
 
 Interactive docs at `http://localhost:8000/docs`.
 
@@ -531,6 +537,45 @@ On top of the standing scores sits the **operating layer** people live in day-to
 
 ---
 
+## Pricing Sandbox + Engine (Blueprint I) — what-if · acceptance model · GP-maximizing quote
+
+`backend/app/pricing.py` (engine) + `pricing_config.py` (**every grid/weight/threshold is a config
+parameter**) turn the rack-vs-street spread into both an interactive what-if and a concrete
+recommendation. **Gated on `unit_price` + `rack_benchmark`** (clear lock + the rack/quote
+"collecting" counters otherwise). It **reads P3's elasticity β** (`scoring` price-sensitivity) and
+**P5's per-customer forecast** (`demand`'s persisted distributions, falling back to the scoring
+lane's annualized base volume). Live-computed over the shared connection with a data-signature cache
+(`api/pricing.py`); the heavy per-customer base + acceptance fit are cached, so the spread slider,
+customer toggles, and regime selector re-derive only the cheap parts.
+
+Everything is computed in **contemporaneous spread space** — each lift measured against the rack
+benchmark *on its own date* (`cost_rel = vol-weighted(unit_cost − rack_at_lift)`,
+`current_spread = vol-weighted(unit_price − rack_at_lift)`), so margin at a posted spread `s` is
+simply `s − cost_rel`. This cancels the absolute street level and its seasonal trend (distillate
+rack drifts up in winter) and is robust to multi-product customers; `ref_today` (latest rack)
+restates spreads as absolute quote prices for display.
+
+- **The Sandbox** (interactive what-if). One book-wide **"our rack vs. street" spread** lever. For
+  each customer, expected **volume** scales with the spread via its acceptance curve
+  (`volume(s) = base_gal · clamp(P(accept|s) / P(accept|current))`) and **margin** = `volume·(s −
+  cost_rel)`; summed to a **total-margin-vs-spread curve** with the **margin-maximizing post**
+  marked. Each customer is flagged **price-driven** (high |β| percentile + thin margin) vs.
+  **captive** (β ≈ 0). The payload returns per-customer volume/margin **curves over the grid** so the
+  frontend toggles accounts in/out and re-solves the optimum client-side (book-level sensitivity).
+- **The Engine** (the recommendation). A per-segment **acceptance model** fit from the quote log:
+  `P(accept) = logistic(a + b·price_spread + c·customer_size + d·regime)` — a self-contained ridge
+  IRLS, **per-archetype** where there's enough data (`min_quotes_segment`), else a **pooled** model,
+  else an **elasticity proxy** from β (so the engine still runs on price+rack alone). The regime's
+  inventory/capacity states feed the `d·regime` term. For each account it searches the price grid for
+  the **GP-maximizing quote**: `argmax (price − cost) · expected_gallons · P(accept | price, regime)`,
+  with the **shadow price** of the binding constraint (`shadow_price(regime)`, positive when supply /
+  capacity is tight) as a **floor** — the objective is shadow-adjusted and **no discount below the
+  street is ever recommended when the shadow price is positive**. Surfaced inline on each scorecard
+  (recommended price · accept-probability · expected GP) and as a ranked **underpriced-accounts**
+  worklist (the GP-maximizing quote sits above today's realized price — room to raise).
+
+---
+
 ## Frontend
 
 Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A **left-nav dashboard
@@ -551,10 +596,19 @@ the Daily Operating Dashboard.
   **service-level slider** + lead-time / lot-size inputs (re-derives the buy-by date live); and a
   **forecast-accuracy strip** (MAPE / bias vs. baselines). A "Persist (P6/P7/P10)" button writes the
   forecast distributions.
+- **Pricing Sandbox** (`pages/Pricing.tsx`, route `pricing`) — Blueprint I. The rack-vs-street
+  **spread slider** with a **total-margin-vs-spread curve** marking the margin-maximizing post
+  (`components/pricing/MarginCurveChart.tsx`); stat cards (max-margin post, uplift, margin at the
+  selected spread, elasticity mix); the **acceptance-model** panel (source, spread coefficient,
+  per-segment fits); a **customer-sensitivity table** with in/out toggles and price-driven/captive
+  badges that re-solves the optimum client-side; and the **engine** below — a regime selector + the
+  GP summary + **today's underpriced accounts** (current → recommended price, accept-prob, +GP/yr).
+  Clear lock + "Feed me unit_price / rack_benchmark" (with the rack/quote collecting pills) when gated.
 - **Scorecards** (`pages/Scorecards.tsx`, routes `scorecards` / `scorecard/{id}`) — Blueprint E.
   One-page per-customer cards: sub-scores, Base Value, today's Regime-Adjusted Score (+ per-axis
-  multiplier breakdown), archetype(s), why-now, recommended action, posture, expected impact, and
-  the **flip-side** panel. An exemplar gallery covers every archetype present.
+  multiplier breakdown), archetype(s), why-now, recommended action, posture, expected impact, the
+  **flip-side** panel, and the inline **Pricing engine** block (recommended price · accept-prob ·
+  expected GP, from `/api/pricing/recommendations`). An exemplar gallery covers every archetype present.
 - **Sales Playbook** (`pages/Playbook.tsx`) — Blueprint G. The morning routine, regime cheat-sheets,
   and per-archetype plays (toggle to only archetypes in the current book).
 
@@ -649,6 +703,8 @@ backend/
     regime_config.py        # ★ the V1 regime-multiplier matrix (axes/states/multipliers — every value a param)
     playbook.py             # ★ Sales Playbook source (archetype plays + regime cheat-sheets + routine) + md render
     demand.py               # ★ Demand Cockpit: per-customer HW/seasonal-naive forecast → terminal P10/P50/P90 band, days-of-cover/burn-down, order-up-to action, persisted distributions (DemandConfig)
+    pricing.py              # ★ Pricing Sandbox + Engine (Blueprint I): spread what-if (per-customer vol/margin curves via β, margin-maximizing post), acceptance model (per-segment logistic from quotes + elasticity proxy), GP-maximizing quote price with shadow-price floor
+    pricing_config.py       # ★ PricingConfig — spread/price grids, shadow-price schedule, acceptance priors, elasticity-class thresholds as parameters
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping (BOL/EDI aliases, 2-tier threshold), inspect (+profiling), validate, coerce (mixed + Excel-serial dates)
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -658,14 +714,15 @@ backend/
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
     cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook
     config.py               # settings (db path, CORS, host/port)
-    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand routers)
+    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + pricing routers)
     api/{routes,queries}.py # read endpoints + SQL
     api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
     api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / config / recompute
     api/reconciliation.py   # /api/reconciliation/* loss-control payload / config / recompute (cached)
     api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
     api/demand.py           # /api/demand/cockpit / persist / forecasts / config (the Demand Cockpit)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_regime + test_reconciliation + test_demand
+    api/pricing.py          # /api/pricing (sandbox + recommendations) / recommendations / config / recompute (cached base)
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_regime + test_reconciliation + test_demand + test_pricing
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -676,10 +733,11 @@ frontend/
     App.tsx, main.tsx, index.css       # App.tsx = the left-nav dashboard shell (Operate/Analyze/Data)
     lib/{useHashRoute,format}.ts, lib/scoreui.tsx
     api/{client,types}.ts
-    pages/{DailyOps,DemandCockpit,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx
+    pages/{DailyOps,DemandCockpit,Pricing,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
     components/scores/{BaseRangeChart,QuadrantScatter}.tsx
     components/demand/{DemandForecastChart,BurnDownChart}.tsx
+    components/pricing/{MarginCurveChart}.tsx
     components/reconciliation/{MechanismBar,ControlChart,LossTrendChart}.tsx
     components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds}.tsx
 CLAUDE.md
@@ -688,6 +746,16 @@ CLAUDE.md
 ## Notes & gotchas
 - **numpy < 2.5** on Python 3.11 (2.5 requires 3.12); pinned in `pyproject.toml`. The scoring
   engine adds **statsmodels** (STL) + **scipy** (rank percentiles) — installed by `uv sync`.
+- **Pricing works in contemporaneous spread space.** The sandbox/engine measure every lift against
+  the rack benchmark *on its own date* (`cost_rel`, `current_spread`), so margin at a posted spread
+  `s` is `s − cost_rel` — the absolute street level and its seasonal trend cancel, and multi-product
+  customers don't blend a wrong-product reference into the margin. Acceptance is `logistic(a +
+  b·spread + c·size + d·regime)` fit per archetype (pooled / elasticity-proxy fallbacks); the
+  **shadow price** floor (`shadow_price(regime)`, positive when supply/capacity binds) means the
+  engine **never recommends a discount below the street** under a binding constraint. `pricing_engine`
+  is the 22nd capability (analysis), gated on `unit_price` + `rack_benchmark`; the pricing base +
+  acceptance fit are a per-scope live-compute cache (busted when demand re-persists, via
+  `demand_computed_at` in the data signature).
 - **Scoring is capability-gated end-to-end**: each metric returns `available + reason`; gated
   sub-scores (margin, elasticity, EVR, market, quotes, credit) report `available:false` on a thin
   book and the UI greys them out. `customer_scores`/`customer_lane` are *derived caches* recomputed
