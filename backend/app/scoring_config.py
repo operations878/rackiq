@@ -49,6 +49,8 @@ class ScoringConfig:
     forecast_horizons: tuple = (7, 30, 90)    # days projected forward (per-customer + book)
     forecast_band_z: float = 1.0          # band half-width in σ (1.0 ≈ a 68% "likely" range)
     forecast_max_horizon_days: int = 90   # how far the dotted lane continuation is drawn
+    forecast_rough_rel: float = 0.45      # band half-width ÷ expected ≥ this ⇒ flag as a ROUGH
+    #                                       forecast (honest "wide lane — treat as a range")
 
     # ---- Excursion (lane-break) weather pattern --------------------------------
     excursion_min_breaks: int = 3         # need this many lane breaks to call a weather pattern

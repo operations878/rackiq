@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 
+import pandas as pd
 import pytest
 
 from app import generator, scoring
@@ -180,6 +181,80 @@ def test_book_forecast_bottom_up_and_filters(full_book):
     sub = scoring.aggregate_book_forecast(res["customers"], DEFAULT_CONFIG, terminal=term)
     sub_30 = next(h for h in sub["horizons"] if h["days"] == 30)["expected"]
     assert 0 < sub_30 <= full_30 + 1
+
+
+# ---- Plain-English reads & honest confidence (polish-pass edge cases) ------------
+def test_plural_and_fmt_helpers():
+    assert scoring._plural(1, "order") == "order"
+    assert scoring._plural(2, "order") == "orders"
+    assert scoring._plural(0, "lift") == "lifts"
+    assert scoring._plural(None, "week") == "weeks"   # never raises on a missing count
+    assert scoring._fmt_gal(None) == "—"
+    assert scoring._fmt_gal(8400) == "8,400"
+    assert scoring._fmt_gal(1_250_000) == "1.2MM"
+
+
+def test_var_explanation_none_safe():
+    """An "ok" status with degenerate (None) lane fields must format, not raise (defence)."""
+    core = {"lane": {"in_band_rate": None, "tightness": None, "excursion_penalty": None,
+                     "base_level": 0.0, "method": "seasonal_median"},
+            "var_status": "ok", "var_score": 50.0, "volume_var": 50.0, "cadence_var": 50.0,
+            "grain": "weekly", "n_lifts": 9, "n_weeks": 8}
+    s = scoring._var_explanation(core, DEFAULT_CONFIG)
+    assert "VAR 50" in s and "%" in s
+
+
+def _insert_lifts(con, cid, day_offsets, end, gal=6000.0):
+    rows = [(cid, (end - pd.Timedelta(days=int(d))).to_pydatetime(), float(gal), "Linden", "ULSD")
+            for d in day_offsets]
+    con.executemany(
+        "INSERT INTO lifts (customer_id, lift_datetime, net_gallons, terminal, product) "
+        "VALUES (?,?,?,?,?)", rows)
+
+
+def test_thin_history_plain_reads(con):
+    """One-time / sparse / few-week accounts each read naturally — never '0 lift(s)'."""
+    generator.generate(generator.GenConfig(seed=42, n_customers=14, months=18, profile="full"), con)
+    end = pd.Timestamp(con.execute("SELECT max(lift_datetime) FROM lifts").fetchone()[0])
+    _insert_lifts(con, "OneShot Diesel", [3], end)                                  # 1 lift
+    _insert_lifts(con, "Sparse Hauling", [2, 12, 23, 35, 46], end)                  # 5 lifts / ~7 wk
+    _insert_lifts(con, "ShortSpan Co", [1, 5, 11, 17, 22, 28, 33, 39, 46], end)     # 9 lifts / ~7 wk
+
+    res = scoring.compute_scores(con, DEFAULT_CONFIG, "all")
+    by = {c["customer_id"]: c for c in res["customers"]}
+
+    one = by["OneShot Diesel"]
+    assert one["var"]["status"] == "insufficient_history" and one["var"]["score"] is None
+    assert one["var"]["descriptor"] == "Thin history"
+    assert "bought just once" in one["var"]["plain"]
+    assert one["forecast"]["available"] is False and one["forecast"]["horizons"] == []
+
+    assert "only 5 lifts" in by["Sparse Hauling"]["var"]["plain"]
+    assert "only 9 lifts" in by["ShortSpan Co"]["var"]["plain"]
+    # never the robotic "(s)" placeholder; each read is a real, complete sentence
+    for cid in ("OneShot Diesel", "Sparse Hauling", "ShortSpan Co"):
+        p = by[cid]["var"]["plain"]
+        assert "(s)" not in p and len(p) > 20 and p.rstrip().endswith(".")
+
+
+def test_forecast_pluralization_and_rough_flag(full_book):
+    res = scoring.compute_scores(full_book, DEFAULT_CONFIG, "all")
+    avail = [c for c in res["customers"] if c["forecast"]["available"]]
+    assert avail
+    for c in avail:
+        p = c["forecast"]["plain"]
+        assert "order(s)" not in p and "roughly 1 orders" not in p   # pluralization fixed
+        assert isinstance(c["forecast"]["rough"], bool)              # honest-confidence flag present
+        h30 = next(h for h in c["forecast"]["horizons"] if h["days"] == 30)
+        if h30.get("expected_orders") == 1:
+            assert "roughly 1 order," in p
+    # the rough flag actually discriminates: a wide-lane account is flagged, a tight one isn't
+    roughs = [c["forecast"]["rough"] for c in avail]
+    assert any(roughs) and not all(roughs)
+    # and the wording follows the flag
+    for c in avail:
+        choppy = "treat this as a rough range" in c["forecast"]["plain"]
+        assert choppy == c["forecast"]["rough"]
 
 
 # ---- API ------------------------------------------------------------------------

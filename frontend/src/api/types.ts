@@ -614,6 +614,9 @@ export interface ForecastBlock {
   base_per_period?: number;
   sigma_per_period?: number;
   band_z?: number;
+  /** True when the band is wide relative to the expected volume — an honest "this is a range,
+   *  not a firm number" signal for erratic / thin-lane accounts. */
+  rough?: boolean;
   horizons: ForecastHorizon[];
   plain?: string;
 }
