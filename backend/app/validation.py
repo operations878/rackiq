@@ -123,16 +123,38 @@ def run_rules(df: pd.DataFrame, table: str, options: dict | None,
                            df, date_targets, "none",
                            "{n} date(s) fall outside %d–%d." % (schema.MIN_REASONABLE_YEAR, hi.year)))
 
-    # 4) Volumes non-negative (a negative volume is invalid → quarantine).
+    # 4) Negative volumes are legitimate corrections / reversals (credits, re-bills, BOL
+    #    cancellations) — KEPT, never quarantined. We surface and list them for review, tagged as
+    #    corrections, instead of treating a signed volume as a fatal error.
     vol_fields = [f for f in schema.volume_fields_for_table(table) if f in df.columns]
     neg_mask = falsemask()
     for f in vol_fields:
         neg_mask |= (df[f].notna() & (df[f] < 0))
     if vol_fields:
-        r = _rule("volume_nonnegative", "Volumes non-negative", "error", neg_mask, df,
-                  vol_fields, "quarantine", "{n} row(s) have a negative volume.")
+        rules.append(_rule(
+            "corrections_reversals", "Corrections / reversals (negative volumes)", "info",
+            neg_mask, df, vol_fields, "none",
+            "{n} row(s) carry a negative volume — kept and flagged as corrections/reversals."))
+
+    # 4b) EDI control / heartbeat rows: BOL number 0 AND gross 0 AND net 0 (often a placeholder
+    #     product code like "ZZZ"). They carry no real volume — the one kind of row we still
+    #     quarantine as genuine junk. Gated on a bol_number column being present.
+    if table == schema.BOL:
+        gross_col, net_col = "compartment_gross_gallons", "compartment_net_gallons"
+    else:
+        gross_col, net_col = "gross_gallons", "net_gallons"
+    if "bol_number" in df.columns and net_col in df.columns:
+        bol_num = pd.to_numeric(df["bol_number"], errors="coerce")
+        net_num = pd.to_numeric(df[net_col], errors="coerce")
+        gross_num = (pd.to_numeric(df[gross_col], errors="coerce") if gross_col in df.columns
+                     else pd.Series(0.0, index=df.index))  # absent gross can't add volume → treat as 0
+        control = (bol_num == 0) & (net_num.fillna(0) == 0) & (gross_num.fillna(0) == 0)
+        cols = [c for c in ("bol_number", gross_col, net_col, "product") if c in df.columns]
+        r = _rule("edi_control_row", "EDI control / heartbeat rows (BOL 0, no volume)", "warning",
+                  control, df, cols, "quarantine",
+                  "{n} zero-volume control row(s) (BOL 0, gross 0, net 0) held as junk.")
         rules.append(r)
-        _quarantine(neg_mask, "volume_nonnegative")
+        _quarantine(control, "edi_control_row")
 
     # 5) Numeric fields within sane bounds (likely unit mismatch / fat-finger).
     bound_fields = [f.name for f in schema.CANONICAL_FIELDS

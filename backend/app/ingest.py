@@ -57,26 +57,81 @@ class IngestError(Exception):
     """Raised for user-facing ingestion problems (bad file, unreadable, etc.)."""
 
 
+def _decode_text(content: bytes) -> str:
+    """Decode bytes to text, tolerating a BOM and non-UTF-8 exports."""
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return content.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("latin-1", errors="replace")
+
+
+def _detect_delimiter(text: str) -> str:
+    """Sniff the field delimiter of a text export (CSV / TSV / ; / |).
+
+    Wide EDI/BOL exports are commonly tab- or comma-separated; we never want a tab file
+    parsed as one giant single column. We let csv.Sniffer try first, then fall back to the
+    candidate that splits the header row into the most fields.
+    """
+    import csv
+
+    sample = text[:65536]
+    header = next((ln for ln in sample.splitlines() if ln.strip()), "")
+    candidates = [",", "\t", ";", "|"]
+    try:
+        return csv.Sniffer().sniff(sample, delimiters="".join(candidates)).delimiter
+    except Exception:  # noqa: BLE001 — fall back to a simple field count
+        best, best_n = ",", header.count(",")
+        for d in candidates:
+            n = header.count(d)
+            if n > best_n:
+                best, best_n = d, n
+        return best
+
+
+def _dedupe_headers(cols: list[str]) -> list[str]:
+    """Make column names unique (wide exports repeat headers like blank/admin columns)."""
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for c in cols:
+        name = str(c).strip() or "column"
+        if name in seen:
+            seen[name] += 1
+            out.append(f"{name}.{seen[name]}")
+        else:
+            seen[name] = 0
+            out.append(name)
+    return out
+
+
 def parse_file(content: bytes, filename: str) -> pd.DataFrame:
-    """Parse raw bytes (CSV or Excel) into a DataFrame with original headers as strings."""
+    """Parse raw bytes (CSV / TSV / Excel) into a DataFrame with original headers as strings.
+
+    - Excel (.xlsx/.xls): cells are read as *typed* values (dates as datetimes, numbers as
+      numbers) so an Excel-formatted date isn't mistaken for text and a number isn't padded.
+    - Text (.csv/.tsv/.txt/unknown): the delimiter is auto-detected (comma / tab / ; / |), so a
+      tab-separated export is never collapsed into a single column.
+    - Arbitrary column count is fine; repeated headers are de-duplicated. Unmapped columns are
+      simply ignored later, never an error.
+    """
     name = (filename or "").lower()
     try:
-        if name.endswith((".xlsx", ".xls")):
+        if name.endswith((".xlsx", ".xls", ".xlsm")):
+            # dtype=object keeps text verbatim while openpyxl still returns true datetimes for
+            # date-formatted cells and numbers for numeric cells (Excel serials handled on coerce).
             df = pd.read_excel(io.BytesIO(content), sheet_name=0, dtype=object)
-        elif name.endswith((".csv", ".txt", ".tsv")):
-            sep = "\t" if name.endswith(".tsv") else None
-            df = pd.read_csv(io.BytesIO(content), dtype=object, sep=sep,
-                             engine="python", skipinitialspace=True)
         else:
-            # Fall back to CSV sniffing for unknown extensions.
-            df = pd.read_csv(io.BytesIO(content), dtype=object, sep=None,
+            text = _decode_text(content)
+            sep = "\t" if name.endswith(".tsv") else _detect_delimiter(text)
+            df = pd.read_csv(io.StringIO(text), dtype=object, sep=sep,
                              engine="python", skipinitialspace=True)
     except Exception as exc:  # noqa: BLE001 — surface a clean message to the UI
         raise IngestError(f"Could not parse '{filename}': {exc}") from exc
 
     if df.shape[1] == 0:
         raise IngestError("The file has no columns.")
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = _dedupe_headers(list(df.columns))
     return df
 
 
@@ -85,12 +140,17 @@ def parse_file(content: bytes, filename: str) -> pd.DataFrame:
 # similarity and token overlap, so this list only needs the non-obvious aliases.
 SYNONYMS: dict[str, list[str]] = {
     "customer_id": ["customer", "cust", "customer id", "customer number", "cust no",
-                    "account", "acct", "account number", "buyer", "client", "bill to"],
+                    "account", "acct", "account number", "buyer", "client", "bill to",
+                    # wide BOL/EDI exports identify the buyer as the consignee
+                    "consignee", "consignee number", "consignee no", "consignee id",
+                    "consignee #", "consignee code", "ship to", "sold to", "customer code"],
     "lift_datetime": ["lift date", "lift time", "date", "datetime", "timestamp",
-                      "load date", "ship date", "delivery date", "transaction date",
-                      "bol date", "pickup date", "lift dt"],
+                      "load date", "ship date", "ship dt", "shipment date", "delivery date",
+                      "transaction date", "bol date", "pickup date", "lift dt"],
     "net_gallons": ["net gallons", "net gal", "net", "net qty", "net quantity",
-                    "net volume", "gallons", "volume", "qty", "quantity", "net gals"],
+                    "net volume", "gallons", "volume", "qty", "quantity", "net gals",
+                    # BOL/EDI exports often label the billed net volume "Net Amount"
+                    "net amount", "net amt", "net billed", "billed net"],
     "terminal": ["terminal", "term", "rack", "location", "origin", "supply point",
                  "loading terminal", "branch"],
     "product": ["product", "grade", "fuel", "item", "material", "prod", "product code",
@@ -250,16 +310,27 @@ def suggest_for_table(headers: list[str], table: str) -> dict[str, dict]:
 
 
 def infer_table(headers: list[str]) -> str:
-    """Pick the canonical table whose targets best explain the file's headers."""
+    """Pick the canonical table whose targets best explain the file's headers.
+
+    The deciding signal is how well a table's REQUIRED keys are matched — weighted by the
+    confidence of those matches, plus a bonus for covering them all. This keeps a wide BOL/EDI
+    export (consignee + ship date + net amount, matched at full confidence) landing on ``lifts``
+    rather than ``bol_compartments``, whose ``compartment_net_gallons`` only weakly matches a
+    "Net Amount" header — while a true compartment file (tank/meter/compartment keys) still wins
+    for ``bol_compartments``.
+    """
     best_table, best_score = schema.LIFTS, -1.0
     for table in schema.IMPORTABLE_TABLES:
         sugg = suggest_for_table(headers, table)
-        # Reward both the strength and the count of confident matches.
-        score = sum(v["confidence"] for v in sugg.values())
-        # Bonus for covering the table's required keys (a strong signal of file type).
+        by_target = {v["target"]: v["confidence"] for v in sugg.values()}
+        # Base: strength + count of confident matches across all targets.
+        score = sum(by_target.values())
+        # Required-key fit, weighted by match confidence + an all-covered bonus (the strongest
+        # signal of the file's type).
         req = schema.required_import_keys(table)
-        covered = sum(1 for k in req if k in {v["target"] for v in sugg.values()})
-        score += covered * 0.75
+        score += sum(by_target.get(k, 0.0) for k in req)
+        if req and all(k in by_target for k in req):
+            score += 1.0
         if score > best_score:
             best_table, best_score = table, score
     return best_table
@@ -440,6 +511,43 @@ def _parse_mixed_dates(series: pd.Series) -> pd.Series:
     return out
 
 
+# Excel stores dates as a serial number of days since 1899-12-30. A wide BOL/EDI export may
+# carry the Ship Date as such a serial (e.g. 45474 == 2024-07-01) instead of a text date.
+# Bounds keep us from mistaking a small integer for a date; the window spans ~1954–2119.
+_EXCEL_EPOCH = "1899-12-30"
+_SERIAL_MIN, _SERIAL_MAX = 20000, 80000
+
+
+def _excel_serial_dates(series: pd.Series) -> pd.Series:
+    """Convert plausible Excel serial-date numbers to timestamps (NaT for everything else)."""
+    nums = pd.to_numeric(
+        series.map(lambda v: v.strip() if isinstance(v, str) else v), errors="coerce")
+    in_range = nums.notna() & (nums >= _SERIAL_MIN) & (nums <= _SERIAL_MAX)
+    out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if in_range.any():
+        out.loc[in_range] = pd.to_datetime(nums[in_range], unit="D", origin=_EXCEL_EPOCH)
+    return out
+
+
+def to_datetime_flex(series: pd.Series) -> pd.Series:
+    """Parse a date column carrying native/text dates AND Excel serial-date numbers.
+
+    Native and text dates (incl. mixed day-first/​month-first) parse first; any non-blank value
+    that still failed is retried as an Excel serial number. This is what keeps a valid serial
+    like ``45474`` from being mis-flagged as "not a recognizable date".
+    """
+    out = _parse_mixed_dates(series)
+    non_blank = series.map(lambda v: not (v is None
+                                          or (isinstance(v, float) and pd.isna(v))
+                                          or (isinstance(v, str) and str(v).strip() == "")))
+    remaining = non_blank & out.isna()
+    if remaining.any():
+        recovered = _excel_serial_dates(series[remaining]).dropna()
+        if len(recovered):
+            out.loc[recovered.index] = recovered
+    return out
+
+
 def coerce_column(series: pd.Series, dtype: str) -> tuple[pd.Series, int, list[str]]:
     """Coerce a source column to a canonical dtype.
 
@@ -454,10 +562,11 @@ def coerce_column(series: pd.Series, dtype: str) -> tuple[pd.Series, int, list[s
         err = non_blank & out.isna()
     elif dtype in ("TIMESTAMP", "DATE"):
         non_blank = ~series.map(_is_missing)
-        out = _parse_mixed_dates(series)
+        out = to_datetime_flex(series)
         err = non_blank & out.isna()
-    else:  # VARCHAR — only genuinely-empty cells become NULL; content is preserved verbatim.
-        out = series.map(lambda v: None if _is_empty(v) else str(v).strip())
+    else:  # VARCHAR — only genuinely-empty cells become NULL; surrounding whitespace is left for
+        # the (audited) hygiene trim step so the fix shows up in the audit log, never dropped silently.
+        out = series.map(lambda v: None if _is_empty(v) else str(v))
         err = pd.Series(False, index=series.index)
     n_err = int(err.sum())
     samples = _fail_samples(series, err) if n_err else []

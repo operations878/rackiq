@@ -74,6 +74,10 @@ tables plus a `customers` dimension. Defined in `backend/app/schema.py`.
 \* = required core field. `terminal`/`product` are detected for presence on **lifts** (their
 primary home); their copies on inventory/market/quotes/receipts/bol_compartments are dimensional keys.
 A **disbursement** is one `bol_number` (sum its compartment rows) — never a single compartment.
+**lifts also carries an optional `bol_number` structural key** (NOT a canonical field, so the count
+stays 45): a wide BOL/EDI export lists each loaded compartment as its own row, several sharing one
+`bol_number`; on import those rows are **grouped by BOL into a single lift** (gross/net summed). Rows
+without a `bol_number` are each their own lift.
 
 ### Early data feeds — start collecting now, modules consume later
 
@@ -164,11 +168,15 @@ Data Studio is how a real book gets in: upload a CSV/Excel file, map its columns
 fields, preview validation, and commit. Capabilities then flex from the fields actually present.
 
 **Backend modules**
-- `app/ingest.py` — parse (CSV/TSV/Excel), **fuzzy header matching** (curated synonyms +
-  string-similarity + token overlap), per-table mapping suggestions, target-table inference,
-  column inspection, type **coercion** (now with **mixed-format date** salvage — a day-first
-  retry pass), and mapping **validation**. Parsed uploads are cached in-process (bounded) keyed
-  by an `upload_id` so the wizard's steps don't re-transmit the file.
+- `app/ingest.py` — parse (CSV/TSV/Excel/`.txt`, with **delimiter auto-detection** for text files
+  and **typed Excel cell** reads), **fuzzy header matching** (curated synonyms + string-similarity +
+  token overlap; consignee/net-amount aliases so a wide BOL/EDI export auto-maps the lift core),
+  per-table mapping suggestions, **confidence-weighted target-table inference** (a table whose
+  *required* keys match at full confidence wins), column inspection, type **coercion** (mixed-format
+  date salvage **plus Excel serial-date numbers** via `to_datetime_flex`), and mapping
+  **validation**. Arbitrary/extra columns are ignored, never an error; repeated headers are
+  de-duplicated. Parsed uploads are cached in-process (bounded) keyed by an `upload_id` so the
+  wizard's steps don't re-transmit the file.
 - `app/profiling.py` — the **data-quality scorecard**: per column type, null %, distinct count,
   min/max, sample values, outlier counts (IQR fences), and quality flags (mixed-type, high-null,
   negatives, unparsed-dates, whitespace, constant) + an overall 0–100 score.
@@ -176,13 +184,18 @@ fields, preview validation, and commit. Capabilities then flex from the fields a
   fuzzy-clusters customer key variants into proposed merge groups with a confidence score,
   persists confirm/reject decisions, and rewrites variant ids → master id on every commit.
 - `app/validation.py` — the **rule engine**: required-present, dates-parseable, dates-in-range,
-  volume-non-negative, value-bounds, duplicate-lifts, price≥cost — each with a severity, a count,
-  and **drill-down rows**; rules with `action="quarantine"` feed the quarantine index.
+  **corrections/reversals** (negative volumes — flagged & kept, never quarantined), **edi-control-row**
+  (BOL 0 + gross 0 + net 0 — the one junk we quarantine), value-bounds, duplicate-lifts, price≥cost —
+  each with a severity, a count, and **drill-down rows**. Only rules with `action="quarantine"`
+  (required-present, edi-control-row, opted-in duplicate-lifts) feed the quarantine index — an
+  unused/blank OPTIONAL column never holds a row. Date checks run only on mapped date targets
+  (e.g. the Ship Date → `lift_datetime`), never on a numeric consignee/amount column.
 - `app/hygiene.py` — the **configurable cleaning pipeline** (`HygieneOptions` → `apply_fixes`):
-  trim, drop-empty, **unit standardization** (bbl→gal ×42), **default fill**, **ASTM D1250
-  net(60°F) correction** (`vcf(api, temp, product)`), and **crosswalk resolution**. Each step
-  emits a human report line and a structured audit entry. `run_pipeline(df, table)` is kept as
-  the conservative lossless default.
+  trim (whitespace, audited), drop-empty, **unit standardization** (bbl→gal ×42), **default fill**,
+  **ASTM D1250 net(60°F) correction** (`vcf(api, temp, product)`), and **crosswalk resolution**;
+  plus `group_by_bol` — **collapse lift compartment rows sharing a BOL number into one lift** (sum
+  gross/net), run after the quarantine split. Each step emits a human report line and a structured
+  audit entry. `run_pipeline(df, table)` is kept as the conservative lossless default.
 - `app/data_health.py` — the **standing health report**: composite quality score
   (completeness · validity · consistency · resolution) + drift alerts (un-mapped/variant customer
   codes, volume out of historical pattern) + quarantine/crosswalk/audit summaries.
@@ -204,8 +217,8 @@ defaultable dimensional keys — a partial BOL feed still imports). Derived in
 | Step | Endpoint | What it does |
 |---|---|---|
 | Inspect | `/api/studio/inspect` (multipart) | parse + stash; return the **profiling scorecard** (columns + samples + null rates + distinct + min/max + outliers + flags + score), suggested table, per-table fuzzy suggestions, mappable targets, matched profile, crosswalk size |
-| Validate | `/api/studio/validate` | apply the chosen **hygiene fixes**, then run the **rule engine**: returns `rules` (with drill-down rows), `fixes_preview`, `quarantine_count`, `clean_rows`, plus the mapping-level `can_commit` |
-| Commit | `/api/studio/commit` | coerce → `apply_fixes` → run rules → **split quarantine** → write clean rows (replace/append) → derive `customers` (names from crosswalk) → log audit → recompute capabilities; returns rows written, quarantined count, hygiene report |
+| Validate | `/api/studio/validate` | apply the chosen **hygiene fixes**, then run the **rule engine**: returns `rules` (with drill-down rows), `fixes_preview`, `quarantine_count`, `clean_rows`, `kept_lifts` (post-BOL-grouping), `corrections`, `quarantine_breakdown` (reason → count), plus the mapping-level `can_commit` |
+| Commit | `/api/studio/commit` | coerce → `apply_fixes` → run rules → **split quarantine** → **group compartments by BOL (lifts)** → write clean rows (replace/append) → derive `customers` (names from crosswalk) → log audit → recompute capabilities; returns `rows_written`/`kept_lifts`, `auto_fixed`, `corrections`, `quarantined` + `quarantine_breakdown`, hygiene report |
 | Targets | `GET /api/studio/targets` | static registry powering the mapping dropdowns (+ `customer_key_column`, `defaultable_fields`) |
 | Crosswalk | `POST …/crosswalk/propose`, `…/crosswalk/confirm`, `GET …/crosswalk`, `DELETE …/crosswalk/{key}`, `POST …/crosswalk/clear` | propose merge groups, persist confirm/reject, browse/edit the master crosswalk |
 | Quarantine | `GET …/quarantine`, `POST …/quarantine/reimport`, `…/quarantine/discard` | review held rows, fix-and-re-import (with edits), or discard |
@@ -243,19 +256,25 @@ of the wizard plus the standing **Data Health** page, and covers eight jobs:
    persist in the **`customer_crosswalk`** table; `apply_to_frame` rewrites every variant → master id
    on **every future commit**, so all downstream metrics read one resolved entity. Rejected keys are
    pinned as singletons and never re-proposed.
-3. **Validation rules** (`validation.py`) — required-present, dates-parseable, dates-in-range,
-   volume-non-negative, value-bounds, duplicate-lifts (customer·datetime·net), price≥cost. Each
-   failure carries a **drill-down** to the offending rows.
-4. **Auto-fix with approval + audit** (`hygiene.apply_fixes`) — trim whitespace, **standardize units**
-   (barrels→gallons), parse mixed date formats, **fill terminal/product defaults**, resolve customers.
-   Toggled per import; every transformation is written to **`hygiene_audit`**.
+3. **Validation rules** (`validation.py`) — **required-field gating only**: a row is held only when a
+   *required* field is missing/unparseable, an **EDI control row** (BOL 0 + gross 0 + net 0), or an
+   opted-in duplicate lift. The rest are non-blocking flags: dates-parseable, dates-in-range,
+   **corrections/reversals** (negative volumes — kept & listed, never quarantined), value-bounds,
+   price≥cost. A blank/unused OPTIONAL column — no matter how many — never quarantines the rows under
+   it. Each failure carries a **drill-down** to the offending rows.
+4. **Auto-fix with approval + audit** (`hygiene.apply_fixes`) — **trim whitespace** (every text field,
+   audited — never a quarantine reason), **standardize units** (barrels→gallons), parse mixed date
+   formats **+ Excel serial dates**, **fill terminal/product defaults**, resolve customers, and
+   **group BOL compartments into lifts**. Toggled per import; every transformation is written to
+   **`hygiene_audit`**.
 5. **Net (60°F) correction** — when `gross_gallons` is mapped, compute net via an **ASTM D1250-style
    VCF** (`hygiene.vcf(api, temp, product)`); modes: `auto` (D1250 where temp+API exist), `factor`
-   (flat user factor), `gross` (net = gross), `off`. Gated on field availability.
-6. **Quarantine + re-import** — rows failing a hard rule (missing required, negative volume, opted-in
-   duplicate lifts) are diverted to the **`quarantine`** table instead of being dropped. The Data
-   Health page lets you edit the held values and **fix-and-re-import**, re-import all (re-run the
-   rules), or discard.
+   (flat user factor), `gross` (net = gross), `off`. Gated on field availability. For a wide BOL
+   export whose **billed Net Amount is authoritative**, keep it `off` and let `group_by_bol` sum it.
+6. **Quarantine + re-import** — only genuinely bad rows (missing required key, EDI control/heartbeat
+   row, opted-in duplicate lift) are diverted to the **`quarantine`** table instead of being dropped;
+   negatives and blank optional columns are **not** held. The Data Health page lets you edit the held
+   values and **fix-and-re-import**, re-import all (re-run the rules), or discard.
 7. **Reusable cleaning profiles** — saved profiles store the **mapping + hygiene options** together,
    so a repeat upload is one click and consistent. The crosswalk is global, so merge decisions apply
    regardless of profile.
@@ -272,9 +291,14 @@ inventory_snapshots,quotes,receipts}_sample.csv` (+ `lifts_sample.xlsx`) with *f
 (e.g. "Customer", "Lift Date", "Sell Price", "Posted Rack", "OPIS Rack", "Quoted Price", "Outcome")
 so the fuzzy matcher has something to chew on. Importing them walks the capability matrix up. It also writes **deliberately-dirty** Hygiene Studio
 demo files: `samples/lifts_dirty.csv` (customer NAMES with spelling/ID variants of several
-customers, mixed/bad dates, negative volumes, exact-duplicate rows, stray whitespace) and
-`samples/lifts_barrels.csv` (volumes in barrels, for the unit-standardization toggle). `--no-dirty`
-skips them. Worked screenshots of the merge + fix flow live in `docs/hygiene-studio/`.
+customers, mixed/bad dates, negative volumes, exact-duplicate rows, stray whitespace);
+`samples/lifts_barrels.csv` (volumes in barrels, for the unit-standardization toggle); and
+**`samples/bol_wide_sample.csv` / `.xlsx`** — a **wide EDI/BOL export** (dozens of mostly-blank admin
+columns; Consignee Number/Name, Ship Date, Net Amount + BOL Number; several compartment rows per BOL;
+Excel **serial** dates mixed with text dates; **negative** reversal rows; stray whitespace; and a few
+**EDI control rows** (BOL 0/gross 0/net 0, product `ZZZ`)). Importing it lands on **lifts**, groups
+compartments by BOL, keeps the large majority of rows, and quarantines only the control-row junk.
+`--no-dirty` skips them. Worked screenshots of the merge + fix flow live in `docs/hygiene-studio/`.
 
 ---
 
@@ -637,9 +661,9 @@ backend/
     api/reconciliation.py   # /api/reconciliation/* loss-control payload / config / recompute (cached)
     api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
     api/demand.py           # /api/demand/cockpit / persist / forecasts / config (the Demand Cockpit)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_early_feeds + test_scoring + test_regime + test_reconciliation + test_demand
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_lifts_import + test_early_feeds + test_scoring + test_regime + test_reconciliation + test_demand
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
-samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
+samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv / bol_wide_sample.csv+xlsx (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
 docs/playbook.md            # generated Sales Playbook (rackiq-export-playbook)
 frontend/
@@ -707,9 +731,27 @@ CLAUDE.md
   error* is only a value with real content that still won't coerce; `validate` returns per-field
   `parse_error_samples` + a `required_status` (mapped? all-null?) so the UI explains a failing
   "required present" rule instead of a bare ∅.
-- **Validate counts reconcile:** `clean_rows + quarantine_count + dropped_rows == rows_after_fixes`.
-  Failing rows are HELD (quarantined) by default; only with `quarantine_failures` off are they
-  dropped — and that count is surfaced (`dropped_rows` / commit `dropped`), never a silent 0/0.
+- **Validate counts reconcile:** `clean_rows + quarantine_count + dropped_rows == rows_after_fixes`
+  (the pre-grouping per-row split); `kept_lifts` is the *post-BOL-grouping* lift count, reported
+  alongside. Failing rows are HELD (quarantined) by default; only with `quarantine_failures` off are
+  they dropped — and that count is surfaced (`dropped_rows` / commit `dropped`), never a silent 0/0.
+- **Required-field gating only (wide BOL/EDI exports).** A row is quarantined ONLY for a missing/
+  unparseable *required* field, an **EDI control row** (`bol_number==0` AND gross==0 AND net==0 —
+  often product `ZZZ`), or an opted-in duplicate lift. Blank/unused OPTIONAL columns — however many —
+  never hold a row. **Negative** gross/net are kept and flagged as **corrections/reversals**
+  (`corrections_reversals`, action `none`), never quarantined. **Whitespace** is auto-trimmed and
+  **audited** (`trim_whitespace`), never a quarantine reason — VARCHAR coercion leaves surrounding
+  whitespace so the audited trim step records it. **Excel serial dates** parse via
+  `ingest.to_datetime_flex` (text/native dates first, then serial numbers in ~1954–2119).
+- **BOL grouping (lifts).** `hygiene.group_by_bol` collapses lift rows sharing a `bol_number` into one
+  lift (sum gross/net; first non-null for other fields), run **after** the quarantine split so junk
+  never pollutes a group. Gated on `group_compartments_by_bol` (default on) + a mapped `bol_number`;
+  rows without a BOL stay standalone. A BOL export with the **billed Net Amount authoritative** should
+  import with `net_correction="off"` so the summed net isn't overwritten by a D1250 recompute.
+- **Table inference is confidence-weighted.** `ingest.infer_table` scores a table by how well its
+  *required* keys match (weighted by match confidence) + a full-coverage bonus, so a consignee-based
+  wide BOL export lands on **lifts** while a true compartment file (tank/meter/compartment keys) still
+  lands on **bol_compartments**.
 - **`at` is a reserved word in DuckDB** — the audit/quarantine tables use `ts` for the timestamp
   column (the JSON still exposes `at`).
 - **Crosswalk resolution happens at commit** (variant ids are rewritten to master ids before the
@@ -718,10 +760,13 @@ CLAUDE.md
   net with the corrected value); quarantine **re-import uses `net_correction="off"`** so hand-fixed
   values are respected.
 - The studio persistence tables (`import_profiles`, `import_log`, `customer_crosswalk`,
-  `hygiene_audit`, `quarantine`) **survive reset/demo** by design; init runs an idempotent
-  `ALTER TABLE … ADD COLUMN IF NOT EXISTS hygiene` migration for pre-existing profile stores.
+  `hygiene_audit`, `quarantine`) **survive reset/demo** by design; init runs idempotent
+  `ALTER TABLE … ADD COLUMN IF NOT EXISTS` migrations (e.g. `import_profiles.hygiene`,
+  `lifts.bol_number`) for stores created before those columns existed.
 - Uploads are cached in-process by `upload_id`; a server restart between map/commit means
   re-uploading the file (the UI surfaces this as "upload expired").
 - **Tests:** `uv run pytest` (dev group adds `pytest` + `httpx`); covers VCF, profiling, crosswalk,
   validation, the hygiene pipeline, scoring, the reconciliation engine (BOL grouping, mechanism
-  split, net-recon, meter drift, dollarize), and the full API flow against a throwaway DuckDB.
+  split, net-recon, meter drift, dollarize), the **wide BOL/EDI → lifts** import (serial dates,
+  corrections-not-quarantined, control-row junk, BOL grouping — `test_bol_lifts_import.py`), and the
+  full API flow against a throwaway DuckDB.

@@ -124,7 +124,14 @@ STRUCTURAL_COLUMNS: dict[str, list[tuple[str, DType]]] = {
         ("archetype", DType.VARCHAR),
         ("home_terminal", DType.VARCHAR),
     ],
-    LIFTS: [],
+    LIFTS: [
+        # A lift may arrive as a wide BOL/EDI export where several compartment rows share one
+        # bill-of-lading number (one disbursement). bol_number is an OPTIONAL grouping key: when
+        # present it lets ingestion collapse those compartment rows into a single lift (summing
+        # gross/net). It is a structural key — NOT a canonical analytic field — so it never counts
+        # toward the capability matrix or the canonical field total.
+        ("bol_number", DType.VARCHAR),
+    ],
     INVENTORY: [
         ("snapshot_datetime", DType.TIMESTAMP),
         ("terminal", DType.VARCHAR),

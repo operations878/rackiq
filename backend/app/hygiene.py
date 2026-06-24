@@ -45,6 +45,7 @@ class HygieneOptions:
     dedupe_exact: bool = True
     dedupe_lifts_grain: bool = False
     quarantine_failures: bool = True
+    group_compartments_by_bol: bool = True  # lifts: collapse compartment rows sharing a BOL number
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "HygieneOptions":
@@ -252,6 +253,64 @@ def apply_fixes(df: pd.DataFrame, table: str, options: HygieneOptions | dict | N
     df = _net_correction(df, table, opts, report, audit)
     df = _resolve_customers(df, table, opts, con, report, audit)
     return df, report, audit
+
+
+def group_by_bol(df: pd.DataFrame, table: str,
+                 options: HygieneOptions | dict | None = None,
+                 report: list[dict] | None = None,
+                 audit: list[dict] | None = None) -> pd.DataFrame:
+    """Collapse lift compartment rows that share a bill-of-lading into one lift.
+
+    A wide BOL/EDI export lists each compartment of a load as its own row; several rows share
+    one ``bol_number`` and together make a single lift/disbursement. When a ``bol_number`` column
+    is present (and grouping is enabled), rows sharing a BOL are summed on gross/net gallons; all
+    other fields (customer, datetime, terminal, product, temp, gravity, price, cost) take the
+    group's first non-null value. Rows with no BOL number are left as-is (each its own lift).
+
+    Called by the commit/validate flow *after* the quarantine split, so junk/control rows and
+    missing-required rows are removed before valid compartments are summed.
+    """
+    opts = options if isinstance(options, HygieneOptions) else HygieneOptions.from_dict(options)
+    report = report if report is not None else []
+    audit = audit if audit is not None else []
+    if table != schema.LIFTS or not opts.group_compartments_by_bol:
+        return df
+    if "bol_number" not in df.columns or len(df) == 0:
+        return df
+
+    def _key(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        return str(v).strip()
+
+    bol = df["bol_number"].map(_key)
+    has_bol = bol != ""
+    # Only collapse BOLs that actually span more than one row; nothing to do otherwise.
+    if not (has_bol & bol.duplicated(keep=False)).any():
+        return df
+
+    groupable = df[has_bol].copy()
+    groupable["bol_number"] = bol[has_bol]
+    standalone = df[~has_bol].copy()
+
+    sum_fields = [c for c in ("net_gallons", "gross_gallons") if c in groupable.columns]
+    for c in sum_fields:
+        groupable[c] = pd.to_numeric(groupable[c], errors="coerce")
+    other = [c for c in groupable.columns if c not in sum_fields and c != "bol_number"]
+    agg: dict = {c: (lambda s: s.sum(min_count=1)) for c in sum_fields}
+    agg.update({c: "first" for c in other})
+    grouped = groupable.groupby("bol_number", sort=False).agg(agg).reset_index()
+
+    n_in = int(has_bol.sum())
+    n_out = int(grouped.shape[0])
+    out = pd.concat([grouped, standalone], ignore_index=True)
+    out = out[[c for c in df.columns if c in out.columns]]
+    collapsed = n_in - n_out
+    if collapsed > 0:
+        _emit(report, audit, "group_by_bol",
+              f"Grouped {n_in} compartment row(s) sharing a BOL number into {n_out} lift(s) "
+              f"(summed gross/net).", collapsed)
+    return out
 
 
 def dedupe_exact(df: pd.DataFrame, report: list[dict], audit: list[dict]) -> pd.DataFrame:

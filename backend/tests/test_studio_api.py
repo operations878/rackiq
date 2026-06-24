@@ -65,8 +65,10 @@ def test_full_hygiene_flow(client):
     val = r.json()
     assert val["can_commit"] is True
     keyed = {x["key"]: x for x in val["rules"]}
-    assert keyed["volume_nonnegative"]["count"] >= 1
-    assert val["quarantine_count"] >= 2
+    # the negative lift is kept and flagged as a correction/reversal, not quarantined
+    assert keyed["corrections_reversals"]["count"] >= 1
+    assert keyed["corrections_reversals"]["action"] == "none"
+    assert val["quarantine_count"] >= 2                 # bad date (required) + grain dupe
 
     # 5) commit → clean rows written, bad rows quarantined, customers merged
     r = client.post("/api/studio/commit", json={
@@ -76,6 +78,7 @@ def test_full_hygiene_flow(client):
     com = r.json()
     assert com["quarantined"] >= 2
     assert com["rows_written"] >= 1
+    assert com["corrections"] >= 1                       # the negative reversal was kept
     # Riverside's 3 variants collapse to one master → fewer customers than raw names
     assert com["summary"]["customers"] <= 3
 
@@ -91,12 +94,11 @@ def test_full_hygiene_flow(client):
     assert r.status_code == 200, r.text
     q = r.json()
     assert q["total"] >= 2
-    neg = next((row for row in q["rows"] if "volume_nonnegative" in row["reasons"]), None)
-    assert neg is not None
-    edit = {"net_gallons": abs(float(neg["payload"]["net_gallons"])),
-            "gross_gallons": abs(float(neg["payload"]["gross_gallons"]))}
+    # the bad-date row was held for missing a required field; fix the date and re-import it
+    bad = next((row for row in q["rows"] if "required_present" in row["reasons"]), None)
+    assert bad is not None
     r = client.post("/api/studio/quarantine/reimport",
-                    json={"ids": [neg["id"]], "edits": {neg["id"]: edit}})
+                    json={"ids": [bad["id"]], "edits": {bad["id"]: {"lift_datetime": "2024-01-15 08:00:00"}}})
     assert r.status_code == 200, r.text
     assert r.json()["reimported"] == 1
 

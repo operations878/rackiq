@@ -73,6 +73,9 @@ STUDIO_DDL = [
 # Lightweight, idempotent migrations for stores created before a column existed.
 STUDIO_MIGRATIONS = [
     "ALTER TABLE import_profiles ADD COLUMN IF NOT EXISTS hygiene VARCHAR",
+    # bol_number is an optional grouping key on lifts (wide BOL/EDI exports). Add it to stores
+    # created before the column existed so a BOL import can carry + group by it.
+    "ALTER TABLE lifts ADD COLUMN IF NOT EXISTS bol_number VARCHAR",
 ]
 
 

@@ -172,6 +172,28 @@ def _coerce_fix(up, table: str, mapping: dict[str, str], options: dict | None):
     return hygiene.apply_fixes(mapped, table, options, _con())
 
 
+# Hygiene steps that count as a per-row "auto-fix" (vs. structural grouping / dedupe).
+_AUTOFIX_STEPS = {"trim_whitespace", "standardize_units", "fill_defaults",
+                  "net_60_correction", "resolve_customers"}
+
+
+def _reason_breakdown(reasons: dict) -> dict[str, int]:
+    """Aggregate per-row quarantine reasons into a {reason: count} breakdown."""
+    out: dict[str, int] = {}
+    for rs in reasons.values():
+        for r in rs:
+            out[r] = out.get(r, 0) + 1
+    return out
+
+
+def _autofixed_rows(report: list[dict]) -> int:
+    return sum(int(s.get("rows_affected", 0)) for s in report if s.get("step") in _AUTOFIX_STEPS)
+
+
+def _rule_count(rules: dict, key: str) -> int:
+    return next((int(r["count"]) for r in rules["rules"] if r["key"] == key), 0)
+
+
 # ---- Endpoints ------------------------------------------------------------------
 @router.get("/targets")
 def targets():
@@ -301,6 +323,13 @@ def validate(req: ValidateRequest):
     base["quarantine_count"] = n_failing if quarantine_on else 0
     base["dropped_rows"] = 0 if quarantine_on else n_failing
     base["clean_rows"] = max(0, n_fixed - n_failing)
+
+    # Collapse the clean rows by BOL (lifts only) so the preview shows how many *lifts* land.
+    good = fixed.drop(index=rules["quarantine_index"]) if rules["quarantine_index"] else fixed
+    grouped = hygiene.group_by_bol(good, req.table, req.options, [], [])
+    base["kept_lifts"] = int(len(grouped))
+    base["corrections"] = _rule_count(rules, "corrections_reversals")
+    base["quarantine_breakdown"] = _reason_breakdown(rules["quarantine_reasons"]) if quarantine_on else {}
     return base
 
 
@@ -331,6 +360,9 @@ def commit(req: CommitRequest):
         quarantined = fixed.loc[q_index] if q_index else fixed.iloc[0:0]
         good = fixed.drop(index=q_index) if q_index else fixed
 
+        # Collapse compartment rows sharing a BOL number into one lift (lifts only; no-op
+        # otherwise). Done after the quarantine split so junk/missing-required rows are gone first.
+        good = hygiene.group_by_bol(good, req.table, opts, report, audit)
         if opts.dedupe_exact:
             good = hygiene.dedupe_exact(good, report, audit)
 
@@ -376,8 +408,12 @@ def commit(req: CommitRequest):
         "mode": req.mode,
         "rows_written": rows_written,
         "rows_in_file": int(len(up.df)),
+        "kept_lifts": rows_written,                       # valid lifts after BOL grouping
+        "auto_fixed": _autofixed_rows(report),            # rows touched by trim/units/defaults/net-60/resolve
+        "corrections": _rule_count(rules, "corrections_reversals"),
         "quarantined": n_quarantined,
         "dropped": n_dropped,
+        "quarantine_breakdown": _reason_breakdown(rules["quarantine_reasons"]),
         "hygiene": report,
         "rules": rules["rules"],
         "saved_profile": req.save_profile or None,

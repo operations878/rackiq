@@ -86,7 +86,7 @@ def test_crosswalk_reject_suppresses_proposal(con):
 
 
 # ---- Validation rule engine -----------------------------------------------------
-def test_validation_quarantines_required_negative_and_dupes(con):
+def test_validation_keeps_negatives_quarantines_required_and_dupes(con):
     df = pd.DataFrame({
         "customer_id": ["A", "B", "A", None],
         "lift_datetime": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-01", "2024-01-03"]),
@@ -95,10 +95,28 @@ def test_validation_quarantines_required_negative_and_dupes(con):
     rules = validation.run_rules(df, schema.LIFTS, {"dedupe_lifts_grain": True}, {}, con)
     by = {r["key"]: r for r in rules["rules"]}
     assert by["required_present"]["count"] == 1
-    assert by["volume_nonnegative"]["count"] == 1
+    # the negative net is a correction/reversal — flagged but NOT quarantined
+    assert by["corrections_reversals"]["count"] == 1
+    assert by["corrections_reversals"]["action"] == "none"
     assert by["duplicate_lifts"]["count"] == 1
-    assert rules["quarantine_count"] == 3              # required + negative + dupe
+    assert rules["quarantine_count"] == 2              # required + dupe only (the negative is kept)
     assert by["required_present"]["rows"]              # drill-down rows present
+
+
+def test_validation_quarantines_edi_control_rows(con):
+    """BOL 0 + gross 0 + net 0 (an EDI control/heartbeat row) is the one junk we still hold."""
+    df = pd.DataFrame({
+        "bol_number": ["820001", "0", "820002"],
+        "customer_id": ["A", "ZZZ", "B"],
+        "lift_datetime": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        "net_gallons": [5000.0, 0.0, 4200.0],
+        "gross_gallons": [5010.0, 0.0, 4210.0],
+    })
+    rules = validation.run_rules(df, schema.LIFTS, {}, {}, con)
+    by = {r["key"]: r for r in rules["rules"]}
+    assert by["edi_control_row"]["count"] == 1
+    assert rules["quarantine_count"] == 1
+    assert "edi_control_row" in rules["quarantine_reasons"][1]   # the BOL-0 row
 
 
 # ---- Standing data-health -------------------------------------------------------

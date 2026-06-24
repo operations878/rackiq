@@ -199,6 +199,8 @@ def export_samples_main() -> None:
         if not args.no_dirty:
             for path, n in _write_dirty_samples(con, out_dir, args.limit, args.seed):
                 written.append((path, n))
+            for path, n in _write_wide_bol_sample(con, out_dir, args.limit, args.seed):
+                written.append((path, n))
     finally:
         con.close()
 
@@ -255,8 +257,8 @@ def _write_dirty_samples(con, out_dir: Path, limit: int, seed: int):
     for i in rng.choice(df.index, size=max(3, len(df) // 60), replace=False):
         df.at[i, "Lift Date"] = bad_dates[int(rng.integers(0, len(bad_dates)))]
 
-    # 3) A few negative volumes (will be quarantined, never silently stored). Negate both
-    #    net and gross so the anomaly survives net-60 recomputation from gross.
+    # 3) A few negative volumes (legitimate corrections/reversals — kept and flagged, never
+    #    quarantined). Negate both net and gross so the sign survives net-60 recomputation.
     for i in rng.choice(df.index, size=max(4, len(df) // 100), replace=False):
         df.at[i, "Net Gallons"] = -abs(float(df.at[i, "Net Gallons"]))
         df.at[i, "Gross Gallons"] = -abs(float(df.at[i, "Gross Gallons"]))
@@ -277,3 +279,114 @@ def _write_dirty_samples(con, out_dir: Path, limit: int, seed: int):
     bbl.to_csv(bbl_path, index=False)
 
     return [(dirty_path, len(df)), (bbl_path, len(bbl))]
+
+
+# A spread of EDI/admin columns a real BOL export carries — almost always blank. They exist to
+# prove the validator never quarantines a row just because optional/unused columns are empty.
+_BOL_ADMIN_COLUMNS = [
+    "Carrier SCAC", "Carrier Name", "Trailer", "Tractor", "Seal Number", "PO Number",
+    "Release Number", "Freight Terms", "Pay Terms", "Tax Jurisdiction", "Tax Code",
+    "Federal Tax", "State Tax", "EDI Trace", "EDI Doc Type", "ISA Control", "GS Control",
+    "Origin Code", "Destination Code", "Driver", "Account Of", "Exchange Party",
+    "Contract Number", "Rate Code", "Special Instructions", "Hold Code", "Reason Code",
+    "Misc 1", "Misc 2", "Misc 3", "Reserved A", "Reserved B",
+]
+
+
+def _write_wide_bol_sample(con, out_dir: Path, limit: int, seed: int):
+    """Write a realistic *wide* EDI/BOL export to exercise the BOL → lifts import path.
+
+    ``bol_wide_sample.csv`` / ``.xlsx`` — one row per loaded compartment, several compartments
+    sharing a ``BOL Number`` (one lift), dozens of mostly-blank admin columns, Excel **serial**
+    ship dates mixed with text dates, **negative** reversal rows, stray whitespace, and a handful
+    of EDI **control rows** (BOL 0 / gross 0 / net 0, product ``ZZZ``). Importing it walks the
+    capability matrix up while quarantining only the genuine control-row junk.
+    """
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(seed + 2)
+    base = con.execute(
+        "SELECT l.customer_id AS cust, c.name AS nm, l.lift_datetime AS dt, l.net_gallons AS net, "
+        "l.gross_gallons AS gross, l.terminal AS term, l.product AS prod, "
+        "l.observed_temp AS temp, l.api_gravity AS api "
+        "FROM lifts l JOIN customers c USING (customer_id) "
+        f"ORDER BY l.lift_datetime LIMIT {max(120, limit // 3)}"
+    ).df()
+
+    # Stable numeric consignee numbers (real exports identify the buyer by a numeric code).
+    codes = {cid: f"{1000 + i:04d}" for i, cid in enumerate(sorted(base["cust"].unique()))}
+
+    records: list[dict] = []
+    bol_seq = 700000
+    for r in base.itertuples(index=False):
+        bol_seq += 1
+        n_comp = int(rng.integers(1, 4))                       # 1..3 compartments per BOL
+        net = float(r.net)
+        gross = float(r.gross) if r.gross == r.gross else net  # NaN-safe
+        w = rng.dirichlet(np.ones(n_comp))
+        ship = pd.Timestamp(r.dt).normalize()
+        # ~20% of BOLs carry the ship date as an Excel serial number instead of a text date.
+        serial = (bol_seq % 5 == 0)
+        ship_val = int((ship - pd.Timestamp("1899-12-30")).days) if serial else ship.strftime("%Y-%m-%d")
+        # Stray whitespace on some rows (fixed-width EDI fields pad with spaces) — on MAPPED
+        # fields so the trim auto-fix has something to clean; identity must still resolve.
+        pad = (bol_seq % 7 == 0)
+        consignee = f" {codes[r.cust]} " if pad else codes[r.cust]
+        nm = f"  {r.nm} " if pad else r.nm
+        terminal = f"{r.term}  " if pad else r.term
+        for c in range(n_comp):
+            records.append({
+                "BOL Number": str(bol_seq),
+                "Consignee Number": consignee,
+                "Consignee Name": nm,
+                "Ship Date": ship_val,
+                "Net Amount": round(net * w[c], 1),
+                "Gross Amount": round(gross * w[c], 1),
+                "Terminal": terminal,
+                "Product": r.prod,
+                "Compartment": f"{bol_seq}-{c + 1}",
+                "Load Temp": round(float(r.temp), 1) if r.temp == r.temp else "",
+                "API Gravity": round(float(r.api), 1) if r.api == r.api else "",
+            })
+
+    # A handful of negative reversal rows (credits / re-bills) — kept and flagged, not dropped.
+    for _ in range(max(3, len(records) // 80)):
+        src = records[int(rng.integers(0, len(records)))].copy()
+        bol_seq += 1
+        src["BOL Number"] = str(bol_seq)
+        src["Compartment"] = f"{bol_seq}-1"
+        src["Net Amount"] = -abs(float(src["Net Amount"]))
+        src["Gross Amount"] = -abs(float(src["Gross Amount"]))
+        records.append(src)
+
+    # A few EDI control / heartbeat rows: BOL 0, no volume, placeholder product code — genuine junk.
+    for k in range(5):
+        records.append({
+            "BOL Number": "0", "Consignee Number": "9999", "Consignee Name": "EDI CONTROL",
+            "Ship Date": "2024-01-01", "Net Amount": 0, "Gross Amount": 0,
+            "Terminal": "", "Product": "ZZZ", "Compartment": "", "Load Temp": "", "API Gravity": "",
+        })
+
+    df = pd.DataFrame(records)
+    for c in _BOL_ADMIN_COLUMNS:                               # dozens of blank/admin columns
+        df[c] = ""
+    # Shuffle so compartments of a BOL aren't guaranteed adjacent (grouping must not rely on order).
+    df = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    csv_path = out_dir / "bol_wide_sample.csv"
+    df.to_csv(csv_path, index=False)
+
+    # An Excel copy too, so the .xlsx (typed-cell) path is exercised. Real text dates become true
+    # Excel dates; the serial-coded ones stay numeric to mimic an export that leaked serials.
+    xlsx = df.copy()
+    def _maybe_date(v):
+        try:
+            return pd.Timestamp(str(v))
+        except (ValueError, TypeError):
+            return v
+    xlsx["Ship Date"] = xlsx["Ship Date"].map(_maybe_date)
+    xlsx_path = out_dir / "bol_wide_sample.xlsx"
+    xlsx.to_excel(xlsx_path, index=False)
+
+    return [(csv_path, len(df)), (xlsx_path, len(df))]
