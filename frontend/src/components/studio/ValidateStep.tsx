@@ -108,6 +108,13 @@ export default function ValidateStep({
   const v = validation;
   const range = v.date_range.start ? `${v.date_range.start} → ${v.date_range.end}` : "—";
   const dropped = v.dropped_rows ?? 0;
+  // BOL/EDI lift imports: compartment rows are grouped & summed into lifts; show the result.
+  const grouped = v.lifts_after_grouping;
+  const showGrouped = grouped != null && grouped !== v.clean_rows;
+  const corrections = v.corrections ?? 0;
+  const nStats = 5 + (dropped > 0 ? 1 : 0) + (showGrouped ? 1 : 0) + (corrections > 0 ? 1 : 0);
+  const lgColsClass =
+    nStats >= 7 ? "lg:grid-cols-7" : nStats === 6 ? "lg:grid-cols-6" : "lg:grid-cols-5";
 
   // Required keys that explain a failing "required fields present" rule.
   const reqProblems = (v.required_status ?? []).filter((r) => !r.mapped || r.all_null);
@@ -119,9 +126,19 @@ export default function ValidateStep({
 
   return (
     <div className="space-y-4">
-      <div className={`grid grid-cols-2 gap-3 sm:grid-cols-3 ${dropped ? "lg:grid-cols-6" : "lg:grid-cols-5"}`}>
+      <div className={`grid grid-cols-2 gap-3 sm:grid-cols-3 ${lgColsClass}`}>
         <Stat label="Rows in file" value={v.n_rows.toLocaleString()} />
-        <Stat label="Clean → store" value={v.clean_rows.toLocaleString()} tone={v.clean_rows ? "ok" : "bad"} />
+        <Stat
+          label={showGrouped ? "Clean rows" : "Clean → store"}
+          value={v.clean_rows.toLocaleString()}
+          tone={v.clean_rows ? "ok" : "bad"}
+        />
+        {showGrouped && (
+          <Stat label="Lifts (BOL-grouped)" value={grouped!.toLocaleString()} tone="ok" />
+        )}
+        {corrections > 0 && (
+          <Stat label="Corrections (kept)" value={corrections.toLocaleString()} tone="warn" />
+        )}
         <Stat
           label="Quarantined"
           value={v.quarantine_count.toLocaleString()}
@@ -278,7 +295,9 @@ export default function ValidateStep({
           >
             {busy === "commit"
               ? "Importing…"
-              : `Commit ${v.clean_rows.toLocaleString()} rows → ${humanize(v.table)}`}
+              : `Commit ${(showGrouped ? grouped! : v.clean_rows).toLocaleString()} ${
+                  showGrouped ? "lifts" : "rows"
+                } → ${humanize(v.table)}`}
           </button>
         </div>
       </div>

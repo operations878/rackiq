@@ -124,7 +124,12 @@ STRUCTURAL_COLUMNS: dict[str, list[tuple[str, DType]]] = {
         ("archetype", DType.VARCHAR),
         ("home_terminal", DType.VARCHAR),
     ],
-    LIFTS: [],
+    LIFTS: [
+        # Optional: a wide BOL/EDI export lists each compartment of a load on its own row,
+        # all sharing one BOL number. They are NOT separate lifts — they are grouped by this
+        # key and summed into one lift at import. Nullable: a lift without a BOL still imports.
+        ("bol_number", DType.VARCHAR),
+    ],
     INVENTORY: [
         ("snapshot_datetime", DType.TIMESTAMP),
         ("terminal", DType.VARCHAR),
@@ -239,7 +244,8 @@ STRUCTURAL_DESCRIPTIONS: dict[str, str] = {
     "customer_id": "Customer identifier (foreign key on this table).",
     "quote_time": "Timestamp the quote was given (grain key).",
     "receipt_datetime": "Timestamp the receipt landed (grain key).",
-    "bol_number": "Bill-of-lading number — groups compartments into one disbursement (grain key).",
+    "bol_number": "Bill-of-lading number — groups the compartment rows of one load; summed "
+                  "into a single lift (on lifts) / disbursement (on BOL compartments) when present.",
     "bol_datetime": "Timestamp the load left the rack (grain key).",
     "tank_id": "Tank the compartment drew from (dimensional key).",
     "meter_id": "Loading rack / meter / lane (dimensional key — drives meter-drift detection).",

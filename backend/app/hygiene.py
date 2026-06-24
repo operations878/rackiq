@@ -45,6 +45,7 @@ class HygieneOptions:
     dedupe_exact: bool = True
     dedupe_lifts_grain: bool = False
     quarantine_failures: bool = True
+    group_bol: bool = True                  # collapse compartment rows sharing a BOL into one lift
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "HygieneOptions":
@@ -252,6 +253,57 @@ def apply_fixes(df: pd.DataFrame, table: str, options: HygieneOptions | dict | N
     df = _net_correction(df, table, opts, report, audit)
     df = _resolve_customers(df, table, opts, con, report, audit)
     return df, report, audit
+
+
+def _is_real_bol(v) -> bool:
+    """A BOL number that actually identifies a load (not blank / 0 / a control-row placeholder)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return False
+    s = str(v).strip()
+    return s not in ("", "0", "0.0")
+
+
+def _first_non_null(s: pd.Series):
+    nn = s.dropna()
+    return nn.iloc[0] if len(nn) else None
+
+
+def _sum_min1(s: pd.Series):
+    # Sum, but keep NULL (not 0) when every value in the group is missing.
+    return s.sum(min_count=1)
+
+
+def group_by_bol(df: pd.DataFrame, table: str,
+                 report: list[dict] | None = None,
+                 audit: list[dict] | None = None) -> pd.DataFrame:
+    """Collapse the compartment rows of one bill of lading into a single lift.
+
+    A wide BOL/EDI export lists each metered compartment of a load on its own row, all sharing
+    one ``bol_number``; these are NOT separate lifts. Rows carrying a real BOL number are grouped
+    by it — ``net_gallons`` and ``gross_gallons`` are SUMMED (so a reversal compartment nets out),
+    every other field takes the first non-null value — while rows without a BOL number pass
+    through unchanged (each its own lift). Only the lifts table is grouped; callers run this on the
+    *clean* rows (after quarantine), so junk/heartbeat rows never pollute a group.
+    """
+    if table != schema.LIFTS or "bol_number" not in df.columns or df.empty:
+        return df
+    grp_mask = df["bol_number"].map(_is_real_bol)
+    if not grp_mask.any():
+        return df
+    groupable, passthrough = df[grp_mask], df[~grp_mask]
+    sum_cols = [c for c in ("net_gallons", "gross_gallons") if c in df.columns]
+    other_cols = [c for c in df.columns if c not in sum_cols and c != "bol_number"]
+    agg = {c: _sum_min1 for c in sum_cols}
+    agg.update({c: _first_non_null for c in other_cols})
+    grouped = (groupable.groupby("bol_number", sort=False, dropna=False)
+               .agg(agg).reset_index())
+    out = pd.concat([grouped, passthrough], ignore_index=True)
+    n_in, n_out = int(len(groupable)), int(len(grouped))
+    if report is not None and n_in != n_out:
+        _emit(report, audit if audit is not None else [], "group_bol",
+              f"Grouped {n_in} compartment row(s) into {n_out} lift(s) by BOL number "
+              f"(gross & net summed; {int(len(passthrough))} row(s) had no BOL number).", n_in)
+    return out
 
 
 def dedupe_exact(df: pd.DataFrame, report: list[dict], audit: list[dict]) -> pd.DataFrame:

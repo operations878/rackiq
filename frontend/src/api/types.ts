@@ -288,6 +288,10 @@ export interface ValidateResponse {
   dropped_rows?: number;
   rows_after_fixes?: number;
   clean_rows: number;
+  // BOL grouping + corrections (wide BOL/EDI lift imports):
+  lifts_after_grouping?: number;
+  corrections?: number;
+  quarantine_reasons?: Record<string, number>;
 }
 
 export interface HygieneStep {
@@ -302,8 +306,12 @@ export interface CommitResponse {
   mode: string;
   rows_written: number;
   rows_in_file: number;
+  clean_rows?: number;
+  lifts_after_grouping?: number;
+  corrections?: number;
   quarantined: number;
   dropped?: number;
+  quarantine_reasons?: Record<string, number>;
   hygiene: HygieneStep[];
   rules: RuleResult[];
   saved_profile: string | null;

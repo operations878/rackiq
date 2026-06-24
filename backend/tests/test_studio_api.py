@@ -65,8 +65,9 @@ def test_full_hygiene_flow(client):
     val = r.json()
     assert val["can_commit"] is True
     keyed = {x["key"]: x for x in val["rules"]}
-    assert keyed["volume_nonnegative"]["count"] >= 1
-    assert val["quarantine_count"] >= 2
+    assert keyed["volume_corrections"]["count"] >= 1   # negative is a correction, not quarantined
+    assert keyed["volume_corrections"]["action"] == "none"
+    assert val["quarantine_count"] >= 2                # the bad-date row + the duplicate
 
     # 5) commit → clean rows written, bad rows quarantined, customers merged
     r = client.post("/api/studio/commit", json={
@@ -91,12 +92,12 @@ def test_full_hygiene_flow(client):
     assert r.status_code == 200, r.text
     q = r.json()
     assert q["total"] >= 2
-    neg = next((row for row in q["rows"] if "volume_nonnegative" in row["reasons"]), None)
-    assert neg is not None
-    edit = {"net_gallons": abs(float(neg["payload"]["net_gallons"])),
-            "gross_gallons": abs(float(neg["payload"]["gross_gallons"]))}
+    # The unparseable-date row is held for a *required* field — fix the date and re-import it.
+    bad = next((row for row in q["rows"] if "required_present" in row["reasons"]), None)
+    assert bad is not None
+    edit = {"lift_datetime": "2024-01-06 08:00:00"}
     r = client.post("/api/studio/quarantine/reimport",
-                    json={"ids": [neg["id"]], "edits": {neg["id"]: edit}})
+                    json={"ids": [bad["id"]], "edits": {bad["id"]: edit}})
     assert r.status_code == 200, r.text
     assert r.json()["reimported"] == 1
 

@@ -35,14 +35,14 @@ def _validity(con) -> tuple[float, dict]:
     n = db.row_count(con, schema.LIFTS)
     if not n:
         return 1.0, {}
-    lo, hi = schema.FIELD_BOUNDS["net_gallons"]
+    _lo, hi = schema.FIELD_BOUNDS["net_gallons"]
+    # A negative net is a legitimate reversal/correction — reported, but NOT counted as invalid.
     bad = int(con.execute(
-        "SELECT count(*) FROM lifts WHERE net_gallons IS NOT NULL AND "
-        "(net_gallons < ? OR net_gallons > ?)", [lo, hi]).fetchone()[0])
-    neg = int(con.execute(
+        "SELECT count(*) FROM lifts WHERE net_gallons IS NOT NULL AND net_gallons > ?",
+        [hi]).fetchone()[0])
+    corrections = int(con.execute(
         "SELECT count(*) FROM lifts WHERE net_gallons < 0").fetchone()[0])
-    invalid = bad + neg
-    return _clamp01(1.0 - invalid / n), {"out_of_bounds": bad, "negative": neg}
+    return _clamp01(1.0 - bad / n), {"out_of_bounds": bad, "corrections": corrections}
 
 
 def _consistency(con) -> tuple[float, dict]:

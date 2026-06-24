@@ -12,6 +12,11 @@ export default function DoneStep({
   onGoDashboard: () => void;
   onGoHealth: () => void;
 }) {
+  const grouped =
+    result.lifts_after_grouping != null &&
+    result.clean_rows != null &&
+    result.lifts_after_grouping !== result.clean_rows;
+  const corrections = result.corrections ?? 0;
   return (
     <div className="space-y-4">
       <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-5 text-center">
@@ -57,7 +62,10 @@ export default function DoneStep({
         </ul>
         <p className="mt-2 text-[11px] text-slate-400">
           {result.rows_in_file.toLocaleString()} rows in file →{" "}
-          {result.rows_written.toLocaleString()} written after cleaning.
+          {grouped
+            ? `${result.clean_rows!.toLocaleString()} clean rows grouped by BOL into ${result.rows_written.toLocaleString()} lifts`
+            : `${result.rows_written.toLocaleString()} written after cleaning`}
+          {corrections > 0 && ` · ${corrections.toLocaleString()} correction(s) kept for review`}.
         </p>
       </div>
 

@@ -86,7 +86,7 @@ def test_crosswalk_reject_suppresses_proposal(con):
 
 
 # ---- Validation rule engine -----------------------------------------------------
-def test_validation_quarantines_required_negative_and_dupes(con):
+def test_validation_holds_required_and_dupes_but_keeps_negatives(con):
     df = pd.DataFrame({
         "customer_id": ["A", "B", "A", None],
         "lift_datetime": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-01", "2024-01-03"]),
@@ -95,9 +95,12 @@ def test_validation_quarantines_required_negative_and_dupes(con):
     rules = validation.run_rules(df, schema.LIFTS, {"dedupe_lifts_grain": True}, {}, con)
     by = {r["key"]: r for r in rules["rules"]}
     assert by["required_present"]["count"] == 1
-    assert by["volume_nonnegative"]["count"] == 1
+    # A negative volume is a correction/reversal — flagged for review, NOT quarantined.
+    assert by["volume_corrections"]["count"] == 1
+    assert by["volume_corrections"]["action"] == "none"
     assert by["duplicate_lifts"]["count"] == 1
-    assert rules["quarantine_count"] == 3              # required + negative + dupe
+    assert rules["quarantine_count"] == 2              # required + dupe only (negative kept)
+    assert "volume_corrections" not in {r for rs in rules["quarantine_reasons"].values() for r in rs}
     assert by["required_present"]["rows"]              # drill-down rows present
 
 
