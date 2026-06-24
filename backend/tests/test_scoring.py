@@ -108,7 +108,98 @@ def test_grade_thresholds():
     assert grade(None, DEFAULT_CONFIG) is None
 
 
+# ---- VAR as a forecast (forward projection, excursions, trend, book forecast) ----
+def test_forward_projection_per_customer(full_book):
+    res = scoring.compute_scores(full_book, DEFAULT_CONFIG, "all")
+    # every established (status ok) account gets a forward projection that nests lo<=expected<=hi
+    projected = [c for c in res["customers"] if c["forecast"]["available"]]
+    assert projected, "expected at least some forward projections"
+    for c in projected:
+        hs = {h["days"]: h for h in c["forecast"]["horizons"]}
+        assert set(hs) == set(DEFAULT_CONFIG.forecast_horizons)
+        for h in hs.values():
+            assert h["lo"] <= h["expected"] <= h["hi"]
+        # longer horizon ⇒ more expected volume and a wider absolute band
+        assert hs[7]["expected"] <= hs[30]["expected"] <= hs[90]["expected"]
+        assert (hs[90]["hi"] - hs[90]["lo"]) >= (hs[7]["hi"] - hs[7]["lo"])
+        assert "gal over the next 30 days" in c["forecast"]["plain"]
+        assert len(c["forecast_series"]) >= 1  # dotted forward continuation
+
+
+def test_forward_band_tighter_for_high_var(full_book):
+    res = scoring.compute_scores(full_book, DEFAULT_CONFIG, "all")
+    rows = [c for c in res["customers"] if c["forecast"]["available"] and c["var"]["score"]]
+    def rel_band(c):
+        h = next(h for h in c["forecast"]["horizons"] if h["days"] == 30)
+        return (h["hi"] - h["lo"]) / h["expected"] if h["expected"] else None
+    hi_var = [rel_band(c) for c in rows if c["var"]["score"] >= 70]
+    lo_var = [rel_band(c) for c in rows if c["var"]["score"] < 60]
+    hi_var = [x for x in hi_var if x is not None]
+    lo_var = [x for x in lo_var if x is not None]
+    if hi_var and lo_var:  # a tight lane forecasts proportionally narrower than a wide one
+        assert (sum(hi_var) / len(hi_var)) < (sum(lo_var) / len(lo_var))
+
+
+def test_excursions_weather_pattern(full_book):
+    res = scoring.compute_scores(full_book, DEFAULT_CONFIG, "all")
+    # weather_distillate accounts should show a cold-snap-driven lane-break pattern
+    wd = [c for c in res["customers"]
+          if c["archetype_true"] == "weather_distillate" and c["excursions"]["n_breaks"] >= 3]
+    assert wd, "expected weather distillate accounts with lane breaks"
+    cold = [c for c in wd if (c["excursions"]["pattern"] or {}).get("type") == "cold_snap"]
+    assert cold, "weather distillate breaks should cluster on cold snaps"
+    c = cold[0]
+    b = c["excursions"]["breaks"][0]
+    assert b["kind"] in {"spike", "shortfall", "no_show"}
+    assert "weeks" in c["excursions"]["pattern"]["note"]
+
+
+def test_var_trend_over_time(full_book):
+    res = scoring.compute_scores(full_book, DEFAULT_CONFIG, "all")
+    moved = [c for c in res["customers"] if c["var_trend"]["available"]]
+    assert moved
+    for c in moved:
+        q = c["var_trend"]["comparisons"]["quarter"]
+        assert q["direction"] in {"tightening", "widening", "steady", "insufficient"}
+        if q["direction"] != "insufficient":
+            assert "VAR" in q["note"]
+
+
+def test_book_forecast_bottom_up_and_filters(full_book):
+    res = scoring.compute_scores(full_book, DEFAULT_CONFIG, "all")
+    agg = scoring.aggregate_book_forecast(res["customers"], DEFAULT_CONFIG)
+    assert agg["n_customers"] > 0
+    assert 0.0 <= agg["predictable_share"] <= 1.0
+    h30 = next(h for h in agg["horizons"] if h["days"] == 30)
+    assert h30["lo"] <= h30["expected"] <= h30["hi"]
+    # a terminal filter is a strict subset of the whole book
+    full_30 = h30["expected"]
+    term = sorted({t for c in res["customers"]
+                   for k in (c["facts"].get("tp_share") or {}) for t in [k.split("|")[0]]
+                   if t and t != "(unknown)"})[0]
+    sub = scoring.aggregate_book_forecast(res["customers"], DEFAULT_CONFIG, terminal=term)
+    sub_30 = next(h for h in sub["horizons"] if h["days"] == 30)["expected"]
+    assert 0 < sub_30 <= full_30 + 1
+
+
 # ---- API ------------------------------------------------------------------------
+def test_book_forecast_api(client):
+    client.post("/api/studio/load-demo", json={"profile": "full"})
+    bf = client.get("/api/scores/book-forecast?window=all").json()
+    assert bf["n_customers"] > 0 and bf["terminals"] and bf["products"]
+    assert any(h["days"] == 30 for h in bf["horizons"])
+    assert bf["predictable_share"] is not None
+    # filtered call returns a subset
+    t = bf["terminals"][0]
+    bft = client.get(f"/api/scores/book-forecast?window=all&terminal={t}").json()
+    assert bft["terminal"] == t and bft["n_customers"] <= bf["n_customers"]
+    # the ranked list carries the slim forecast + trend, but not the heavy series
+    s = client.get("/api/scores?window=all").json()
+    top = s["customers"][0]
+    assert "forecast" in top and "var_trend" in top
+    assert "forecast_series" not in top and "excursions" not in top
+
+
 def test_scores_api_flow(client):
     client.post("/api/studio/load-demo", json={"profile": "full"})
     s = client.get("/api/scores?window=all").json()

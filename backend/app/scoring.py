@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from . import db, schema
+from . import db, schema, weather
 from .scoring_config import (ARCHETYPE_POSTURE, ARCHETYPES, DEFAULT_CONFIG, WINDOWS,
                              ScoringConfig, grade)
 
@@ -136,10 +136,8 @@ def _ols(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 def _hdd_cdd(dt: pd.Timestamp) -> tuple[float, float]:
-    """Climatological degree-days from a date (NOAA auto-fetch pending → seasonal proxy)."""
-    doy = dt.dayofyear
-    t = 50.0 - 18.0 * math.cos(2 * math.pi * (doy - 15) / 365.0)  # matches generator ambient mean
-    return max(0.0, 65.0 - t), max(0.0, t - 65.0)
+    """Climatological degree-days from a date (seasonal proxy; live fetch lives in ``weather``)."""
+    return weather.seasonal_hdd_cdd(dt)
 
 
 # ---- Data loading ---------------------------------------------------------------
@@ -199,7 +197,8 @@ def _availability(data: dict) -> dict:
       "Needs margin + elasticity (quotes / rack benchmark).")
     g("market_sensitivity", data["has_market"], "Corr(volume, market level/momentum/vol).",
       "Needs market prices.")
-    g("weather_sensitivity", True, "Seasonal HDD/CDD proxy (NOAA auto-fetch pending).", "")
+    g("weather_sensitivity", True,
+      "Seasonal HDD/CDD proxy (live NOAA/ERA5 fetch powers the lane-break weather).", "")
     g("quote_score", data["has_quotes"], "From the quote log.",
       "Needs a quote log — collecting.")
     g("churn_risk", True, "Recency + volume trend (+ accept decline if quoted).", "")
@@ -234,9 +233,10 @@ def _seasonal_fitted(y: np.ndarray, months: np.ndarray) -> np.ndarray:
     return np.array([overall * factors.get(m, 1.0) for m in months])
 
 
-def _stl_or_seasonal(y: np.ndarray, starts: pd.DatetimeIndex, grain: str) -> tuple[np.ndarray, str]:
+def _stl_or_seasonal(y: np.ndarray, starts: pd.DatetimeIndex, grain: str,
+                     fast: bool = False) -> tuple[np.ndarray, str]:
     period = 52 if grain == "weekly" else 12
-    if len(y) >= 2 * period and period >= 2:
+    if not fast and len(y) >= 2 * period and period >= 2:
         try:
             from statsmodels.tsa.seasonal import STL
             res = STL(pd.Series(y), period=period, robust=True).fit()
@@ -247,12 +247,17 @@ def _stl_or_seasonal(y: np.ndarray, starts: pd.DatetimeIndex, grain: str) -> tup
     return _seasonal_fitted(y, months), "seasonal_median"
 
 
-def _lane(periods: pd.DataFrame, cfg: ScoringConfig, grain: str) -> dict:
-    """Fit the base / base-range / variability-range lane on a customer's per-period volume."""
+def _lane(periods: pd.DataFrame, cfg: ScoringConfig, grain: str,
+          with_diagnostics: bool = True) -> dict:
+    """Fit the base / base-range / variability-range lane on a customer's per-period volume.
+
+    ``with_diagnostics=False`` skips the heavy statistics layer (bootstrap CI, STL strengths,
+    Ljung-Box, …) and the STL fit itself — used by the cheap point-in-time VAR-trend re-fits.
+    """
     y = periods["actual"].to_numpy(dtype=float)
     starts = pd.DatetimeIndex(periods["period_start"])
     n = len(y)
-    fitted, method = _stl_or_seasonal(y, starts, grain)
+    fitted, method = _stl_or_seasonal(y, starts, grain, fast=not with_diagnostics)
     resid = y - fitted
     sigma = _robust_sigma(resid)
     base_level = float(fitted[-1]) if n else 0.0
@@ -281,8 +286,10 @@ def _lane(periods: pd.DataFrame, cfg: ScoringConfig, grain: str) -> dict:
         "var_hi": round(float(vh), 1), "actual": round(float(a), 1),
     } for s, f, bl, bh, vl, vh, a in zip(starts, fitted, base_lo, base_hi, var_lo, var_hi, y)]
 
-    diagnostics = _lane_diagnostics(y, fitted, resid, starts, grain, sigma, cfg)
-    steadiness = _steadiness_trend(y, base_lo, base_hi, cfg)
+    diagnostics = (_lane_diagnostics(y, fitted, resid, starts, grain, sigma, cfg)
+                   if with_diagnostics else None)
+    steadiness = (_steadiness_trend(y, base_lo, base_hi, cfg)
+                  if with_diagnostics else None)
 
     return {
         "base_level": round(base_level, 1), "sigma": round(sigma, 1),
@@ -501,8 +508,13 @@ def _lane_diagnostics(y: np.ndarray, fitted: np.ndarray, resid: np.ndarray,
 
 
 # ---- Per-customer computation ---------------------------------------------------
-def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp) -> dict:
-    """VAR lane + cadence + raw volume/timing facts for one customer's (windowed) lifts."""
+def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
+                   light: bool = False) -> dict:
+    """VAR lane + cadence + raw volume/timing facts for one customer's (windowed) lifts.
+
+    ``light=True`` skips the expensive diagnostics layer — used by the point-in-time VAR-trend
+    re-fits where only the headline score is needed.
+    """
     cl = cl.sort_values("lift_datetime")
     dts = pd.to_datetime(cl["lift_datetime"])
     vols = cl["net_gallons"].to_numpy(dtype=float)
@@ -521,7 +533,7 @@ def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp) ->
     periods = pd.DataFrame({"period_start": span.index, "actual": span.to_numpy()})
     n_weeks = len(periods) if grain == "weekly" else len(periods) * 4
 
-    lane = _lane(periods, cfg, grain) if len(periods) >= 2 else {
+    lane = _lane(periods, cfg, grain, with_diagnostics=not light) if len(periods) >= 2 else {
         "base_level": float(np.median(vols)) if n else 0.0, "sigma": 0.0, "in_band_rate": None,
         "tightness": None, "excursion_penalty": None, "score": None, "method": "insufficient",
         "n_periods": len(periods), "series": []}
@@ -559,6 +571,285 @@ def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp) ->
     }
 
 
+# ---- Part 1c: VAR as a FORECAST — forward projection from the lane ---------------
+# The lane describes past behavior; this turns it into a forward expectation. Expected volume
+# over the next H days = base_per_period · (H / period_days); the confidence band widens with the
+# lane width (independent-period √-aggregation), so a tight lane (high VAR) projects narrow and
+# a wide lane (low VAR) projects wide. The VAR score itself is untouched.
+def _forward_projection(core: dict, cfg: ScoringConfig) -> dict:
+    lane = core["lane"]
+    grain = core["grain"]
+    series = lane.get("series") or []
+    sigma = lane.get("sigma") or 0.0
+    cad = core.get("base_cadence_days")
+    period_days = 30.44 if grain == "monthly" else 7.0
+    # Project from the trailing RUN-RATE (their normal pace) rather than the seasonal endpoint:
+    # `fitted[-1]` collapses to ~0 for sparse/erratic accounts whose recent periods are empty,
+    # which would (wrongly) drop them from the forecast. The run-rate is robust and ≥0 for anyone
+    # who buys, so erratic customers still get a (wide-banded) forward number.
+    actuals = np.array([p["actual"] for p in series], dtype=float)
+    cycle = 52 if grain != "monthly" else 12
+    recent = actuals[-cycle:] if len(actuals) > cycle else actuals
+    base = float(np.mean(recent)) if len(recent) else 0.0
+    if core["var_status"] != "ok" or base <= 0 or not series:
+        return {"available": False, "grain": grain,
+                "reason": (f"Need a fitted lane (≥{cfg.var_min_lifts} lifts over "
+                           f"≥{cfg.var_min_weeks} weeks) to project forward."),
+                "horizons": [], "series": []}
+
+    z = cfg.forecast_band_z
+    horizons = []
+    for h in cfg.forecast_horizons:
+        k = float(h) / period_days
+        expected = base * k
+        sigma_h = sigma * math.sqrt(k)
+        horizons.append({
+            "days": int(h), "expected": round(expected, 0),
+            "lo": round(max(0.0, expected - z * sigma_h), 0), "hi": round(expected + z * sigma_h, 0),
+            "expected_orders": (round(float(h) / cad) if cad and cad > 0 else None),
+        })
+
+    # dotted forward continuation of the lane (flat at base, same ±1σ / ±2σ bands)
+    if cfg.base_range_mode == "percent":
+        bhalf = cfg.base_range_pct * abs(base)
+        vhalf = (cfg.variability_sigma_k / max(cfg.base_range_sigma_k, 1e-9)) * bhalf
+    else:
+        bhalf, vhalf = cfg.base_range_sigma_k * sigma, cfg.variability_sigma_k * sigma
+    step = pd.offsets.MonthBegin(1) if grain == "monthly" else pd.Timedelta(days=7)
+    n_fwd = max(1, math.ceil(cfg.forecast_max_horizon_days / period_days))
+    cur = pd.Timestamp(lane["series"][-1]["period_start"])
+    series = []
+    for _ in range(n_fwd):
+        cur = cur + step
+        series.append({
+            "period_start": str(pd.Timestamp(cur).date()), "base": round(base, 1),
+            "base_lo": round(max(0.0, base - bhalf), 1), "base_hi": round(base + bhalf, 1),
+            "var_lo": round(max(0.0, base - vhalf), 1), "var_hi": round(base + vhalf, 1),
+        })
+
+    h30 = next((h for h in horizons if h["days"] == 30), horizons[len(horizons) // 2])
+    per = "month" if grain == "monthly" else "week"
+    plain = (f"Expect about {_fmt_gal(h30['expected'])} gal over the next {h30['days']} days "
+             f"(likely {_fmt_gal(h30['lo'])}–{_fmt_gal(h30['hi'])})")
+    if h30.get("expected_orders"):
+        plain += f" — roughly {h30['expected_orders']} order(s)"
+    plain += f", if they hold their pattern of ~{_fmt_gal(base)} gal/{per}."
+    return {"available": True, "grain": grain, "period_days": round(period_days, 2),
+            "base_per_period": round(base, 1), "sigma_per_period": round(sigma, 1),
+            "band_z": z, "horizons": horizons, "series": series, "plain": plain}
+
+
+# ---- Part 1d: excursion explanation (lane breaks + weather pattern) --------------
+# When an actual lift lands outside the variability range, tag it (spike / shortfall / no-show)
+# and attach the weather that period. A pattern across the breaks separates a predictable-looking-
+# erratic account (cold-snap buyer) from a truly random one.
+def _excursion_pattern(breaks: list, cfg: ScoringConfig) -> dict:
+    n = len(breaks)
+    if n == 0:
+        return {"type": "none", "n_breaks": 0,
+                "note": "No lane breaks in this window — they've stayed inside their normal range."}
+    cold = sum(1 for b in breaks if b["cold_snap"])
+    hot = sum(1 for b in breaks if b["hot_spell"])
+    if n < cfg.excursion_min_breaks:
+        return {"type": "too_few", "n_breaks": n, "n_cold_snap": cold, "n_hot_spell": hot,
+                "note": f"Only {n} lane break(s) so far — not enough to read a weather pattern."}
+    if cold / n >= cfg.excursion_pattern_share:
+        spikes = sum(1 for b in breaks if b["cold_snap"] and b["kind"] == "spike")
+        extra = " (mostly buying spikes)" if spikes >= max(1, cold // 2) else ""
+        return {"type": "cold_snap", "n_breaks": n, "n_cold_snap": cold, "n_hot_spell": hot,
+                "note": f"{cold} of {n} lane breaks landed on cold-snap weeks{extra} — "
+                        "looks weather-driven, not random."}
+    if hot / n >= cfg.excursion_pattern_share:
+        return {"type": "hot_spell", "n_breaks": n, "n_cold_snap": cold, "n_hot_spell": hot,
+                "note": f"{hot} of {n} lane breaks landed on hot spells — looks weather-driven, not random."}
+    return {"type": "random", "n_breaks": n, "n_cold_snap": cold, "n_hot_spell": hot,
+            "note": (f"{n} lane breaks with no clear weather tie ({cold} on cold snaps, "
+                     f"{hot} on hot spells) — looks like genuine noise, not weather.")}
+
+
+def _excursions(core: dict, terminal: str | None, con, cfg: ScoringConfig, live: bool = False) -> dict:
+    """Lane breaks + weather pattern. ``live=False`` (the bulk path) uses the free seasonal proxy
+    for speed; the per-customer detail re-runs with ``live=True`` to auto-fetch real NOAA/ERA5
+    degree-days for just that terminal (cached thereafter)."""
+    lane = core["lane"]
+    series = lane.get("series") or []
+    if core["var_status"] != "ok" or not series:
+        return {"available": False, "n_breaks": 0, "breaks": [], "pattern": None, "weather_source": None}
+    starts = [p["period_start"] for p in series]
+    grain = core["grain"]
+    try:
+        wx = weather.period_series(con, terminal, starts, grain, allow_fetch=live)
+    except Exception:  # noqa: BLE001 — never let weather break scoring
+        wx = {}
+    hdds = [wx[s]["hdd"] for s in starts if wx.get(s) and wx[s].get("hdd") is not None]
+    cdds = [wx[s]["cdd"] for s in starts if wx.get(s) and wx[s].get("cdd") is not None]
+    hdd_thr = float(np.quantile(hdds, cfg.weather_snap_quantile)) if len(hdds) >= 4 else None
+    cdd_thr = float(np.quantile(cdds, cfg.weather_snap_quantile)) if len(cdds) >= 4 else None
+    base = lane.get("base_level") or 0.0
+
+    breaks = []
+    for p in series:
+        a, vlo, vhi = p["actual"], p["var_lo"], p["var_hi"]
+        if vlo <= a <= vhi:
+            continue
+        w = wx.get(p["period_start"]) or {}
+        hdd, cdd = w.get("hdd"), w.get("cdd")
+        kind = "spike" if a > vhi else ("no_show" if a <= 0 else "shortfall")
+        breaks.append({
+            "period_start": p["period_start"], "kind": kind,
+            "actual": round(float(a), 0), "expected": round(base, 0),
+            "delta_pct": (round((a - base) / base * 100, 0) if base else None),
+            "var_range": [round(float(vlo), 0), round(float(vhi), 0)],
+            "hdd": hdd, "cdd": cdd,
+            "cold_snap": bool(hdd is not None and hdd_thr is not None and hdd >= hdd_thr and hdd > 0),
+            "hot_spell": bool(cdd is not None and cdd_thr is not None and cdd >= cdd_thr and cdd > 0),
+            "weather_source": w.get("source"),
+        })
+    breaks.sort(key=lambda b: b["period_start"], reverse=True)
+    src = None
+    if wx:
+        src = "open-meteo" if any(v.get("source") == "open-meteo" for v in wx.values()) else "climatology"
+    return {"available": True, "n_breaks": len(breaks), "breaks": breaks,
+            "pattern": _excursion_pattern(breaks, cfg), "weather_source": src}
+
+
+def customer_excursions(con, customer: dict, cfg: ScoringConfig | None = None) -> dict:
+    """Recompute one customer's lane breaks with LIVE weather (the per-customer detail path).
+
+    Rebuilds the minimal lane context from a (cached) scored-customer record so the detail
+    endpoint can auto-fetch real degree-days for just that terminal without re-deriving scores.
+    """
+    cfg = cfg or DEFAULT_CONFIG
+    v = customer.get("var") or {}
+    pseudo = {"lane": {"series": customer.get("lane_series") or [], "base_level": v.get("base_level") or 0.0},
+              "var_status": v.get("status", "insufficient"), "grain": customer.get("grain", "weekly")}
+    terminal = customer.get("weather_terminal") or customer.get("home_terminal")
+    return _excursions(pseudo, terminal, con, cfg, live=True)
+
+
+# ---- Part 1e: VAR trend over time (lane tightening vs widening) ------------------
+# Re-fit the (cheap, diagnostics-free) lane at an earlier as-of and compare the VAR score:
+# is the lane getting tighter (more reliable) or wider (a developing problem)?
+def _trend_comp(now_s, now_g, prior_s, prior_g, label: str, cfg: ScoringConfig) -> dict:
+    if now_s is None or prior_s is None:
+        return {"direction": "insufficient", "delta": None, "score_now": now_s, "score_prior": prior_s,
+                "grade_now": now_g, "grade_prior": prior_g,
+                "note": f"Not enough history to compare this {label} vs the prior one."}
+    delta = round(now_s - prior_s, 1)
+    direction = ("tightening" if delta >= cfg.var_trend_move_band
+                 else "widening" if delta <= -cfg.var_trend_move_band else "steady")
+    verb = {"tightening": "tightening — more reliable",
+            "widening": "widening — becoming harder to plan",
+            "steady": "holding steady"}[direction]
+    gp = f" ({prior_g}→{now_g})" if (prior_g and now_g and prior_g != now_g) else ""
+    return {"direction": direction, "delta": delta, "score_now": now_s, "score_prior": prior_s,
+            "grade_now": now_g, "grade_prior": prior_g,
+            "note": f"Lane {verb}: VAR {round(prior_s)}→{round(now_s)}{gp} over the last {label}."}
+
+
+def _var_trend(full_cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp) -> dict:
+    if as_of is None or not len(full_cl):
+        return {"available": False, "comparisons": {}}
+    look = pd.Timedelta(days=cfg.var_trend_lookback_days)
+
+    def score_at(point):
+        sub = full_cl[(full_cl["lift_datetime"] <= point) & (full_cl["lift_datetime"] >= point - look)]
+        if len(sub) < cfg.var_min_lifts:
+            return None, None
+        c = _customer_core(sub, cfg, point, light=True)
+        return c["var_score"], c["var_grade"]
+
+    now_s, now_g = score_at(as_of)
+    out = {"available": now_s is not None, "score_now": now_s, "grade_now": now_g,
+           "lookback_days": cfg.var_trend_lookback_days, "comparisons": {}}
+    for label, shift in (("month", cfg.var_trend_month_days), ("quarter", cfg.var_trend_quarter_days)):
+        prior_s, prior_g = score_at(as_of - pd.Timedelta(days=shift))
+        out["comparisons"][label] = _trend_comp(now_s, now_g, prior_s, prior_g, label, cfg)
+    return out
+
+
+# ---- Book-level bottom-up forecast (sum the per-customer lanes) ------------------
+def _filter_share(c: dict, terminal: str | None, product: str | None) -> float:
+    """A customer's share of volume matching the (terminal, product) filter (1.0 if no filter)."""
+    if not terminal and not product:
+        return 1.0
+    tp = ((c.get("facts") or {}).get("tp_share")) or {}
+    s = 0.0
+    for key, val in tp.items():
+        t, _, p = key.partition("|")
+        if terminal and t != terminal:
+            continue
+        if product and p != product:
+            continue
+        s += float(val)
+    return s
+
+
+def aggregate_book_forecast(customers: list, cfg: ScoringConfig,
+                            terminal: str | None = None, product: str | None = None) -> dict:
+    """Sum every customer's forward projection into a total expected-demand band for the book.
+
+    Optionally filtered by terminal / product (via each customer's volume mix). Variances add
+    independently → band = z·√Σσ². Also returns the A/B-vs-C/D volume split (the forecastability
+    headline) with its quarter-over-quarter trend.
+    """
+    horizons = [int(h) for h in cfg.forecast_horizons]
+    agg = {h: {"expected": 0.0, "var": 0.0} for h in horizons}
+    ref_h = 30 if 30 in agg else horizons[len(horizons) // 2]
+    grade_vol = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+    prior_vol = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+    n = 0
+    for c in customers:
+        fc = c.get("forecast") or {}
+        if not fc.get("available"):
+            continue
+        share = _filter_share(c, terminal, product)
+        if share <= 0:
+            continue
+        n += 1
+        hmap = {h["days"]: h for h in fc.get("horizons", [])}
+        for h in horizons:
+            row = hmap.get(h)
+            if not row:
+                continue
+            exp = (row["expected"] or 0.0) * share
+            sig_h = ((row["hi"] - row["expected"]) / cfg.forecast_band_z) if cfg.forecast_band_z else 0.0
+            agg[h]["expected"] += exp
+            agg[h]["var"] += (sig_h * share) ** 2
+        ref = hmap.get(ref_h)
+        ref_exp = (ref["expected"] or 0.0) * share if ref else 0.0
+        g = (c.get("var") or {}).get("grade")
+        if g in grade_vol:
+            grade_vol[g] += ref_exp
+        pg = (((c.get("var_trend") or {}).get("comparisons") or {}).get("quarter") or {}).get("grade_prior")
+        if pg in prior_vol:
+            prior_vol[pg] += ref_exp
+
+    out_h = []
+    for h in horizons:
+        e = agg[h]["expected"]
+        band = cfg.forecast_band_z * math.sqrt(agg[h]["var"])
+        out_h.append({"days": h, "expected": round(e, 0),
+                      "lo": round(max(0.0, e - band), 0), "hi": round(e + band, 0)})
+
+    ab = grade_vol["A"] + grade_vol["B"]
+    cd = grade_vol["C"] + grade_vol["D"]
+    tot = ab + cd
+    pred_share = (ab / tot) if tot else None
+    prior_ab = prior_vol["A"] + prior_vol["B"]
+    prior_tot = prior_ab + prior_vol["C"] + prior_vol["D"]
+    prior_share = (prior_ab / prior_tot) if prior_tot else None
+    return {
+        "horizons": out_h, "ref_horizon_days": ref_h, "n_customers": n,
+        "grade_volume": {k: round(v, 0) for k, v in grade_vol.items()},
+        "predictable_volume": round(ab, 0), "erratic_volume": round(cd, 0),
+        "predictable_share": round(pred_share, 3) if pred_share is not None else None,
+        "predictable_share_prior": round(prior_share, 3) if prior_share is not None else None,
+        "predictable_share_delta": (round(pred_share - prior_share, 3)
+                                    if (pred_share is not None and prior_share is not None) else None),
+    }
+
+
 def _facts(cl: pd.DataFrame, core: dict, inv: pd.DataFrame, q: pd.DataFrame,
            cfg: ScoringConfig, data: dict) -> dict:
     """Part 2 — Layer-1 behavioral facts for one customer."""
@@ -577,6 +868,15 @@ def _facts(cl: pd.DataFrame, core: dict, inv: pd.DataFrame, q: pd.DataFrame,
     total = float(mix.sum()) or 1.0
     mix_share = {str(k): round(float(v) / total, 3) for k, v in mix.items()}
     hhi = float(sum((v / total) ** 2 for v in mix.values)) if len(mix) else 1.0
+
+    # joint terminal×product mix (powers the book-forecast terminal/product filters)
+    net_total = float(cl["net_gallons"].sum()) or 1.0
+    tcol = cl["terminal"].fillna("(unknown)") if "terminal" in cl else pd.Series("(unknown)", index=cl.index)
+    pcol = cl["product"].fillna("(unknown)") if "product" in cl else pd.Series("(unknown)", index=cl.index)
+    tp = cl.groupby([tcol, pcol])["net_gallons"].sum()
+    tp_share = {f"{t}|{p}": round(float(v) / net_total, 4) for (t, p), v in tp.items()}
+    term_share = {str(t): round(float(v) / net_total, 4)
+                  for t, v in cl.groupby(tcol)["net_gallons"].sum().items()}
 
     # margin facts
     margin_mean = margin_cv = None
@@ -631,6 +931,7 @@ def _facts(cl: pd.DataFrame, core: dict, inv: pd.DataFrame, q: pd.DataFrame,
         "gross_margin_per_gal_cv": round(margin_cv, 3) if margin_cv is not None else None,
         "days_since_last_order": core["days_since_last"],
         "product_mix": mix_share, "product_concentration_hhi": round(hhi, 3),
+        "tp_share": tp_share, "terminal_mix": term_share,
         "small_order_rate": round(small_order_rate, 3), "rush_rate": round(rush_rate, 3),
         "split_rate": round(split_rate, 3),
         "cancel_rate": round(cancel_rate, 3) if cancel_rate is not None else None,
@@ -866,6 +1167,7 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all") -
 
     inv_by_id = (data["invoices"].groupby("customer_id") if len(data["invoices"]) else None)
     q_by_id = (data["quotes"].groupby("customer_id") if len(data["quotes"]) else None)
+    full_by_id = lifts.groupby("customer_id")  # full history (for the window-independent VAR trend)
 
     # ---- pass 1: per-customer cores, facts, raw sub-score inputs ----
     rows = {}
@@ -878,8 +1180,17 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all") -
         facts = _facts(cl, core, inv, q, cfg, data)
         raw = _raw_subscore_inputs(cl, core, q, data["market"], cfg, data)
         sufficient = core["n_lifts"] >= cfg.suff_min_lifts and core["n_weeks"] >= (cfg.suff_min_days / 7.0)
+        # VAR as a forecast: forward projection, lane-break (excursion) weather, and VAR-over-time trend
+        term = home_by_id.get(cid)
+        if not term and "terminal" in cl and cl["terminal"].notna().any():
+            term = cl["terminal"].mode().iloc[0]
+        forward = _forward_projection(core, cfg)
+        excursions = _excursions(core, term, con, cfg)
+        full_cl = full_by_id.get_group(cid) if cid in full_by_id.groups else cl
+        var_trend = _var_trend(full_cl, cfg, as_of)
         rows[cid] = {"core": core, "facts": facts, "raw": raw, "inv": inv, "q": q,
-                     "data_sufficient": sufficient}
+                     "data_sufficient": sufficient, "forward": forward,
+                     "excursions": excursions, "var_trend": var_trend, "terminal": term}
 
     if not rows:
         return {"window": window, "as_of": str(as_of.date()), "availability": avail,
@@ -1098,6 +1409,11 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all") -
             "monthly_volume": facts["monthly_volume"], "trend_pct": core["trend_pct"],
             "recency_gap": round((core["days_since_last"] or 0.0) / cad, 2),
             "var": _var_block(core, facts, name_by_id.get(cid, cid), cfg),
+            "var_trend": r["var_trend"],
+            "forecast": {k: v for k, v in r["forward"].items() if k != "series"},
+            "forecast_series": r["forward"].get("series", []),
+            "excursions": r["excursions"],
+            "weather_terminal": r["terminal"],
             "lane_series": core["lane"]["series"],
             "base_value": {"score": base_value[cid], "grade": grade(base_value[cid], cfg),
                            "egp": round(bv["egp"], 0), "friction_cost": round(bv["friction"], 0),
@@ -1271,7 +1587,8 @@ def recompute_and_persist(con, cfg: ScoringConfig | None = None) -> dict:
                  c["quadrant"]["profitability"], c["quadrant"]["quadrant"], c["data_sufficient"],
                  c["total_net_gallons"], c["n_lifts"],
                  json.dumps({"facts": c["facts"], "subscores": c["subscores"],
-                             "base_value": c["base_value"], "var": c["var"], "archetype": c["archetype"]})])
+                             "base_value": c["base_value"], "var": c["var"], "archetype": c["archetype"],
+                             "forecast": c["forecast"], "var_trend": c["var_trend"]})])
             if window == "all":
                 for p in c["lane_series"]:
                     con.execute("INSERT INTO customer_lane VALUES (?,?,?,?,?,?,?,?,?,?)",
