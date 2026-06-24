@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import type { ScoresResponse, ScoreCustomer, CustomerScoreResponse, Summary } from "../api/types";
+import type { ScoresResponse, ScoreCustomer, CustomerScoreResponse, Summary, CreditRow } from "../api/types";
 import Panel from "../components/Panel";
 import BaseRangeChart from "../components/scores/BaseRangeChart";
-import { ScorePill, ArchetypeTag, TrendArrow } from "../lib/scoreui";
+import { QUAD_COLOR } from "../components/credit/AccountRiskScatter";
+import { ScorePill, ArchetypeTag, TrendArrow, gradeTone } from "../lib/scoreui";
 
 const WINDOW_LABEL: Record<string, string> = { "30": "30d", "90": "90d", "365": "365d", all: "All-time" };
 
 type SortKey =
   | "name" | "var" | "base_value" | "total_net_gallons" | "trend_pct"
-  | "margin" | "account_value" | "recency_gap" | "churn";
+  | "margin" | "account_value" | "recency_gap" | "churn" | "credit";
 
 function factNum(c: ScoreCustomer, key: string): number | null {
   const v = (c.facts as Record<string, unknown> | undefined)?.[key];
@@ -24,7 +25,7 @@ function dominantProduct(c: ScoreCustomer): string | null {
   return entries.sort((a, b) => b[1] - a[1])[0][0];
 }
 
-function sortValue(c: ScoreCustomer, key: SortKey): number | string {
+function sortValue(c: ScoreCustomer, key: SortKey, credit?: CreditRow): number | string {
   switch (key) {
     case "name": return c.name.toLowerCase();
     case "var": return c.var.score ?? -1;
@@ -35,6 +36,7 @@ function sortValue(c: ScoreCustomer, key: SortKey): number | string {
     case "account_value": return c.account_value ?? -1;
     case "recency_gap": return c.recency_gap;
     case "churn": return c.subscores.churn_risk?.value ?? -1;
+    case "credit": return credit?.credit_score ?? -1;
   }
 }
 
@@ -111,6 +113,8 @@ function Th({ label, sortKey, sort, dir, onSort, right }: {
 export default function BookOverview({ summary, navigate }: { summary: Summary; navigate: (to: string) => void }) {
   const [window, setWindow] = useState("all");
   const [data, setData] = useState<ScoresResponse | null>(null);
+  const [credit, setCredit] = useState<Record<string, CreditRow>>({});
+  const [creditOnP9, setCreditOnP9] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [sort, setSort] = useState<SortKey>("base_value");
@@ -126,6 +130,15 @@ export default function BookOverview({ summary, navigate }: { summary: Summary; 
       setData(d);
       setSelected((cur) => cur ?? d.customers[0]?.customer_id ?? null);
     }).catch((e) => setError(String(e)));
+    api.credit.get(window).then((c) => {
+      if (c.available && c.customers) {
+        setCredit(Object.fromEntries(c.customers.map((r) => [r.customer_id, r])));
+        setCreditOnP9(true);
+      } else {
+        setCredit({});
+        setCreditOnP9(false);
+      }
+    }).catch(() => { setCredit({}); setCreditOnP9(false); });
   }, [window]);
   useEffect(reload, [reload]);
 
@@ -157,12 +170,12 @@ export default function BookOverview({ summary, navigate }: { summary: Summary; 
       return true;
     });
     rs = [...rs].sort((x, y) => {
-      const a = sortValue(x, sort), b = sortValue(y, sort);
+      const a = sortValue(x, sort, credit[x.customer_id]), b = sortValue(y, sort, credit[y.customer_id]);
       if (typeof a === "string" || typeof b === "string") return String(a).localeCompare(String(b)) * dir;
       return (a - b) * dir;
     });
     return rs;
-  }, [data, fTerminal, fProduct, fGrade, fArchetype, sort, dir]);
+  }, [data, credit, fTerminal, fProduct, fGrade, fArchetype, sort, dir]);
 
   if (!summary.connected) {
     return <div className="rounded-xl border border-dashed border-slate-300 bg-white p-10 text-center text-slate-500">Load a book in Data Studio to see the customer book.</div>;
@@ -215,14 +228,15 @@ export default function BookOverview({ summary, navigate }: { summary: Summary; 
                 <Th label="Acct val" sortKey="account_value" sort={sort} dir={dir} onSort={onSort} right />
                 <Th label="Recency" sortKey="recency_gap" sort={sort} dir={dir} onSort={onSort} right />
                 <Th label="Churn" sortKey="churn" sort={sort} dir={dir} onSort={onSort} right />
-                <th className="pb-2 text-right" title="Credit & quadrant — full credit risk lands in P9">Credit / Quadrant</th>
+                <Th label="Credit" sortKey="credit" sort={sort} dir={dir} onSort={onSort} right />
+                <th className="pb-2 text-right" title="Account-risk quadrant: VAR (supply) × credit (financial)">Risk</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((c) => {
                 const margin = factNum(c, "gross_margin_per_gal_mean");
-                const util = factNum(c, "credit_utilization");
                 const churn = c.subscores.churn_risk?.value ?? null;
+                const cr = credit[c.customer_id];
                 return (
                   <tr key={c.customer_id} onClick={() => setSelected(c.customer_id)}
                     className={`cursor-pointer border-t border-slate-100 hover:bg-slate-50 ${selected === c.customer_id ? "bg-indigo-50" : ""}`}>
@@ -239,9 +253,21 @@ export default function BookOverview({ summary, navigate }: { summary: Summary; 
                     <td className="py-1.5 text-right text-slate-600">{c.account_value ?? "—"}</td>
                     <td className={`py-1.5 text-right ${c.recency_gap > 1.5 ? "text-rose-600" : "text-slate-600"}`}>{c.recency_gap}×</td>
                     <td className="py-1.5 text-right">{churn != null && churn >= 50 ? <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700">{Math.round(churn)}</span> : <span className="text-slate-400">{churn != null ? Math.round(churn) : "—"}</span>}</td>
+                    <td className="py-1.5 text-right">
+                      {creditOnP9 && cr?.credit_score != null ? (
+                        <span className="inline-flex items-center gap-1" title={cr.explanation}>
+                          <span className="font-semibold text-slate-800">{Math.round(cr.credit_score)}</span>
+                          {cr.credit_grade && <span className={`rounded px-1 py-0.5 text-[10px] font-semibold ${gradeTone(cr.credit_grade)}`}>{cr.credit_grade}</span>}
+                        </span>
+                      ) : <span className="text-slate-300" title={creditOn ? "credit scoring computing…" : "needs the AR ledger (P9)"}>{creditOn ? "—" : "P9"}</span>}
+                    </td>
                     <td className="py-1.5 text-right text-[10px]">
-                      <span className={creditOn ? "text-slate-600" : "text-slate-300"} title={creditOn ? "credit utilization" : "credit risk — P9"}>{creditOn && util != null ? `${Math.round(util * 100)}%` : "P9"}</span>
-                      <span className="ml-1 text-slate-400">{c.quadrant.quadrant ? `· ${c.quadrant.quadrant.split(" ")[0]}` : ""}</span>
+                      {cr?.quadrant ? (
+                        <span className="inline-flex items-center gap-1 font-medium" style={{ color: QUAD_COLOR[cr.quadrant] }}>
+                          <span className="h-1.5 w-1.5 rounded-full" style={{ background: QUAD_COLOR[cr.quadrant] }} />
+                          {cr.quadrant.replace(" – ", "/")}
+                        </span>
+                      ) : <span className="text-slate-300">—</span>}
                     </td>
                   </tr>
                 );

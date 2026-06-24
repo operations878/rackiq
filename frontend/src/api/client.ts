@@ -24,6 +24,8 @@ import type {
   CustomerScoreResponse,
   BacktestResponse,
   Reconciliation,
+  CreditResponse,
+  CreditRow,
   RegimeConfig,
   Regime,
   DailyResponse,
@@ -157,6 +159,20 @@ export const api = {
     recompute: (overrides?: Record<string, number | string>) =>
       postJSON<{ ok: boolean; computed_at: string; windows: Record<string, number> }>(
         "/scores/recompute", { overrides: overrides ?? null }),
+  },
+
+  // ---- Credit & account risk (P9) ----
+  credit: {
+    get: (window = "all") => getJSON<CreditResponse>(`/credit?window=${window}`),
+    customer: (id: string, window = "all") =>
+      getJSON<{ window: string; as_of: string | null; customer: CreditRow & { credit: Record<string, unknown> } }>(
+        `/credit/customer/${encodeURIComponent(id)}?window=${window}`),
+    config: () =>
+      getJSON<{ config: Record<string, number | string>; windows: string[]; quadrant_order: string[] }>(
+        "/credit/config"),
+    recompute: (overrides?: Record<string, number | string>) =>
+      postJSON<{ ok: boolean; computed_at: string; windows: Record<string, number> }>(
+        "/credit/recompute", { overrides: overrides ?? null }),
   },
 
   // ---- Reconciliation & loss control ----

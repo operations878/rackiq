@@ -579,6 +579,103 @@ export interface BacktestResponse {
   summary: Record<string, number>;
 }
 
+// ---- Credit & Account Risk (P9) -------------------------------------------------
+export interface CreditRow {
+  customer_id: string;
+  name: string;
+  home_terminal: string | null;
+  credit_score: number | null;
+  credit_grade: string | null;
+  quadrant: string | null;
+  var_score: number | null;
+  var_grade: string | null;
+  dso_days: number | null;
+  avg_days_late: number | null;
+  pct_late: number | null;
+  utilization: number | null;
+  open_exposure: number | null;
+  trend_days_late: number | null;
+  total_net_gallons: number | null;
+  archetype: string | null;
+  explanation: string;
+}
+
+export interface ConversionTarget {
+  customer_id: string;
+  name: string;
+  home_terminal: string | null;
+  conversion_score: number;
+  var_score: number;
+  credit_score: number;
+  credit_grade: string | null;
+  volume_pct: number;
+  price_sensitivity: number | null;
+  monthly_volume: number | null;
+  archetype: string | null;
+  rationale: string;
+}
+
+export interface GrowMe {
+  customer_id: string;
+  name: string;
+  home_terminal: string | null;
+  grow_score: number;
+  var_score: number;
+  credit_score: number;
+  credit_grade: string | null;
+  trend_pct: number;
+  monthly_volume: number | null;
+  archetype: string | null;
+  rationale: string;
+}
+
+export interface RevenueAtRisk {
+  customer_id: string;
+  name: string;
+  home_terminal: string | null;
+  volume_at_risk: number;
+  trend_pct: number;
+  base_value: number | null;
+  var_score: number | null;
+  credit_score: number | null;
+  credit_grade: string | null;
+  churn_risk: number | null;
+  archetype: string | null;
+  monthly_volume: number | null;
+  rationale: string;
+}
+
+export interface CreditNetwork {
+  n_customers: number;
+  open_exposure_total: number;
+  median_credit_score: number | null;
+  n_danger: number;
+  danger_open_exposure: number;
+  n_over_limit: number;
+  var_cut: number;
+  credit_cut: number;
+}
+
+export interface CreditResponse {
+  available: boolean;
+  window: string;
+  as_of?: string | null;
+  windows?: string[];
+  n_customers?: number;
+  axis_cuts?: { var: number; credit: number };
+  quadrant_order?: string[];
+  quadrant_counts?: Record<string, number>;
+  network?: CreditNetwork;
+  elasticity_available?: boolean;
+  customers?: CreditRow[];
+  conversion_targets?: ConversionTarget[];
+  grow_me?: GrowMe[];
+  revenue_at_risk?: RevenueAtRisk[];
+  // present only when locked
+  missing_fields?: string[];
+  reason?: string;
+}
+
 // ---- Reconciliation & loss control (P8) -----------------------------------------
 export interface ReconMechanism {
   temperature_gal: number | null;

@@ -11,6 +11,7 @@ import Reconciliation from "./pages/Reconciliation";
 import DailyOps from "./pages/DailyOps";
 import DemandCockpit from "./pages/DemandCockpit";
 import BookOverview from "./pages/BookOverview";
+import AccountRisk from "./pages/AccountRisk";
 import Radar from "./pages/Radar";
 import Scorecards from "./pages/Scorecards";
 import Playbook from "./pages/Playbook";
@@ -104,6 +105,7 @@ export default function App() {
       title: "Analyze",
       items: [
         { key: "overview", label: "Book Overview", icon: "☰", match: (b) => b === "overview" },
+        { key: "risk", label: "Account Risk", icon: "⚑", match: (b) => b === "risk" },
         { key: "radar", label: "Early-Warning Radar", icon: "◔", match: (b) => b === "radar" },
         { key: "scores", label: "Scores & Quadrant", icon: "✦", match: (b) => b === "scores" },
         { key: "reconciliation", label: "Reconciliation", icon: "⚖", match: (b) => b === "reconciliation" },
@@ -155,6 +157,7 @@ export default function App() {
           {(base === "scorecards" || base === "scorecard") && <Scorecards summary={summary} customerId={scorecardId} />}
           {base === "playbook" && <Playbook summary={summary} />}
           {base === "overview" && <BookOverview summary={summary} navigate={navigate} />}
+          {base === "risk" && <AccountRisk summary={summary} navigate={navigate} />}
           {base === "radar" && <Radar summary={summary} />}
           {base === "scores" && <Scores summary={summary} />}
           {base === "reconciliation" && <Reconciliation summary={summary} navigate={navigate} />}

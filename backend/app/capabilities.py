@@ -73,6 +73,11 @@ FEATURES: list[Feature] = [
     Feature("credit_risk_late_payers", "Credit Risk & Late Payers",
             "Flag chronically late payers and credit exposure.",
             "Receivables", ("due_date", "paid_date"), ("credit_limit", "invoice_amount")),
+    Feature("credit_account_risk", "Credit & Account Risk (P9)",
+            "Per-customer credit risk score (DSO, days late, % late, open exposure vs limit, "
+            "trend) percentile-ranked like VAR; the VAR × credit account-risk map (Anchor / "
+            "Watch / Danger); and conversion targeting (spot→ratable, grow-me, revenue-at-risk).",
+            "Receivables", ("invoice_date", "due_date", "paid_date", "invoice_amount", "credit_limit")),
     # --- Inventory ---
     Feature("inventory_days_of_supply", "Inventory Days of Supply",
             "Days of cover from book inventory above heel vs recent draw.",

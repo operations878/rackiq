@@ -103,7 +103,7 @@ gain/loss ← `physical_inventory` vs `inventory_snapshot`; net position ← `co
 
 ## Capability matrix
 
-`backend/app/capabilities.py` declares **21 features** (18 analysis + 3 *feed*). Each feature
+`backend/app/capabilities.py` declares **22 features** (19 analysis + 3 *feed*). Each feature
 lists the canonical fields it `requires` (and optional fields that `enhance` it). At runtime:
 
 - A field is **present** if it has ≥1 non-null value in its primary table.
@@ -123,7 +123,7 @@ Served at **`GET /api/capabilities`**:
   "fields":   { "unit_cost": {"present":true,"nonnull":6541,"applicable":6541,"coverage":1.0}, ... },
   "features": [ { "key":"margin_analysis","enabled":true,"missing_fields":[],
                   "enhanced_by":["product","terminal"],"coverage":1.0, ... } ],
-  "summary":  { "enabled": 21, "total": 21 }
+  "summary":  { "enabled": 22, "total": 22 }
 }
 ```
 
@@ -131,7 +131,7 @@ Served at **`GET /api/capabilities`**:
 |---|---|
 | **Demand** | demand_ranking (customer_id, net_gallons) · lift_cadence (customer_id, lift_datetime) · archetype_detection (core 3) · demand_forecast (core 3) · product_mix (net_gallons, product) · terminal_breakdown (net_gallons, terminal) |
 | **Margin** | net_vs_gross (net_gallons, gross_gallons) · margin_analysis (unit_price, unit_cost, net_gallons) · revenue (net_gallons, unit_price) |
-| **Receivables** | ar_aging (invoice_date, due_date, invoice_amount) · dso (invoice_date, paid_date, invoice_amount) · credit_risk_late_payers (due_date, paid_date) |
+| **Receivables** | ar_aging (invoice_date, due_date, invoice_amount) · dso (invoice_date, paid_date, invoice_amount) · credit_risk_late_payers (due_date, paid_date) · **credit_account_risk** (invoice_date, due_date, paid_date, invoice_amount, credit_limit — the P9 credit-score / account-risk-map / conversion-targeting module) |
 | **Inventory** | inventory_days_of_supply (inventory_snapshot, tank_capacity, min_heel) · gain_loss_reconciliation (physical_inventory, inventory_snapshot) · tank_utilization (inventory_snapshot, tank_capacity) · **reconciliation** (physical_inventory, receipt_source — the P8 loss-control module; enhanced by bol_compartments) · **receipt_detail** *(feed: receipt_source; target 20 receipts)* |
 | **Market** | basis_tracking (market_price, nyh_basis) · position_committed (committed_buys, committed_sells) |
 | **Pricing** | **pricing_sandbox** *(feed: rack_benchmark; target 30 days)* · **quote_elasticity** *(feed: quoted_price + outcome; target 50 quotes)* |
@@ -145,12 +145,12 @@ from the **same code** on different data:
 |---|---|---|
 | `core` | only the 3 required fields (no inventory/invoices/market/quotes/receipts) | **4** |
 | `lite` | core + `terminal` + `product` on lifts | **6** |
-| `full` | every canonical field (incl. rack_benchmark, quotes, receipts, bol_compartments) | **21** |
+| `full` | every canonical field (incl. rack_benchmark, quotes, receipts, bol_compartments) | **22** |
 
 ```
-rackiq-generate --profile core   #  capabilities enabled: 4/21
-rackiq-generate --profile lite   #  capabilities enabled: 6/21
-rackiq-generate --profile full   #  capabilities enabled: 21/21
+rackiq-generate --profile core   #  capabilities enabled: 4/22
+rackiq-generate --profile lite   #  capabilities enabled: 6/22
+rackiq-generate --profile full   #  capabilities enabled: 22/22
 ```
 
 (The 3 feed capabilities count toward "enabled" only once their history crosses the target;
@@ -396,6 +396,34 @@ computed over the shared connection with a data-signature cache (`api/reconcilia
   ranked (e.g. *"Tank 4 ULSD 0.18% vs 0.05% network avg ≈ $X/yr"*), with a **network recoverable**
   total (loss above routine shrink).
 
+## Credit & account risk (P9) — credit score · account-risk map · conversion targeting
+
+`backend/app/credit.py` (engine) + `credit_config.py` (**every weight/threshold/norm is a config
+parameter**) compute per-customer **financial** risk and pair it with the **VAR** (supply/variability)
+score from P3 to map the book on two axes. **Gated on the AR fields** (`invoice_date`, `due_date`,
+`paid_date`, `invoice_amount`, `credit_limit`) — a clear lock + "Feed me X" otherwise. Reads the
+**resolved** customer master (ids rewritten to master at commit). Live-computed over the shared
+connection with a data-signature cache (`api/credit.py`); `customer_credit` is a derived cache
+(created by `credit.ensure_tables`, NOT `init_db`) so it **survives** demo reload / reset.
+
+- **Part 1 — Credit risk score (0–100, higher = SAFER).** Per customer: **DSO** (avg collection
+  period on paid invoices), **average days late** and **% invoices late** (counting both paid-late
+  bills *and* currently-overdue open bills — open-but-not-yet-due bills get no verdict), **current
+  open exposure vs `credit_limit`** (utilization), and a **trend** (recent vs early days-late). These
+  become five normalized penalties → a raw *payment-safety* value; the headline credit score is the
+  **percentile rank of that safety across the active book**, exactly like the VAR sub-scores (for
+  cross-module consistency), with a grade A≥80/B/C/D and a `safety_absolute` reference.
+- **Part 2 — Account-risk map.** A 2×2 of **VAR (supply risk, x)** × **credit score (financial risk,
+  y)**, split at the book median of each axis: **Anchor** (steady + pays), **Watch – Supply** (pays
+  but erratic), **Watch – Credit** (steady but slow-pay), **Danger** (erratic + slow-pay). Every point
+  is clickable through to the customer scorecard.
+- **Part 3 — Conversion targeting.** Ranks **spot→ratable term** candidates by the target profile =
+  **high volume + erratic (low VAR) + price-elastic + acceptable credit** (a credit floor gates out
+  slow payers; already-steady accounts and tiny accounts are excluded), each with a one-line *"lock N
+  gal/mo on a term deal"* rationale. Also surfaces **Grow-me** (steady, growing, good credit) and
+  **Revenue-at-risk** (a good account fading — ranked by annualized volume at risk). Plus **network**
+  KPIs: total open exposure, median credit score, Danger count + Danger open exposure, over-limit count.
+
 ## API endpoints
 
 All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
@@ -424,6 +452,10 @@ service-level slider re-derives only the cheap action).
 | `GET /api/reconciliation?period=month` | the full loss-control payload: network totals + mechanism split, ranked worst-offender tanks (control chart series), net-recon by meter/terminal, receipt basis, loss-tracking series, meter-drift ranking (`available:false` + missing feeds when locked) |
 | `GET /api/reconciliation/config` | the reconciliation config (control limits, thresholds) + period grains |
 | `POST /api/reconciliation/recompute` | recompute with optional `{overrides, period}` (busts the cache) |
+| `GET /api/credit?window=all` | the **Credit & Account-Risk** payload: per-customer credit score (DSO/days-late/%late/exposure/trend), account-risk quadrant + VAR pairing, network KPIs, conversion targets, grow-me, revenue-at-risk (`available:false` + missing AR fields when locked) |
+| `GET /api/credit/customer/{id}?window=` | per-customer credit drill-down (the full score components + explanation) |
+| `GET /api/credit/config` | the credit config (every weight/threshold) + windows + quadrant order |
+| `POST /api/credit/recompute` | recompute all windows (+ optional `{overrides}`) and write `customer_credit` |
 | `GET /api/regime/config` | the regime axes + states + the full **V1 regime-multiplier matrix** + posture (the frontend mirrors this) |
 | `GET /api/daily?terminal=&inventory=&market=&capacity=&credit=&window=` | the **nine ranked panels** for one terminal under a regime (Blueprint C) |
 | `POST /api/daily/persist` | recompute every terminal under a regime and write the `daily_recommendations` table (§14) |
@@ -533,9 +565,16 @@ the Daily Operating Dashboard.
 **Analyze**
 - **Book Overview** (`pages/BookOverview.tsx`) — the sortable/filterable customer table (VAR, Base
   Value, archetypes, volume, trend arrow, margin & Account Value greyed when unavailable, recency
-  gap, churn flag, credit/quadrant — credit greyed until **P9**). Filter by terminal/product/grade/
+  gap, churn flag, and — **lit up in P9** — a **Credit** score (grade-toned, sortable) + the
+  **account-risk quadrant** (Anchor / Watch / Danger), both fetched from `/api/credit` and merged by
+  customer id (greyed "P9" only when the AR ledger is absent). Filter by terminal/product/grade/
   archetype. Row → drill-down with the **base-range chart**, in-band rate, base volume & cadence,
   recency, and an auto-generated **scouting note**.
+- **Account Risk** (`pages/AccountRisk.tsx`, route `risk`) — the P9 screen. Network credit KPIs
+  (open exposure, median credit, Danger count + Danger exposure, over-limit), the **account-risk map**
+  (`components/credit/AccountRiskScatter.tsx` — VAR × credit scatter, bubble = volume, quadrant-colored,
+  click → scorecard), the ranked **conversion-targeting** list (spot→ratable, each with a rationale),
+  and **Grow-me** + **Revenue-at-risk** lists. A clear lock + "Feed me &lt;field&gt;" when gated.
 - **Early-Warning Radar** (`pages/Radar.tsx`) — a ranked worklist: **Overdue** (recency > 1.5×
   cadence), **Fading** (volume trend ≤ −12%), **Erratic** (VAR dropped ≥ 8 vs all-time, 90-day vs
   all-time). Shows why each is flagged, sorts by **volume-at-risk**, and **exports CSV**.
@@ -621,6 +660,9 @@ backend/
     regime_config.py        # ★ the V1 regime-multiplier matrix (axes/states/multipliers — every value a param)
     playbook.py             # ★ Sales Playbook source (archetype plays + regime cheat-sheets + routine) + md render
     demand.py               # ★ Demand Cockpit: per-customer HW/seasonal-naive forecast → terminal P10/P50/P90 band, days-of-cover/burn-down, order-up-to action, persisted distributions (DemandConfig)
+    credit.py               # ★ P9 Credit & Account-Risk engine: credit score (DSO/days-late/%late/exposure/trend),
+                            #   VAR × credit account-risk map, conversion targeting (+grow-me / revenue-at-risk), persisted cache
+    credit_config.py        # ★ CreditConfig — credit-score weights / norms / conversion profile / quadrant split as parameters
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping, inspect (+profiling), validate, coerce
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -630,14 +672,15 @@ backend/
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
     cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook
     config.py               # settings (db path, CORS, host/port)
-    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand routers)
+    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + credit routers)
     api/{routes,queries}.py # read endpoints + SQL
     api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
     api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / config / recompute
     api/reconciliation.py   # /api/reconciliation/* loss-control payload / config / recompute (cached)
     api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
     api/demand.py           # /api/demand/cockpit / persist / forecasts / config (the Demand Cockpit)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_early_feeds + test_scoring + test_regime + test_reconciliation + test_demand
+    api/credit.py           # /api/credit/* account-risk payload / customer drill-down / config / recompute (cached)
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_early_feeds + test_scoring + test_regime + test_reconciliation + test_demand + test_credit
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -648,9 +691,10 @@ frontend/
     App.tsx, main.tsx, index.css       # App.tsx = the left-nav dashboard shell (Operate/Analyze/Data)
     lib/{useHashRoute,format}.ts, lib/scoreui.tsx
     api/{client,types}.ts
-    pages/{DailyOps,DemandCockpit,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx
+    pages/{DailyOps,DemandCockpit,Scorecards,Playbook,BookOverview,AccountRisk,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
     components/scores/{BaseRangeChart,QuadrantScatter}.tsx
+    components/credit/{AccountRiskScatter}.tsx
     components/demand/{DemandForecastChart,BurnDownChart}.tsx
     components/reconciliation/{MechanismBar,ControlChart,LossTrendChart}.tsx
     components/studio/{Stepper,UploadStep,MappingStep,CleanStep,ProfilingScorecard,CustomerMasterPanel,FixOptions,ValidateStep,DoneStep,QuickFeeds}.tsx
@@ -664,6 +708,14 @@ CLAUDE.md
   sub-scores (margin, elasticity, EVR, market, quotes, credit) report `available:false` on a thin
   book and the UI greys them out. `customer_scores`/`customer_lane` are *derived caches* recomputed
   from canonical data (live-computed on read with a data-signature cache; persisted by `recompute`).
+- **Credit & account risk (P9) pairs financial risk with the P3 VAR**: the credit engine reads the
+  AR ledger *and* calls `scoring.compute_scores` for the same window, so the account-risk map's two
+  axes (VAR x, credit y) come from one as-of. The credit score is the **percentile rank of payment
+  safety** across the book (higher = safer), like the VAR sub-scores. Lateness counts paid-late bills
+  **and** currently-overdue open bills (open-not-yet-due bills get no verdict). The conversion-target
+  credit floor **gates out slow payers** — never deepen a term commitment to a Danger account.
+  `customer_credit` is a derived cache created by `credit.ensure_tables` (NOT `init_db`), so it
+  survives reset/demo; the API caches per `(data-sig, config, window)`.
 - **Regime re-ranking is config-driven**: `regime_config.REGIME_MULTIPLIER[archetype][axis][state]`
   (neutral 1.0) → `regime_score = clamp(base_value · Π multipliers, 0, 100)`. The matrix is exposed at
   `/api/regime/config` so the selector re-ranks live (the backend recomputes via the scoring cache).
