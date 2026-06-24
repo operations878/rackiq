@@ -10,6 +10,12 @@ function p0(x: number | null | undefined): string {
   return x == null ? "—" : `${Math.round(x * 100)}%`;
 }
 
+/** Format a raw float for the advanced-stats grid without false precision (0.73841 → "0.74"). */
+function fx(x: number | null | undefined, dp = 2): string {
+  if (x == null || !isFinite(x)) return "—";
+  return `${Number(x.toFixed(dp))}`;
+}
+
 function StatRow({ label, value, hint }: { label: string; value: React.ReactNode; hint?: string }) {
   return (
     <div className="flex items-baseline justify-between gap-3 py-0.5">
@@ -37,6 +43,9 @@ export default function VarBreakdown({ v, grain }: { v: VarBlock; grain: string 
   const unit = grain === "monthly" ? "mo" : "wk";
   const d = v.diagnostics;
   const st = v.steadiness;
+  // With too little history the lane is degenerate (σ≈0 → zero-width ranges). Don't show
+  // false-precision numbers like "6.2k–6.2k"; say plainly that the lane isn't fitted yet.
+  const ok = v.status === "ok" && v.score != null;
 
   return (
     <div className="space-y-4 text-slate-700">
@@ -69,26 +78,34 @@ export default function VarBreakdown({ v, grain }: { v: VarBlock; grain: string 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-2.5">
           <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Their normal lane</h4>
-          <StatRow label={`Base volume / ${unit}`} value={`${fmtGal(v.base_level)} gal`}
-                   hint="Seasonally-aware expected volume per period." />
-          <StatRow label="Base range (±1σ)" value={v.base_range ? `${fmtGal(v.base_range[0])}–${fmtGal(v.base_range[1])}` : "—"}
-                   hint="Where a normal order lands most of the time." />
-          <StatRow label="Variability range (±2σ)" value={v.variability_range ? `${fmtGal(v.variability_range[0])}–${fmtGal(v.variability_range[1])}` : "—"}
-                   hint="Outside this is a genuine surprise." />
-          {d?.base_ci && (
-            <StatRow label={`${Math.round((d.base_ci.ci ?? 0.9) * 100)}% confidence on base`}
-                     value={`${fmtGal(d.base_ci.lo)}–${fmtGal(d.base_ci.hi)}`}
-                     hint="Residual-bootstrap confidence interval on the base volume." />
+          {!ok ? (
+            <p className="py-1.5 text-[11px] leading-snug text-slate-400">
+              Not enough history yet to map their normal lane — it firms up once they have ≥8 lifts over ≥12 weeks.
+            </p>
+          ) : (
+            <>
+              <StatRow label={`Base volume / ${unit}`} value={`${fmtGal(v.base_level)} gal`}
+                       hint="Seasonally-aware expected volume per period." />
+              <StatRow label="Usual range (±1σ)" value={v.base_range ? `${fmtGal(v.base_range[0])}–${fmtGal(v.base_range[1])} gal` : "—"}
+                       hint="Where a normal order lands most of the time (base ± 1 standard deviation)." />
+              <StatRow label="Wider range (±2σ)" value={v.variability_range ? `${fmtGal(v.variability_range[0])}–${fmtGal(v.variability_range[1])} gal` : "—"}
+                       hint="Almost every lift lands inside this; outside it is a genuine surprise (base ± 2 standard deviations)." />
+              {d?.base_ci && (
+                <StatRow label={`${Math.round((d.base_ci.ci ?? 0.9) * 100)}% confidence on base`}
+                         value={`${fmtGal(d.base_ci.lo)}–${fmtGal(d.base_ci.hi)} gal`}
+                         hint="Residual-bootstrap confidence interval on the base volume." />
+              )}
+            </>
           )}
         </div>
         <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-2.5">
           <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Their rhythm (cadence)</h4>
           <StatRow label="Typical gap between lifts"
-                   value={v.cadence?.base_cadence_days != null ? `~${Math.round(v.cadence.base_cadence_days)} days` : "—"}
+                   value={v.cadence?.base_cadence_days != null ? `~${Math.round(v.cadence.base_cadence_days)} ${Math.round(v.cadence.base_cadence_days) === 1 ? "day" : "days"}` : "—"}
                    hint="Median days between one lift and the next." />
           <StatRow label="Timing consistency" value={p0(v.cadence?.in_band_rate)}
                    hint="How often the gap stays inside their usual rhythm." />
-          <StatRow label="Cadence steadiness" value={v.cadence?.score != null ? v.cadence.score : "—"}
+          <StatRow label="Cadence steadiness" value={v.cadence?.score != null ? Math.round(v.cadence.score) : "—"}
                    hint="The cadence lane's own 0–100 score (30% of the headline VAR)." />
           <div className="mt-1.5 flex items-center justify-between">
             <span className="text-[11px] text-slate-500">Trend in steadiness</span>
@@ -99,7 +116,7 @@ export default function VarBreakdown({ v, grain }: { v: VarBlock; grain: string 
           {st && st.direction !== "insufficient" && (
             <p className="mt-0.5 text-[10px] leading-tight text-slate-400">
               In-band {p0(st.in_band_prior)} → {p0(st.in_band_recent)} (recent half vs prior
-              {st.p_value != null && <>, p={st.p_value}</>}).
+              {st.p_value != null && <>, p={fx(st.p_value, 3)}</>}).
             </p>
           )}
         </div>
@@ -126,22 +143,22 @@ export default function VarBreakdown({ v, grain }: { v: VarBlock; grain: string 
                        value={d.skill ? `${fmtGal(d.skill.mae_model)} / ${fmtGal(d.skill.mae_naive)} gal` : "—"}
                        hint="Mean absolute one-step error of the seasonal lane vs naïve-last." />
               <StatRow label="Trend test (Mann–Kendall)"
-                       value={d.trend_test ? `${d.trend_test.direction} (τ=${d.trend_test.tau}, p=${d.trend_test.p_value})` : "—"}
+                       value={d.trend_test ? `${d.trend_test.direction} (τ=${fx(d.trend_test.tau)}, p=${fx(d.trend_test.p_value, 3)})` : "—"}
                        hint="Non-parametric monotonic-trend test on the demand series." />
-              <StatRow label="Lane fit R²" value={d.r2 != null ? d.r2 : "—"}
+              <StatRow label="Lane fit R²" value={fx(d.r2)}
                        hint="Share of demand variance the seasonal lane explains." />
-              <StatRow label="Coefficient of variation" value={d.coef_variation != null ? d.coef_variation : "—"}
+              <StatRow label="Coefficient of variation" value={fx(d.coef_variation)}
                        hint="σ ÷ mean — relative scatter (lower = tighter)." />
               <StatRow label="Residuals are white noise"
-                       value={d.residuals.white_noise == null ? "—" : d.residuals.white_noise ? `yes (Ljung–Box p=${d.residuals.ljung_box_p})` : `no (p=${d.residuals.ljung_box_p})`}
+                       value={d.residuals.white_noise == null ? "—" : d.residuals.white_noise ? `yes (Ljung–Box p=${fx(d.residuals.ljung_box_p, 3)})` : `no (p=${fx(d.residuals.ljung_box_p, 3)})`}
                        hint="If yes, the lane captured the structure — what's left is irreducible noise." />
-              <StatRow label="Residual autocorrelation (lag-1)" value={d.residuals.acf1 != null ? d.residuals.acf1 : "—"}
+              <StatRow label="Residual autocorrelation (lag-1)" value={fx(d.residuals.acf1)}
                        hint="Leftover period-to-period pattern the lane misses." />
               {d.stl && (
                 <>
-                  <StatRow label="Trend strength" value={d.stl.trend_strength}
+                  <StatRow label="Trend strength" value={fx(d.stl.trend_strength)}
                            hint="STL feature: 0 (no trend) → 1 (dominant trend)." />
-                  <StatRow label="Seasonal strength" value={d.stl.seasonal_strength}
+                  <StatRow label="Seasonal strength" value={fx(d.stl.seasonal_strength)}
                            hint="STL feature: 0 (no seasonality) → 1 (dominant seasonality)." />
                 </>
               )}

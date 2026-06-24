@@ -403,6 +403,10 @@ percentile ranking. Results persist to `customer_scores` + `customer_lane`.
      sparse seasonal endpoint that would otherwise collapse erratic accounts to zero). Surfaced as a
      plain sentence (*"Expect ~X gal over the next 30 days (likely Y–Z) … if they hold their
      pattern"*) and a **dotted forward continuation** of the base-range chart (`forecast_series`).
+     **Honest confidence:** when the band is wide relative to the expected volume (half-width ÷
+     expected ≥ `forecast_rough_rel`, or the low end clamps to 0) the projection carries a
+     `rough: true` flag and the sentence says so plainly (*"…treat this as a rough range, not a firm
+     number"*); the UI badges it **"rough — wide lane"** rather than implying false precision.
   2. **Book-level bottom-up forecast** (`aggregate_book_forecast` → `GET /api/scores/book-forecast`):
      sums every customer's projection into a total expected-demand band (variances add,
      `band = z·√Σσ²`), **filterable by terminal/product** via each customer's `tp_share` volume mix.
@@ -851,6 +855,24 @@ CLAUDE.md
   `as_of − {30,90}d` over a trailing `var_trend_lookback_days` window using the cheap
   diagnostics-free light path (`_customer_core(..., light=True)`, STL skipped) — it is
   **window-independent** (always from `as_of`), so it reads the same on every display window.
+- **Plain-English reads are honest across every account shape.** `_plain_read`/`_forward_projection`
+  read naturally for the awkward cases: a **one-time buyer** ("…has bought just once so far — too new
+  to read a buying pattern or forecast yet"), a **sparse/few-week** account ("…has only N lifts over
+  ~W weeks so far…"), and **erratic C/D** accounts (the in-band phrasing softens for very low rates).
+  `_plural(n, word)` kills the robotic "order(s)"/"lift(s)" placeholders (1 → "order", N → "orders").
+  `_var_explanation` is None-guarded so a degenerate "ok" lane formats rather than raising.
+- **VAR Home is the polished, non-technical spine.** Presentation only — the math is untouched. The
+  **base-range chart owns its own always-visible plain-language legend** (`BaseRangeChart`: Normal
+  volume · Usual range ±1σ · Wider range ±2σ · Actual lifts · Forecast), shades the forecast region,
+  and shows a friendly **empty-lane state** (not a blank chart) for thin accounts. Shared score UI
+  (`lib/scoreui.tsx`) carries the plain-language glossary (`gradeWord`, `varMeaning`) and a
+  dependency-free `Tip` hover (so "VAR 71 B" expands to *"Variability score 71 of 100 — steady and
+  fairly predictable"*); grade/trend colours mean the same everywhere (emerald = steady/good, amber =
+  caution, rose = problem). `fmtGal`/`fmtGalFull` + `format.ts` (`fmtDate`/`fmtMonthYear`) keep units
+  ("gal"), dates, and rounding consistent (no false precision). Thin/insufficient accounts show a
+  **"limited history"** badge, "— no rating", an honest "Not enough history yet to map their normal
+  lane" instead of zero-width ranges, and the forward card badges **"rough — wide lane"** when the
+  band is wide.
 - **Weather (HDD/CDD) is best-effort with a deterministic fallback.** `weather.py` auto-fetches real
   degree-days from the **key-less Open-Meteo archive (ERA5 — the reanalysis behind NOAA's products)**
   per terminal lat/lon, caches them in `weather_daily`, and falls back to a **seasonal climatology
@@ -950,6 +972,8 @@ CLAUDE.md
 - **Tests:** `uv run pytest` (dev group adds `pytest` + `httpx`); covers VCF, profiling, crosswalk,
   validation, the hygiene pipeline, scoring (incl. **VAR-as-forecast**: forward projection band,
   tighter-band-for-higher-VAR, excursion weather pattern, VAR trend, book bottom-up forecast +
-  terminal filter, the `/api/scores/book-forecast` endpoint), the reconciliation engine (BOL
+  terminal filter, the `/api/scores/book-forecast` endpoint; **plus the plain-English edge cases** —
+  one-time/sparse/few-week reads, `_plural` pluralization, the `rough`-forecast flag, and
+  `_var_explanation` None-safety), the reconciliation engine (BOL
   grouping, mechanism split, net-recon, meter drift, dollarize), and the full API flow against a
   throwaway DuckDB. Weather fetch is disabled under pytest (deterministic seasonal proxy).

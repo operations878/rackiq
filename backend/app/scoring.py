@@ -593,8 +593,8 @@ def _forward_projection(core: dict, cfg: ScoringConfig) -> dict:
     base = float(np.mean(recent)) if len(recent) else 0.0
     if core["var_status"] != "ok" or base <= 0 or not series:
         return {"available": False, "grain": grain,
-                "reason": (f"Need a fitted lane (≥{cfg.var_min_lifts} lifts over "
-                           f"≥{cfg.var_min_weeks} weeks) to project forward."),
+                "reason": (f"Too little history to forecast forward yet — need ≥{cfg.var_min_lifts} "
+                           f"lifts over ≥{cfg.var_min_weeks} weeks."),
                 "horizons": [], "series": []}
 
     z = cfg.forecast_band_z
@@ -629,14 +629,23 @@ def _forward_projection(core: dict, cfg: ScoringConfig) -> dict:
 
     h30 = next((h for h in horizons if h["days"] == 30), horizons[len(horizons) // 2])
     per = "month" if grain == "monthly" else "week"
+    # Honest confidence: a band that is wide relative to the expected volume (a low-VAR, erratic
+    # account) — or one whose low end is clamped to zero — is a ROUGH forecast. Flag it so the
+    # sentence and the UI say so plainly instead of implying a firm number.
+    half = (h30["hi"] - h30["lo"]) / 2.0
+    rel = (half / h30["expected"]) if h30["expected"] else 1.0
+    rough = bool(rel >= cfg.forecast_rough_rel or h30["lo"] <= 0)
+    n_ord = h30.get("expected_orders")
     plain = (f"Expect about {_fmt_gal(h30['expected'])} gal over the next {h30['days']} days "
              f"(likely {_fmt_gal(h30['lo'])}–{_fmt_gal(h30['hi'])})")
-    if h30.get("expected_orders"):
-        plain += f" — roughly {h30['expected_orders']} order(s)"
+    if n_ord:
+        plain += f" — roughly {n_ord} {_plural(n_ord, 'order')}"
     plain += f", if they hold their pattern of ~{_fmt_gal(base)} gal/{per}."
+    if rough:
+        plain += " Their buying is choppy, so treat this as a rough range, not a firm number."
     return {"available": True, "grain": grain, "period_days": round(period_days, 2),
             "base_per_period": round(base, 1), "sigma_per_period": round(sigma, 1),
-            "band_z": z, "horizons": horizons, "series": series, "plain": plain}
+            "band_z": z, "rough": rough, "horizons": horizons, "series": series, "plain": plain}
 
 
 # ---- Part 1d: excursion explanation (lane breaks + weather pattern) --------------
@@ -652,7 +661,7 @@ def _excursion_pattern(breaks: list, cfg: ScoringConfig) -> dict:
     hot = sum(1 for b in breaks if b["hot_spell"])
     if n < cfg.excursion_min_breaks:
         return {"type": "too_few", "n_breaks": n, "n_cold_snap": cold, "n_hot_spell": hot,
-                "note": f"Only {n} lane break(s) so far — not enough to read a weather pattern."}
+                "note": f"Only {n} lane {_plural(n, 'break')} so far — not enough to read a weather pattern."}
     if cold / n >= cfg.excursion_pattern_share:
         spikes = sum(1 for b in breaks if b["cold_snap"] and b["kind"] == "spike")
         extra = " (mostly buying spikes)" if spikes >= max(1, cold // 2) else ""
@@ -1442,10 +1451,15 @@ def _var_explanation(core: dict, cfg: ScoringConfig) -> str:
     if core["var_status"] != "ok":
         return (f"Insufficient history — need ≥{cfg.var_min_lifts} lifts over ≥{cfg.var_min_weeks} "
                 f"weeks (has {core['n_lifts']} lifts / ~{core['n_weeks']:.0f} weeks).")
+    # Guarded against None even though "ok" status implies a scored lane (defence in depth — a
+    # degenerate series must never raise from a formatting f-string).
+    ib = lane.get("in_band_rate") or 0.0
+    tight = lane.get("tightness") or 0.0
+    exc = lane.get("excursion_penalty") or 0.0
     return (f"VAR {core['var_score']} = blend of volume-lane {core['volume_var']} (70%) and "
-            f"cadence-lane {core['cadence_var']} (30%). Volume lane: {lane['in_band_rate']:.0%} of "
-            f"periods inside the base range, tightness {lane['tightness']:.2f}, "
-            f"{lane['excursion_penalty']:.0%} beyond ±2σ. Base ≈ {lane['base_level']:,.0f} gal/"
+            f"cadence-lane {core['cadence_var']} (30%). Volume lane: {ib:.0%} of "
+            f"periods inside the base range, tightness {tight:.2f}, "
+            f"{exc:.0%} beyond ±2σ. Base ≈ {lane['base_level']:,.0f} gal/"
             f"{core['grain'][:-2]}; fit: {lane['method']}.")
 
 
@@ -1456,6 +1470,14 @@ def _fmt_gal(x) -> str:
     if abs(x) >= 1e6:
         return f"{x / 1e6:.1f}MM"
     return f"{round(float(x)):,}"
+
+
+def _plural(n, word: str) -> str:
+    """Pluralize a count word: 1 → 'order', else 'orders'. Avoids the ugly 'order(s)'."""
+    try:
+        return word if int(round(n)) == 1 else word + "s"
+    except (TypeError, ValueError):
+        return word + "s"
 
 
 def _descriptor(grade: str | None, status: str) -> str:
@@ -1473,9 +1495,18 @@ def _plain_read(core: dict, facts: dict, name: str, cfg: ScoringConfig) -> str:
     the time — very predictable."
     """
     nm = name or "This account"
+    n = int(core.get("n_lifts") or 0)
     if core["var_status"] != "ok":
-        return (f"{nm} doesn't have enough history yet to read a reliable buying pattern "
-                f"({core['n_lifts']} lift(s) so far).")
+        # Thin history — keep it honest and specific so a one-time, brand-new, or sparse account
+        # each reads naturally (never the robotic "0 lift(s)").
+        if n <= 1:
+            return (f"{nm} has bought just once so far — too new to read a buying pattern or "
+                    f"forecast yet.")
+        wk = core.get("n_weeks") or 0
+        span = (f"over ~{round(wk)} {_plural(round(wk), 'week')}" if wk >= 1 else "in a short span")
+        return (f"{nm} has only {n} {_plural(n, 'lift')} {span} so far — not enough history yet "
+                f"to score how steadily they buy (we look for ≥{cfg.var_min_lifts} lifts over "
+                f"≥{cfg.var_min_weeks} weeks).")
     size = facts.get("order_size_median") or facts.get("order_size_mean")
     cad = core.get("base_cadence_days")
     ib = core["lane"].get("in_band_rate") or 0.0
@@ -1485,14 +1516,19 @@ def _plain_read(core: dict, facts: dict, name: str, cfg: ScoringConfig) -> str:
         cad_phrase = ""
     elif cad >= 26:
         cad_phrase = "about once a month"
-    elif cad >= 12:
-        cad_phrase = f"every ~{round(cad)} days"
     elif cad >= 2:
         cad_phrase = f"every ~{round(cad)} days"
     else:
         cad_phrase = "almost daily"
-    head = f"{nm} buys about {_fmt_gal(size)} gal {cad_phrase}".rstrip()
-    sentence = f"{head} and stays within their usual range {round(ib * 100)}% of the time — {desc}."
+    size_phrase = f"about {_fmt_gal(size)} gal" if size else "in varying amounts"
+    head = f"{nm} buys {size_phrase} {cad_phrase}".rstrip()
+    ibp = round(ib * 100)
+    # Soften the phrasing for genuinely erratic accounts so a low in-band % reads naturally
+    # ("only lands inside … 18% of the time") rather than the harsh "stays within … 0%".
+    if ibp >= 45:
+        sentence = f"{head} and stays within their usual range {ibp}% of the time — {desc}."
+    else:
+        sentence = f"{head}, but only lands inside their usual range {ibp}% of the time — {desc}."
     st = core["lane"].get("steadiness") or {}
     if st.get("direction") == "improving":
         sentence += " Their steadiness has been improving lately."
