@@ -58,6 +58,7 @@ class HedgingConfig:
     rel_sigma_default: float = 0.40        # relative forecast σ when a customer can't be backtested
     rel_sigma_cap: float = 1.25            # cap a wild account's σ so the band stays sane
     sigma_floor_gallons: float = 250.0     # absolute per-customer σ floor
+    burst_lambda_cap: float = 1.5          # cap on expected loads-in-window for the burst σ term
 
     # Customer correlation (cold snaps co-move distillate; variances don't just add).
     corr_same_product: float = 0.30        # two accounts on the same product
@@ -202,6 +203,25 @@ def _build_customer(c: dict, terminal: str | None, cal, as_of_ts, wd_in_week: fl
     }
 
 
+# ---- Per-customer demand σ over a horizon ---------------------------------------
+def _sigma_i(r: dict, H: int, hcfg: HedgingConfig) -> float:
+    """Per-customer demand σ over H working days. A **steady** account's uncertainty is its
+    forecast error (``expected × rel_sigma`` — the CLT smooths many small lifts). A **bursty /
+    intermittent** account's is **load-lumpiness**: a typical load may or may not land in the window
+    (Poisson-style ``typical_load · √λ``, λ = expected loads in the window). Using the smeared
+    ``expected × rel`` for a lumpy buyer badly understates the surprise — this makes them contribute
+    WIDE (which is the whole point of the buffer), never fake-precise."""
+    exp = r["daily_rate"] * H
+    s_steady = exp * r["rel_sigma"]
+    s_burst = 0.0
+    cad = r["cadence_working_days"]
+    if r["is_bursty"] and r["typical_load"] > 0 and cad and cad > 0:
+        lam = min(hcfg.burst_lambda_cap, H / cad)              # expected loads in the window
+        s_burst = r["typical_load"] * r["terminal_share"] * math.sqrt(max(lam, 0.0))
+    s = max(s_steady, s_burst)
+    return s if s > 0 else (hcfg.sigma_floor_gallons if exp > 0 else 0.0)
+
+
 # ---- Terminal aggregation for one horizon ---------------------------------------
 def _correlation_sigma(recs: list[dict], sig: np.ndarray, hcfg: HedgingConfig) -> float:
     """Terminal σ with customer correlation: √(σ·R·σ). Same-product / weather-linked pairs co-move,
@@ -233,8 +253,7 @@ def _horizon_block(recs: list[dict], H: int, cal, today, terminal: str | None,
                    sl: float, hcfg: HedgingConfig) -> dict:
     """Expected band + floor/upside + behavior-aware buffer + readout for one working-day horizon."""
     exp = np.array([r["daily_rate"] * H for r in recs], dtype=float)
-    sig = np.array([max(e * r["rel_sigma"], hcfg.sigma_floor_gallons) if e > 0 else 0.0
-                    for e, r in zip(exp, recs)], dtype=float)
+    sig = np.array([_sigma_i(r, H, hcfg) for r in recs], dtype=float)
     p50 = float(exp.sum())
     sigma_terminal = _correlation_sigma(recs, sig, hcfg)
     z10 = hcfg.band_z
@@ -302,11 +321,7 @@ def _horizon_block(recs: list[dict], H: int, cal, today, terminal: str | None,
 def _risk_concentration(recs: list[dict], H: int, hcfg: HedgingConfig, buffer: float) -> list[dict]:
     """Rank customers by contribution to demand VARIABILITY (variance share), not volume — who makes
     the buffer necessary. Flags a customer whose single load could exceed the buffer."""
-    sig2 = []
-    for r in recs:
-        e = r["daily_rate"] * H
-        s = max(e * r["rel_sigma"], hcfg.sigma_floor_gallons) if e > 0 else 0.0
-        sig2.append(s * s)
+    sig2 = [_sigma_i(r, H, hcfg) ** 2 for r in recs]
     total = float(sum(sig2)) or 1.0
     out = []
     for r, s2 in zip(recs, sig2):
