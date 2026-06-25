@@ -441,6 +441,32 @@ percentile ranking. Results persist to `customer_scores` + `customer_lane`.
      problem), this month-vs-prior and quarter-vs-prior — driving the home-page **movers** list and
      the **forecastability** headline (A/B-steady vs C/D-erratic share of forecast volume, with its
      quarter-over-quarter trend).
+- **Part 1f — DAILY PRESENCE-AWARE BEHAVIORAL PROFILE** (`backend/app/behavioral.py`, a layer ON TOP
+  of the frozen VAR lane — it never changes the score). Fixes the *"average hides the pattern"* trap:
+  a steady daily buyer ("Taylor": ~39k most days) and a silent-then-spiky buyer ("Super Quality":
+  0,0,60k,0,50k) can share a weekly total yet are obviously different — the naive ~22k daily average
+  is meaningless for Super Quality (they never lift 22k). The core move is to **split PRESENCE from
+  SIZE** at **daily** resolution over rolling calendar windows (`behavior_windows` = 7/30/90 + all,
+  anchored to the last data date, clipped at first-active so a new account isn't charged for
+  pre-existence):
+  1. **Presence / frequency** — over ALL calendar days, **zeros included**: active-day rate, median
+     gap, longest silent stretch, lifts/active-days per week.
+  2. **Size-when-present** — over ACTIVE days only: mean · median · **mode (bucketed)** · min · max ·
+     range · std · CV · P10·P50·P90 (the real load size when they buy).
+  3. **Naive all-days** — mean & median over every day; the **misleading-average detector** fires when
+     the all-days **median = 0 while mean > 0** (`intermittent`/`misleading_average`), with a
+     `misleading_severity` (high for occasional/rare burst buyers, moderate for chunky-but-frequent).
+  Each customer is classified on **FREQUENCY** (daily/frequent/occasional/rare) × **SIZE-CONSISTENCY**
+  (tight/variable/erratic), with a **timing-regularity** tiebreaker (gap CV) splitting predictable
+  bursts from sporadic ones → a plain **label**: *Steady Daily · Steady Frequent · Steady Intermittent
+  · Erratic Frequent · Rare but Regular · Sporadic/Bursty · New/Sparse* + a plain-English **headline**
+  ("…they lift 0 most days, then ~55k when they buy — their 22k average is misleading") and a
+  **presence-aware lane** restatement ("their lane is ~55k on the ~2 days/week they lift, not a
+  22k/day average"). Each window is self-describing (its own stats + headline + daily **bars**).
+  Resolves per **master** customer (ids rewritten at commit) using real ship dates. Every threshold is
+  a `ScoringConfig` `behavior_*` parameter. Surfaced as `customer["behavior"]` — a **slim** copy
+  (label + axes + the primary-window presence/size summary) rides on `/api/scores`; the **full** block
+  (all windows + bars) rides on `/api/scores/customer/{id}`.
 - **Part 2 — Layer-1 behavioral facts**: order size mean/median/CV, monthly volume, frequency,
   days-between mean & CV, margin/gal mean & CV, days-since-last, product mix + HHI,
   rush/split/small-order/cancel rates + friction-tag count, payment terms, days-to-pay mean & CV,
@@ -519,8 +545,8 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/customers` | per-customer rollups; `avg_margin_per_gal`/`dso_days` are `null` when those capabilities are off — the API itself honors the matrix |
 | `GET /api/market-prices?product=ULSD` | market vs street-rack time series (`available:false` when absent) |
 | `GET /api/monthly-volume` | monthly net gallons (needs only required fields; survives `core`) |
-| `GET /api/scores?window=all` | ranked customers (VAR+grade, base value+grade, archetype, volume, trend, **per-customer forecast incl. chosen model + backtested accuracy**) + per-metric `availability` + the **data-recency block** (`data_through`/`forecast_anchor`/`data_lag_days`/`recency_note`) |
-| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, the full **VAR statistics layer** (base/variability ranges, score-component breakdown, cadence lane, steadiness-trend test, plain-English read, advanced diagnostics), the **forward forecast** (real per-customer engine: chosen model + backtested ±MAPE, 7/30/90-day band anchored to today, dotted `forecast_series` model curve, `low_predictability`/`slowing`/`gap_note`), the **lane-break list** (excursions tagged spike/shortfall/no-show + live-weather pattern), the **VAR trend** (tightening/widening), sub-scores, base value, archetype posture |
+| `GET /api/scores?window=all` | ranked customers (VAR+grade, base value+grade, archetype, volume, trend, **per-customer forecast incl. chosen model + backtested accuracy**, **slim daily behavioral profile** — label + frequency/size axes + primary-window presence/size summary + intermittency flag) + per-metric `availability` + the **data-recency block** (`data_through`/`forecast_anchor`/`data_lag_days`/`recency_note`) |
+| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, the full **VAR statistics layer** (base/variability ranges, score-component breakdown, cadence lane, steadiness-trend test, plain-English read, advanced diagnostics), the full **daily presence-aware behavioral profile** (`behavior`: per-window 7/30/90/all presence + size-when-present + naive all-days stats, misleading-average flag, FREQUENCY×SIZE label + headline, presence-aware lane, and the daily **bars**), the **forward forecast** (real per-customer engine: chosen model + backtested ±MAPE, 7/30/90-day band anchored to today, dotted `forecast_series` model curve, `low_predictability`/`slowing`/`gap_note`), the **lane-break list** (excursions tagged spike/shortfall/no-show + live-weather pattern), the **VAR trend** (tightening/widening), sub-scores, base value, archetype posture |
 | `GET /api/scores/book-forecast?window=&terminal=&product=` | the **bottom-up book demand forecast** (7/30/90-day expected band summed from every customer's per-customer forecast, anchored to today, filterable by terminal/product) + the **forecastability** split (A/B-steady vs C/D-erratic volume share, with the quarter-over-quarter trend) + the data-recency block |
 | `POST /api/studio/crosswalk/upload-names` · `GET /api/studio/unmapped-customers` | upload the hand-built raw→coded name map (confirmed; re-applied across the store) · list raw names still unmapped |
 | `POST /api/studio/product-map/upload` · `GET /api/studio/unmapped-products` | upload the hand-built raw→standardized **product** chart (confirmed; re-applied across the store) · list raw product codes still unmapped |
@@ -672,10 +698,19 @@ presentation: the home screen serves understanding demand & VAR; secondary metri
   **7/30/90-day** cards and **terminal/product filter** dropdowns — and the **forecastability
   summary** (the A/B-steady vs C/D-erratic volume split as a two-segment bar + one headline % with
   its quarter trend). A **data-recency banner** appears when the book is behind today (forecasts are
-  anchored to today and projected across the gap). Below sits the **VAR movers** worklist
-  (`MoversPanel`: who tightened / widened most this quarter). Main: the customer list **ranked by VAR**
-  — coded name · VAR+grade · **next-30d forecast** · **trend badge** — with a **"show more columns"**
-  toggle (cadence, archetype). Click a customer → the **plain-English read**, the **forward forecast**
+  anchored to today and projected across the gap). Next, the **behavioral map**
+  (`components/scores/BehaviorMap.tsx`) — the FREQUENCY × SIZE-CONSISTENCY 2-axis grid (dots ∝ volume,
+  a rose ring marks an avg-misleading burst buyer) so you instantly see who's **baseload** (↖) vs. a
+  **buffer-risk burst buyer** (↘). Below sits the **VAR movers** worklist (`MoversPanel`: who tightened
+  / widened most this quarter). Main: the customer list **ranked by VAR** — coded name · VAR+grade ·
+  **daily-pattern label** (sortable/filterable column with a ⚠ avg-misleading flag) · **next-30d
+  forecast** · **trend badge** — with a frequency filter, a misleading-avg-only toggle, and a
+  **"show more columns"** toggle (cadence, archetype). Click a customer → the **plain-English read**,
+  the **daily presence-aware behavioral profile** (`components/scores/BehaviorProfile.tsx`: the label
+  headline + misleading-average flag + the **daily bar view** `components/scores/DailyBars.tsx`
+  [presence + size — Taylor reads as a row of similar bars, Super Quality as mostly-empty with
+  occasional towers] + the presence/size split + the full descriptive-stats panel with a **7/30/90/all
+  window toggle**), the **forward forecast**
   card (`components/scores/ForwardProjection.tsx`, now showing the **chosen model + backtested accuracy**
   — *"seasonal model · ±12% typ. error"* — plus `low predictability` / `slowing` / `rough` badges and
   the per-customer gap note), the **base-range chart** as the hero now **continued forward as the real
@@ -803,6 +838,7 @@ backend/
     scoring.py              # ★ scoring engine: VAR lane (+ transparency/statistics layer; + VAR-as-forecast:
                             #   forward forecast (→ forecasting.py), lane-break excursions+weather, book bottom-up forecast, VAR trend), sub-scores, base value, archetypes, backtest, forecast_backtest (new-vs-old-vs-naive proof)
     forecasting.py          # ★ per-customer demand forecasting engine: multi-model (seasonal/HW/trend/cadence/recency/flat) selected by walk-forward backtest, must-beat-naive + low-pred flag, reliability shrinkage, honest per-customer band, TODAY-anchored horizons (proration over the data-recency gap)
+    behavioral.py           # ★ daily presence-aware behavioral profile (enriches VAR; never changes the score): split PRESENCE (all days, zeros incl.) from SIZE-WHEN-PRESENT (active days), full descriptive stats, median-0/mean>0 misleading-average flag, FREQUENCY×SIZE classifier (Steady Daily…Sporadic/Bursty) + plain read + daily bars, per master customer
     scoring_config.py       # ★ ScoringConfig — every weight/threshold/window/forecast param (model selection, backtest, shrinkage, today-anchoring) as a parameter
     weather.py              # ★ HDD/CDD feed: live NOAA/ERA5 auto-fetch (no key) → weather_daily cache → seasonal proxy fallback (explains lane breaks)
     reconciliation.py       # ★ P8 loss-control engine: book vs physical, BOL-grouped disbursements,
@@ -831,7 +867,7 @@ backend/
     api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
     api/demand.py           # /api/demand/cockpit / persist / forecasts / config (the Demand Cockpit)
     api/pricing.py          # /api/pricing (sandbox + recommendations) / recommendations / config / recompute (cached base)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_name_map + test_regime + test_reconciliation + test_demand + test_pricing
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_name_map + test_regime + test_reconciliation + test_demand + test_pricing
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -844,7 +880,7 @@ frontend/
     api/{client,types}.ts
     pages/{VarHome,DailyOps,DemandCockpit,Pricing,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx   # VarHome = the default landing (route "")
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
-    components/scores/{BaseRangeChart,QuadrantScatter,VarBreakdown,ForwardProjection,LaneBreaks,VarTrendBadge}.tsx   # BaseRangeChart draws the dotted forward projection; ForwardProjection/LaneBreaks/VarTrendBadge = VAR-as-forecast UI
+    components/scores/{BaseRangeChart,QuadrantScatter,VarBreakdown,ForwardProjection,LaneBreaks,VarTrendBadge,BehaviorMap,BehaviorProfile,DailyBars}.tsx   # BaseRangeChart draws the dotted forward projection; ForwardProjection/LaneBreaks/VarTrendBadge = VAR-as-forecast UI; BehaviorMap (2-axis freq×size map) / BehaviorProfile (presence/size split + stats panel + window toggle) / DailyBars (daily presence+size bars) = the presence-aware behavioral profile UI
     components/demand/{DemandForecastChart,BurnDownChart}.tsx
     components/pricing/{MarginCurveChart}.tsx
     components/reconciliation/{MechanismBar,ControlChart,LossTrendChart}.tsx
@@ -881,6 +917,22 @@ CLAUDE.md
   **VAR trend** re-fits the lane at `as_of − {30,90}d` over a trailing `var_trend_lookback_days` window
   using the cheap diagnostics-free light path (`_customer_core(..., light=True)`, STL skipped) — it is
   **window-independent** (always from `as_of`), so it reads the same on every display window.
+- **The daily behavioral profile splits PRESENCE from SIZE — and it ENRICHES VAR, never changes the
+  score** (`behavioral.py`). The trap it fixes: a daily ~39k buyer and a silent-then-spiky 0/0/60k/0/50k
+  buyer share a weekly total but a naive daily average (~22k) is meaningless for the second — they
+  never lift that. So presence (active-day rate / gaps / silence) is computed over **all** calendar
+  days (zeros are data, never skipped) while size stats are computed over **active days only**; the
+  **misleading-average flag** is the literal `all-days median == 0 and mean > 0` (with a
+  `misleading_severity` so a once-a-month marine parcel reads louder than an every-3-days ratable). The
+  classifier's headline axes are FREQUENCY × SIZE-CONSISTENCY; **timing regularity (gap CV) only
+  disambiguates the intermittent quadrant** (Steady Intermittent = predictable bursts vs Sporadic/Bursty
+  = irregular). It is **window-independent of the scoring window** (it computes its OWN 7/30/90/all
+  calendar windows from the full history, anchored to `as_of`, clipped at first-active so a new account
+  isn't charged for pre-existence). The lane "goes presence-aware" by restating it as *active-day size ×
+  frequency* (`presence_lane`), not by touching the VAR math. Every threshold is a `behavior_*`
+  `ScoringConfig` param (`behavior_freq_frequent=0.30` means "frequent" = ~3+ days/week, so a twice-a-
+  week burst buyer reads "occasional"). Slim copy on `/api/scores` (`behavioral.slim_behavior`), full
+  block (all windows + bars) on `/api/scores/customer/{id}`.
 - **Forecasts anchor to TODAY, not the last data date** (the bug this fixed). `compute_scores(...,
   today=)` defaults to `datetime.now()` (injectable for tests) and is **never before `as_of`**; the
   rolling windows still measure from `as_of` (history depth) but the 7/30/90-day horizons, the forward

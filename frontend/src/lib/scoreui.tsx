@@ -156,3 +156,53 @@ export function fmtGalFull(x: number | null | undefined): string {
   if (x == null || !isFinite(x)) return "—";
   return `${Math.round(x).toLocaleString()} gal`;
 }
+
+// ---- Daily presence-aware behavioral profile UI ---------------------------------
+/** Plain-language colour ramp for the behavioral label — emerald = dependable/predictable,
+ *  sky = predictable bursts, amber/orange = swingy, rose = a buffer-risk burst buyer. */
+const BEHAVIOR_TONE: Record<string, string> = {
+  "Steady Daily": "bg-emerald-100 text-emerald-800",
+  "Steady Frequent": "bg-emerald-50 text-emerald-700",
+  "Rare but Regular": "bg-teal-50 text-teal-700",
+  "Steady Intermittent": "bg-sky-50 text-sky-700",
+  "Variable Daily": "bg-amber-50 text-amber-700",
+  "Variable Frequent": "bg-amber-50 text-amber-700",
+  "Erratic Daily": "bg-orange-100 text-orange-800",
+  "Erratic Frequent": "bg-orange-100 text-orange-800",
+  "Sporadic/Bursty": "bg-rose-100 text-rose-700",
+  "New / Sparse": "bg-slate-100 text-slate-500",
+};
+export function behaviorTone(label: string | null | undefined): string {
+  return BEHAVIOR_TONE[label ?? ""] ?? "bg-slate-100 text-slate-600";
+}
+
+export function freqWord(f: string | null | undefined): string {
+  return ({ daily: "Daily", frequent: "Frequent", occasional: "Occasional", rare: "Rare" } as Record<string, string>)[f ?? ""] ?? "—";
+}
+export function sizeWord(s: string | null | undefined): string {
+  return ({ tight: "Tight", variable: "Variable", erratic: "Erratic", unknown: "—" } as Record<string, string>)[s ?? ""] ?? "—";
+}
+
+/** The behavioral label as a coloured chip, with a "⚠ avg misleads" flag when the daily average is
+ *  genuinely misleading (silent-most-days burst buyer). */
+export function BehaviorTag({
+  label,
+  severity,
+  compact,
+}: {
+  label: string | null | undefined;
+  severity?: "high" | "moderate" | null;
+  compact?: boolean;
+}) {
+  if (!label) return <span className="text-[11px] text-slate-400">—</span>;
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className={`inline-block whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium ${behaviorTone(label)}`}>{label}</span>
+      {severity === "high" && (
+        <Tip text="Their median daily volume is 0 — silent most days, then a large load. The daily average is misleading; plan around active-day size + frequency, not a daily rate.">
+          <span className="cursor-help text-[10px] font-semibold text-rose-600">{compact ? "⚠" : "⚠ avg misleads"}</span>
+        </Tip>
+      )}
+    </span>
+  );
+}

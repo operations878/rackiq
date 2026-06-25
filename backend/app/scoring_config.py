@@ -102,6 +102,30 @@ class ScoringConfig:
     var_trend_quarter_days: int = 90      # "this quarter vs prior" shift
     var_trend_move_band: float = 3.0      # |ΔVAR| below this ⇒ "steady" (else tighten/widen)
 
+    # ---- Daily presence-aware behavioral profile (ENRICHES VAR; never changes the score) ----
+    # The core move: split PRESENCE (how often they buy, over ALL calendar days incl. zeros) from
+    # SIZE-WHEN-PRESENT (only the days they actually lift). This fixes the "average hides the
+    # pattern" problem — a steady daily buyer and a silent-then-spiky buyer can share a weekly total
+    # but look obviously different here. Computed at DAILY resolution per master customer over rolling
+    # calendar windows, anchored to the last data date. NOTHING here touches the VAR lane score.
+    behavior_windows: tuple = (7, 30, 90)     # calendar-day windows the profile is computed over ("all" always added)
+    behavior_primary_window: str = "30"       # window the headline label/read is taken from (falls back if too thin)
+    behavior_min_active_days: int = 3         # need this many active days to read size-consistency / timing
+    behavior_intermittent_min_days: int = 7   # window must span ≥ this many days for the intermittency flag to mean anything
+    # Frequency bucket on the active-day rate (share of calendar days with ≥1 lift).
+    behavior_freq_daily: float = 0.6          # ≥ ⇒ "daily" (lifts most days — baseload)
+    behavior_freq_frequent: float = 0.30      # ≥ ⇒ "frequent" (several days a week, ~3+); below
+    #                                           this a twice-a-week burst buyer reads "occasional"
+    behavior_freq_occasional: float = 0.08    # ≥ ⇒ "occasional" (once/twice a week); below ⇒ "rare"
+    # Size-consistency bucket on the coefficient of variation of ACTIVE-day sizes.
+    behavior_size_tight_cv: float = 0.25      # ≤ ⇒ "tight" (very consistent load size)
+    behavior_size_variable_cv: float = 0.60   # ≤ ⇒ "variable"; above ⇒ "erratic"
+    # Timing regularity (robust CV of gaps between active days) — separates predictable bursts
+    # ("Steady Intermittent") from genuinely sporadic ones ("Sporadic/Bursty").
+    behavior_regular_gap_cv: float = 0.50     # ≤ ⇒ "regular" cadence; above ⇒ "irregular"
+    behavior_size_bucket_gallons: float = 5000.0   # mode-bucket width floor (adaptive above this)
+    behavior_max_bar_days: int = 120          # cap the daily-bar series length (the "all" window) for the chart
+
     # ---- Data sufficiency (is an account "established"?) ------------------------
     suff_min_lifts: int = 12
     suff_min_days: int = 90
