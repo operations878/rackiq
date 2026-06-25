@@ -86,9 +86,14 @@ def parse_file(content: bytes, filename: str) -> pd.DataFrame:
 SYNONYMS: dict[str, list[str]] = {
     "customer_id": ["customer", "cust", "customer id", "customer number", "cust no",
                     "account", "acct", "account number", "buyer", "client", "bill to",
-                    # BOL/EDI exports name the buyer the "consignee" (Consignee Number is the id).
+                    # BOL/EDI exports name the buyer the "consignee". We key customer_id on the
+                    # account NAME when one is present (see _customer_id_rank_bonus) so the
+                    # raw→coded name crosswalk can group spellings and the UI shows names, never a
+                    # bare account number. A name-less file still maps the number (best available).
                     "consignee", "consignee number", "consignee no", "consignee num",
-                    "consignee #", "consignee id"],
+                    "consignee #", "consignee id", "consignee name", "customer name",
+                    "account name", "buyer name", "bill to name", "sold to name",
+                    "ship to name", "company name", "account description"],
     "lift_datetime": ["lift date", "lift time", "date", "datetime", "timestamp",
                       "load date", "ship date", "delivery date", "transaction date",
                       "bol date", "pickup date", "lift dt"],
@@ -228,6 +233,27 @@ def score_header(header: str, target: str) -> float:
     return round(best, 3)
 
 
+_NAME_TOKEN_RE = re.compile(r"\bname\b")
+_IDNUM_TOKEN_RE = re.compile(r"\b(number|num|nbr|no|id|code|acct)\b")
+
+
+def _customer_id_rank_bonus(header: str) -> float:
+    """Tie-break the *customer key* toward a NAME column over a bare number/id column.
+
+    Customers are keyed on customer_id, and the raw→coded name crosswalk resolves on that key —
+    so when a file carries both a "Consignee Number" and a "Consignee Name" we want the NAME to
+    win (variants collapse under the crosswalk; the UI shows names, never a bare account number).
+    Applied only to ranking among headers that already clear the customer_id threshold, so it
+    re-orders competing customer columns without ever admitting an unrelated header.
+    """
+    h = _norm(header)
+    if _NAME_TOKEN_RE.search(h):
+        return 0.15
+    if _IDNUM_TOKEN_RE.search(h):
+        return -0.10
+    return 0.0
+
+
 def suggest_for_table(headers: list[str], table: str) -> dict[str, dict]:
     """Best target (within ``table``) for each header, resolved greedily by score.
 
@@ -245,12 +271,14 @@ def suggest_for_table(headers: list[str], table: str) -> dict[str, dict]:
             s = score_header(h, t)
             thr = _SUGGEST_THRESHOLD if t in required else _OPTIONAL_SUGGEST_THRESHOLD
             if s >= thr:
-                pairs.append((s, h, t))
+                # Rank with a customer-key name-preference; report the raw similarity unchanged.
+                rank = s + (_customer_id_rank_bonus(h) if t == "customer_id" else 0.0)
+                pairs.append((rank, s, h, t))
     pairs.sort(reverse=True)
     used_headers: set[str] = set()
     used_targets: set[str] = set()
     out: dict[str, dict] = {}
-    for s, h, t in pairs:
+    for _rank, s, h, t in pairs:
         if h in used_headers or t in used_targets:
             continue
         out[h] = {"target": t, "confidence": s}
