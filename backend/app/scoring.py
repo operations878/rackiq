@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from . import db, schema, weather
+from . import db, forecasting, schema, weather
 from .scoring_config import (ARCHETYPE_POSTURE, ARCHETYPES, DEFAULT_CONFIG, WINDOWS,
                              ScoringConfig, grade)
 
@@ -562,6 +562,7 @@ def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
     return {
         "grain": grain, "n_lifts": n, "n_weeks": round(n_weeks, 1),
         "vols": vols, "gaps": gaps, "periods": periods, "lane": lane, "cadence": cadence,
+        "dts": dts.reset_index(drop=True),  # raw sorted lift datetimes (for the cadence model)
         "var_score": round(headline, 1) if headline is not None else None,
         "var_grade": grade(headline, cfg) if headline is not None else None,
         "volume_var": vol_var, "cadence_var": cad_var, "var_status": var_status,
@@ -571,81 +572,38 @@ def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
     }
 
 
-# ---- Part 1c: VAR as a FORECAST — forward projection from the lane ---------------
-# The lane describes past behavior; this turns it into a forward expectation. Expected volume
-# over the next H days = base_per_period · (H / period_days); the confidence band widens with the
-# lane width (independent-period √-aggregation), so a tight lane (high VAR) projects narrow and
-# a wide lane (low VAR) projects wide. The VAR score itself is untouched.
-def _forward_projection(core: dict, cfg: ScoringConfig) -> dict:
-    lane = core["lane"]
-    grain = core["grain"]
-    series = lane.get("series") or []
-    sigma = lane.get("sigma") or 0.0
-    cad = core.get("base_cadence_days")
-    period_days = 30.44 if grain == "monthly" else 7.0
-    # Project from the trailing RUN-RATE (their normal pace) rather than the seasonal endpoint:
-    # `fitted[-1]` collapses to ~0 for sparse/erratic accounts whose recent periods are empty,
-    # which would (wrongly) drop them from the forecast. The run-rate is robust and ≥0 for anyone
-    # who buys, so erratic customers still get a (wide-banded) forward number.
-    actuals = np.array([p["actual"] for p in series], dtype=float)
-    cycle = 52 if grain != "monthly" else 12
-    recent = actuals[-cycle:] if len(actuals) > cycle else actuals
-    base = float(np.mean(recent)) if len(recent) else 0.0
-    if core["var_status"] != "ok" or base <= 0 or not series:
-        return {"available": False, "grain": grain,
-                "reason": (f"Too little history to forecast forward yet — need ≥{cfg.var_min_lifts} "
-                           f"lifts over ≥{cfg.var_min_weeks} weeks."),
-                "horizons": [], "series": []}
+# ---- Part 1c: VAR as a FORECAST — the real per-customer forecasting engine -------
+# This used to smear a trailing run-rate flat across every future period. It now delegates to
+# ``forecasting.py``: multiple candidate models backtested walk-forward, the lowest-error one
+# selected PER CUSTOMER, seasonality preserved on sparse history, the band from that customer's
+# OWN backtest error, and every horizon anchored to TODAY (not the last data date). The VAR
+# score itself is untouched — this is a forward layer ON TOP of the frozen lane.
+def _forward_projection(core: dict, cfg: ScoringConfig, today: pd.Timestamp,
+                        as_of: pd.Timestamp) -> dict:
+    return forecasting.forecast_customer(core, cfg, today, as_of)
 
-    z = cfg.forecast_band_z
-    horizons = []
-    for h in cfg.forecast_horizons:
-        k = float(h) / period_days
-        expected = base * k
-        sigma_h = sigma * math.sqrt(k)
-        horizons.append({
-            "days": int(h), "expected": round(expected, 0),
-            "lo": round(max(0.0, expected - z * sigma_h), 0), "hi": round(expected + z * sigma_h, 0),
-            "expected_orders": (round(float(h) / cad) if cad and cad > 0 else None),
-        })
 
-    # dotted forward continuation of the lane (flat at base, same ±1σ / ±2σ bands)
-    if cfg.base_range_mode == "percent":
-        bhalf = cfg.base_range_pct * abs(base)
-        vhalf = (cfg.variability_sigma_k / max(cfg.base_range_sigma_k, 1e-9)) * bhalf
-    else:
-        bhalf, vhalf = cfg.base_range_sigma_k * sigma, cfg.variability_sigma_k * sigma
-    step = pd.offsets.MonthBegin(1) if grain == "monthly" else pd.Timedelta(days=7)
-    n_fwd = max(1, math.ceil(cfg.forecast_max_horizon_days / period_days))
-    cur = pd.Timestamp(lane["series"][-1]["period_start"])
-    series = []
-    for _ in range(n_fwd):
-        cur = cur + step
-        series.append({
-            "period_start": str(pd.Timestamp(cur).date()), "base": round(base, 1),
-            "base_lo": round(max(0.0, base - bhalf), 1), "base_hi": round(base + bhalf, 1),
-            "var_lo": round(max(0.0, base - vhalf), 1), "var_hi": round(base + vhalf, 1),
-        })
+def _resolve_today(as_of, today):
+    """Anchor forecasts to the real calendar date (or an injected one for tests), never before
+    the last data date. Returns a normalized (midnight) Timestamp."""
+    today = pd.Timestamp(datetime.now()).normalize() if today is None else pd.Timestamp(today).normalize()
+    if as_of is not None and today < pd.Timestamp(as_of).normalize():
+        today = pd.Timestamp(as_of).normalize()
+    return today
 
-    h30 = next((h for h in horizons if h["days"] == 30), horizons[len(horizons) // 2])
-    per = "month" if grain == "monthly" else "week"
-    # Honest confidence: a band that is wide relative to the expected volume (a low-VAR, erratic
-    # account) — or one whose low end is clamped to zero — is a ROUGH forecast. Flag it so the
-    # sentence and the UI say so plainly instead of implying a firm number.
-    half = (h30["hi"] - h30["lo"]) / 2.0
-    rel = (half / h30["expected"]) if h30["expected"] else 1.0
-    rough = bool(rel >= cfg.forecast_rough_rel or h30["lo"] <= 0)
-    n_ord = h30.get("expected_orders")
-    plain = (f"Expect about {_fmt_gal(h30['expected'])} gal over the next {h30['days']} days "
-             f"(likely {_fmt_gal(h30['lo'])}–{_fmt_gal(h30['hi'])})")
-    if n_ord:
-        plain += f" — roughly {n_ord} {_plural(n_ord, 'order')}"
-    plain += f", if they hold their pattern of ~{_fmt_gal(base)} gal/{per}."
-    if rough:
-        plain += " Their buying is choppy, so treat this as a rough range, not a firm number."
-    return {"available": True, "grain": grain, "period_days": round(period_days, 2),
-            "base_per_period": round(base, 1), "sigma_per_period": round(sigma, 1),
-            "band_z": z, "rough": rough, "horizons": horizons, "series": series, "plain": plain}
+
+def _recency(as_of, today, cfg: ScoringConfig) -> dict:
+    """How far the book is behind today, with an honest note when the gap is meaningful."""
+    if as_of is None:
+        return {"data_through": None, "forecast_anchor": str(today.date()),
+                "data_lag_days": 0, "recency_note": None}
+    gap = max(0, int((today - pd.Timestamp(as_of).normalize()).days))
+    note = None
+    if gap >= cfg.forecast_gap_note_days:
+        note = (f"Your data is current through {pd.Timestamp(as_of).date()} — {gap} days behind "
+                f"today ({today.date()}). Forecasts beyond that point are projected across the gap.")
+    return {"data_through": str(pd.Timestamp(as_of).date()), "forecast_anchor": str(today.date()),
+            "data_lag_days": gap, "recency_note": note}
 
 
 # ---- Part 1d: excursion explanation (lane breaks + weather pattern) --------------
@@ -1155,18 +1113,26 @@ def _window_cutoff(as_of: pd.Timestamp, window: str):
     return as_of - pd.Timedelta(days=int(window))
 
 
-def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all") -> dict:
-    """Compute the full score payload for one window (capability-gated, percentile-ranked)."""
+def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all",
+                   today=None) -> dict:
+    """Compute the full score payload for one window (capability-gated, percentile-ranked).
+
+    ``today`` anchors every forward forecast to the real calendar date at request time (default
+    ``datetime.now()``; injectable for tests). It never changes the VAR score or the windows —
+    only where the forecast starts from and how the data-recency gap is reported.
+    """
     cfg = cfg or DEFAULT_CONFIG
     if window not in WINDOWS:
         window = "all"
     data = _load(con)
     avail = _availability(data)
     lifts, customers, as_of = data["lifts"], data["customers"], data["as_of"]
+    today = _resolve_today(as_of, today)
+    recency = _recency(as_of, today, cfg)
 
     if not len(lifts) or as_of is None:
         return {"window": window, "as_of": None, "availability": avail,
-                "config": cfg.to_dict(), "n_customers": 0, "customers": []}
+                "config": cfg.to_dict(), "n_customers": 0, "customers": [], **recency}
 
     cutoff = _window_cutoff(as_of, window)
     lw = lifts if cutoff is None else lifts[lifts["lift_datetime"] >= cutoff]
@@ -1193,7 +1159,7 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all") -
         term = home_by_id.get(cid)
         if not term and "terminal" in cl and cl["terminal"].notna().any():
             term = cl["terminal"].mode().iloc[0]
-        forward = _forward_projection(core, cfg)
+        forward = _forward_projection(core, cfg, today, as_of)
         excursions = _excursions(core, term, con, cfg)
         full_cl = full_by_id.get_group(cid) if cid in full_by_id.groups else cl
         var_trend = _var_trend(full_cl, cfg, as_of)
@@ -1203,7 +1169,7 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all") -
 
     if not rows:
         return {"window": window, "as_of": str(as_of.date()), "availability": avail,
-                "config": cfg.to_dict(), "n_customers": 0, "customers": []}
+                "config": cfg.to_dict(), "n_customers": 0, "customers": [], **recency}
 
     # ---- book-level percentile inputs ----
     def collect(path):
@@ -1443,7 +1409,8 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all") -
 
     out_customers.sort(key=lambda c: (c["var"]["score"] if c["var"]["score"] is not None else -1), reverse=True)
     return {"window": window, "as_of": str(as_of.date()), "availability": avail,
-            "config": cfg.to_dict(), "n_customers": len(out_customers), "customers": out_customers}
+            "config": cfg.to_dict(), "n_customers": len(out_customers), "customers": out_customers,
+            **recency}
 
 
 def _var_explanation(core: dict, cfg: ScoringConfig) -> str:
@@ -1670,3 +1637,67 @@ def backtest(con, cfg: ScoringConfig | None = None) -> dict:
     rows.sort(key=lambda r: r["mae"].get("seasonal", 1e18))
     summary = {m: round(float(np.mean(v)), 1) for m, v in agg.items() if v}
     return {"customers": rows, "methods": ["naive_last", "seasonal", "lane_base"], "summary": summary}
+
+
+def forecast_backtest(con, cfg: ScoringConfig | None = None, today=None) -> dict:
+    """Prove the new engine is real: a per-customer walk-forward comparison of the **new
+    forecasting engine** vs the **old flat run-rate** vs a **naive-last** baseline, plus the
+    aggregate accuracy improvement and how many customers the engine beats each baseline on.
+
+    For each held-out period the new engine RE-SELECTS its model from data before that period
+    (a true walk-forward), so the comparison can't peek ahead. Customers where nothing beats
+    naive are reported honestly (``beats_naive=false``) rather than hidden.
+    """
+    cfg = cfg or DEFAULT_CONFIG
+    data = _load(con)
+    lifts, as_of = data["lifts"], data["as_of"]
+    methods = ["new_engine", "old_runrate", "naive"]
+    if not len(lifts):
+        return {"customers": [], "methods": methods, "summary": {}, "improvement": {},
+                "n_customers": 0, "n_beat_naive": 0, "n_beat_old": 0}
+    today = _resolve_today(as_of, today)
+    name_by_id = (dict(zip(data["customers"]["customer_id"], data["customers"]["name"]))
+                  if len(data["customers"]) else {})
+    rows = []
+    agg = {m: [] for m in methods}
+    n_beat_naive = n_beat_old = 0
+    for cid, cl in lifts.groupby("customer_id"):
+        core = _customer_core(cl, cfg, as_of, light=True)
+        comp = forecasting.compare_customer(core, cfg)
+        if comp is None:
+            continue
+        for m in methods:
+            agg[m].append(comp["mape"][m])
+        n_beat_naive += int(comp["beats_naive"])
+        n_beat_old += int(comp["beats_old"])
+        rows.append({
+            "customer_id": cid, "name": name_by_id.get(cid, cid), "grain": comp["grain"],
+            "chosen_model": comp["chosen_model"],
+            "model_label": forecasting.MODEL_LABEL.get(comp["chosen_model"], comp["chosen_model"]),
+            "n_steps": comp["n_steps"], "mae": comp["mae"], "mape": comp["mape"],
+            "best": comp["best"], "beats_naive": comp["beats_naive"], "beats_old": comp["beats_old"]})
+    rows.sort(key=lambda r: r["mape"]["new_engine"])
+    # mean is skewed by erratic intermittent accounts (zero-buy weeks blow up MAPE); the MEDIAN
+    # per-customer MAPE is the robust headline. We report both, plus the mean absolute error (gal).
+    summary = {m: round(float(np.median(v)), 1) for m, v in agg.items() if v}        # median MAPE %
+    summary_mean = {m: round(float(np.mean(v)), 1) for m, v in agg.items() if v}     # mean MAPE %
+    mae_mean = {m: round(float(np.mean([r["mae"][m] for r in rows])), 1) for m in methods if rows}
+    mae_median = {m: round(float(np.median([r["mae"][m] for r in rows])), 1) for m in methods if rows}
+    improvement = {}
+    if summary.get("naive"):
+        improvement["vs_naive_pct"] = round((summary["naive"] - summary["new_engine"]) / summary["naive"] * 100, 1)
+    if summary.get("old_runrate"):
+        improvement["vs_old_pct"] = round((summary["old_runrate"] - summary["new_engine"]) / summary["old_runrate"] * 100, 1)
+    if mae_mean.get("naive"):
+        improvement["mae_vs_naive_pct"] = round((mae_mean["naive"] - mae_mean["new_engine"]) / mae_mean["naive"] * 100, 1)
+    if mae_mean.get("old_runrate"):
+        improvement["mae_vs_old_pct"] = round((mae_mean["old_runrate"] - mae_mean["new_engine"]) / mae_mean["old_runrate"] * 100, 1)
+    if mae_median.get("naive"):
+        improvement["mae_median_vs_naive_pct"] = round((mae_median["naive"] - mae_median["new_engine"]) / mae_median["naive"] * 100, 1)
+    if mae_median.get("old_runrate"):
+        improvement["mae_median_vs_old_pct"] = round((mae_median["old_runrate"] - mae_median["new_engine"]) / mae_median["old_runrate"] * 100, 1)
+    return {"customers": rows, "methods": methods, "summary": summary, "summary_mean": summary_mean,
+            "mae_mean": mae_mean, "mae_median": mae_median, "improvement": improvement,
+            "n_customers": len(rows), "n_beat_naive": n_beat_naive, "n_beat_old": n_beat_old,
+            "as_of": str(as_of.date()) if as_of is not None else None,
+            "forecast_anchor": str(today.date())}

@@ -27,6 +27,7 @@ import type {
   QuadrantResponse,
   CustomerScoreResponse,
   BacktestResponse,
+  ForecastBacktestResponse,
   BookForecast,
   Reconciliation,
   RegimeConfig,
@@ -182,6 +183,7 @@ export const api = {
     },
     quadrant: (window = "all") => getJSON<QuadrantResponse>(`/scores/quadrant?window=${window}`),
     backtest: () => getJSON<BacktestResponse>("/scores/backtest"),
+    forecastBacktest: () => getJSON<ForecastBacktestResponse>("/scores/forecast-backtest"),
     config: () => getJSON<{ config: Record<string, number | string>; windows: string[]; archetypes: string[] }>("/scores/config"),
     recompute: (overrides?: Record<string, number | string>) =>
       postJSON<{ ok: boolean; computed_at: string; windows: Record<string, number> }>(
