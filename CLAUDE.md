@@ -239,6 +239,7 @@ defaultable dimensional keys — a partial BOL feed still imports). Derived in
 | Targets | `GET /api/studio/targets` | static registry powering the mapping dropdowns (+ `customer_key_column`, `defaultable_fields`) |
 | Crosswalk | `POST …/crosswalk/propose`, `…/crosswalk/confirm`, `GET …/crosswalk`, `DELETE …/crosswalk/{key}`, `POST …/crosswalk/clear` | propose merge groups, persist confirm/reject, browse/edit the master crosswalk |
 | Name map | `POST …/crosswalk/upload-names` (multipart), `GET …/unmapped-customers` | upload a hand-built two-column **raw→coded** CSV as confirmed masters (overrides fuzzy), then **re-apply across the whole store** (regroup + rename, busts the score/forecast caches) and return the still-**unmapped** raw names. Re-uploadable to keep extending the map |
+| Product map | `POST …/product-map/upload` (multipart), `GET …/unmapped-products` | upload a hand-built two-column **raw product code → standardized code** chart as confirmed entries, then **re-apply across the whole store** (restate the `product` column on lifts/inventory/market/quotes/receipts/BOLs, busts the caches) and return still-**unmapped** raw codes. The product analogue of the name map; re-uploadable |
 | Quarantine | `GET …/quarantine`, `POST …/quarantine/reimport`, `…/quarantine/discard` | review held rows, fix-and-re-import (with edits), or discard |
 | Data health | `GET …/data-health` | the standing quality-score + drift report |
 | Audit | `GET …/audit` | recent hygiene transformations |
@@ -247,10 +248,11 @@ defaultable dimensional keys — a partial BOL feed still imports). Derived in
 | Quick feeds | `/api/studio/rack-benchmark`, `/api/studio/quote` | append a daily rack benchmark / a single quote (resolved via crosswalk) through the hygiene pipeline; bumps the "collecting" counters live |
 | Demo / Reset | `/api/studio/load-demo`, `/api/studio/reset` | load the synthetic book (`core`/`lite`/`full`) or clear the store |
 
-Saved profiles, the import log, the **customer crosswalk**, the **hygiene audit log**, and the
-**quarantine queue** live in dedicated tables (`import_profiles`, `import_log`,
-`customer_crosswalk`, `hygiene_audit`, `quarantine`) that **survive** demo regeneration / reset on
-purpose — merge decisions and held rows are never lost when the book is reloaded.
+Saved profiles, the import log, the **customer crosswalk**, the **product reference chart**, the
+**hygiene audit log**, and the **quarantine queue** live in dedicated tables (`import_profiles`,
+`import_log`, `customer_crosswalk`, `product_crosswalk`, `hygiene_audit`, `quarantine`) that
+**survive** demo regeneration / reset on purpose — merge decisions, product standardization, and
+held rows are never lost when the book is reloaded.
 
 **Frontend** (`pages/DataStudio.tsx` + `components/studio/*`): a **5-step** wizard — **Upload**,
 **Map Columns**, **Clean** (`CleanStep` = `ProfilingScorecard` + `CustomerMasterPanel` +
@@ -504,6 +506,7 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, the full **VAR statistics layer** (base/variability ranges, score-component breakdown, cadence lane, steadiness-trend test, plain-English read, advanced diagnostics), the **forward projection** (7/30/90-day expected band + dotted `forecast_series`), the **lane-break list** (excursions tagged spike/shortfall/no-show + live-weather pattern), the **VAR trend** (tightening/widening), sub-scores, base value, archetype posture |
 | `GET /api/scores/book-forecast?window=&terminal=&product=` | the **bottom-up book demand forecast** (7/30/90-day expected band summed from every customer's lane, filterable by terminal/product) + the **forecastability** split (A/B-steady vs C/D-erratic volume share, with the quarter-over-quarter trend) |
 | `POST /api/studio/crosswalk/upload-names` · `GET /api/studio/unmapped-customers` | upload the hand-built raw→coded name map (confirmed; re-applied across the store) · list raw names still unmapped |
+| `POST /api/studio/product-map/upload` · `GET /api/studio/unmapped-products` | upload the hand-built raw→standardized **product** chart (confirmed; re-applied across the store) · list raw product codes still unmapped |
 | `GET /api/scores/quadrant?window=` | Explainability × Profitability scatter points with archetype tags |
 | `GET /api/scores/backtest` | per-customer one-step forecast error by method |
 | `GET /api/scores/config` | the scoring config (every weight) + windows + archetypes/posture |
@@ -791,7 +794,7 @@ backend/
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping (BOL/EDI aliases, 2-tier threshold), inspect (+profiling), validate, coerce (mixed + Excel-serial dates)
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
-    crosswalk.py            # ★ Customer Master crosswalk — fuzzy merge groups, confirm/reject, apply, load_name_map (raw→coded)
+    crosswalk.py            # ★ Customer Master crosswalk (fuzzy merge groups, confirm/reject, apply, load_name_map raw→coded) + Product Reference chart (load_product_map / apply_products_to_frame, raw→standardized)
     validation.py           # rule engine: required-only gating (+ EDI-control-row junk), negatives-as-corrections, drill-down + quarantine index
     hygiene.py              # configurable cleaning pipeline (HygieneOptions, apply_fixes, group_by_bol, ASTM D1250 vcf)
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
@@ -964,9 +967,15 @@ CLAUDE.md
   net with the corrected value); quarantine **re-import uses `net_correction="off"`** so hand-fixed
   values are respected.
 - The studio persistence tables (`import_profiles`, `import_log`, `customer_crosswalk`,
-  `hygiene_audit`, `quarantine`) **survive reset/demo** by design; init runs idempotent
-  `ALTER TABLE … ADD COLUMN IF NOT EXISTS` migrations (`import_profiles.hygiene`; `lifts.bol_number`)
-  for pre-existing stores.
+  `product_crosswalk`, `hygiene_audit`, `quarantine`) **survive reset/demo** by design; init runs
+  idempotent `ALTER TABLE … ADD COLUMN IF NOT EXISTS` migrations (`import_profiles.hygiene`;
+  `lifts.bol_number`) for pre-existing stores.
+- **Product standardization mirrors the customer name map.** A two-column **raw product code →
+  standardized code** chart loads as confirmed `product_crosswalk` entries; `hygiene._resolve_products`
+  rewrites the `product` column at commit (option `resolve_products`, default on) and
+  `db.reapply_product_crosswalk` restates it across every product-bearing table for already-loaded
+  data. Customers key on the consignee **name** (so the name map resolves) and products standardize
+  via this chart — the consignee **number** is internal-only and never a label.
 - Uploads are cached in-process by `upload_id`; a server restart between map/commit means
   re-uploading the file (the UI surfaces this as "upload expired").
 - **Tests:** `uv run pytest` (dev group adds `pytest` + `httpx`); covers VCF, profiling, crosswalk,

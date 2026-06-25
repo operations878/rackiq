@@ -544,6 +544,29 @@ export interface NameMapResult extends StudioState {
   crosswalk_masters: number;
 }
 
+export interface UnmappedProduct {
+  product: string;
+  lift_count: number;
+  total_net_gallons: number;
+}
+export interface UnmappedProductResponse {
+  unmapped: UnmappedProduct[];
+  n_unmapped: number;
+  product_standards: number;
+}
+export interface ProductMapResult extends StudioState {
+  ok: boolean;
+  raw_column: string;
+  standard_column: string;
+  loaded: number;
+  standards: number;
+  remapped: Record<string, number>;
+  total_remapped: number;
+  unmapped: UnmappedProduct[];
+  n_unmapped: number;
+  product_standards: number;
+}
+
 export interface BaseValueBlock {
   score: number;
   grade: string | null;

@@ -50,6 +50,16 @@ STUDIO_DDL = [
         source VARCHAR,
         updated_at VARCHAR
     )""",
+    # Product Reference chart: every raw product description resolves to a standardized code
+    # (raw_code -> standard_code). Authoritative human source of truth (status 'confirmed'),
+    # applied to the `product` column on every commit and re-applied across the loaded store.
+    """CREATE TABLE IF NOT EXISTS product_crosswalk (
+        raw_code VARCHAR PRIMARY KEY,
+        standard_code VARCHAR,
+        status VARCHAR,
+        source VARCHAR,
+        updated_at VARCHAR
+    )""",
     # Hygiene audit log: one row per transformation applied during a commit.
     """CREATE TABLE IF NOT EXISTS hygiene_audit (
         ts VARCHAR,
@@ -410,6 +420,98 @@ def delete_crosswalk_entry(con, variant_key: str) -> None:
 
 def clear_crosswalk(con) -> None:
     con.execute("DELETE FROM customer_crosswalk")
+
+
+# ---- Product Reference chart (raw product description -> standardized code) ------
+def get_product_crosswalk(con) -> dict[str, dict]:
+    """Map every raw product code -> {standard_code, status, source}."""
+    rows = con.execute(
+        "SELECT raw_code, standard_code, status, source FROM product_crosswalk").fetchall()
+    return {r[0]: {"standard_code": r[1], "status": r[2], "source": r[3]} for r in rows}
+
+
+def list_product_crosswalk(con) -> list[dict]:
+    rows = con.execute(
+        "SELECT raw_code, standard_code, status, source, updated_at "
+        "FROM product_crosswalk ORDER BY standard_code, raw_code").fetchall()
+    return [{"raw_code": r[0], "standard_code": r[1], "status": r[2],
+             "source": r[3], "updated_at": r[4]} for r in rows]
+
+
+def upsert_product_crosswalk_entries(con, entries: list[dict]) -> int:
+    """Insert/replace product-crosswalk rows (raw_code, standard_code, status, source, updated_at)."""
+    n = 0
+    for e in entries:
+        con.execute("DELETE FROM product_crosswalk WHERE raw_code = ?", [e["raw_code"]])
+        con.execute(
+            "INSERT INTO product_crosswalk (raw_code, standard_code, status, source, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [e["raw_code"], e.get("standard_code"), e.get("status", "confirmed"),
+             e.get("source", "product_map"), e.get("updated_at")])
+        n += 1
+    return n
+
+
+def clear_product_crosswalk(con) -> None:
+    con.execute("DELETE FROM product_crosswalk")
+
+
+def reapply_product_crosswalk(con) -> dict:
+    """Re-resolve the `product` column of every already-loaded row to its standardized code.
+
+    Mirrors :func:`reapply_crosswalk` for products: a Product Reference upload regroups data
+    that was loaded BEFORE the chart existed, so all raw descriptions of one product collapse to
+    a single standardized code and product mix / reconciliation recompute on it. Idempotent.
+    """
+    remapped: dict[str, int] = {}
+    for table in schema.PRODUCT_TABLES:
+        if row_count(con, table) == 0:
+            continue
+        moved = con.execute(f"""
+            SELECT count(*) FROM {table} t
+            JOIN product_crosswalk pc ON TRIM(CAST(t.product AS VARCHAR)) = pc.raw_code
+            WHERE pc.status = 'confirmed' AND pc.standard_code IS NOT NULL
+              AND pc.standard_code <> t.product
+        """).fetchone()[0]
+        if moved:
+            con.execute(f"""
+                UPDATE {table} SET product = pc.standard_code
+                FROM product_crosswalk pc
+                WHERE TRIM(CAST({table}.product AS VARCHAR)) = pc.raw_code
+                  AND pc.status = 'confirmed' AND pc.standard_code IS NOT NULL
+                  AND pc.standard_code <> {table}.product
+            """)
+            remapped[table] = int(moved)
+    return {"remapped": remapped, "total_remapped": sum(remapped.values())}
+
+
+def unmapped_products(con, limit: int = 500) -> list[dict]:
+    """Distinct product values in lifts the Product Reference chart doesn't standardize yet
+    (a raw code that is not itself a confirmed standardized code)."""
+    if row_count(con, schema.LIFTS) == 0:
+        return []
+    rows = con.execute("""
+        SELECT l.product,
+               count(*)                        AS lifts,
+               coalesce(sum(l.net_gallons), 0) AS gal
+        FROM lifts l
+        WHERE l.product IS NOT NULL AND TRIM(CAST(l.product AS VARCHAR)) <> ''
+          AND l.product NOT IN (
+              SELECT standard_code FROM product_crosswalk
+              WHERE status = 'confirmed' AND standard_code IS NOT NULL)
+        GROUP BY 1
+        ORDER BY gal DESC
+        LIMIT ?
+    """, [limit]).fetchall()
+    return [{"product": r[0], "lift_count": int(r[1]),
+             "total_net_gallons": round(float(r[2]), 1)} for r in rows]
+
+
+def product_standard_count(con) -> int:
+    row = con.execute(
+        "SELECT count(DISTINCT standard_code) FROM product_crosswalk WHERE status = 'confirmed'"
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 # ---- Hygiene audit log ----------------------------------------------------------

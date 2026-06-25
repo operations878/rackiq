@@ -12,6 +12,7 @@ Steps (in order):
   4. fill_defaults          — fill missing terminal/product from a chosen default
   5. net_60_correction      — ASTM D1250-style gross→net(60°F) volume correction
   6. resolve_customers      — apply the Customer Master crosswalk (variant → master id)
+  7. resolve_products       — standardize the product column via the Product Reference chart
 
 Deduplication and quarantine routing are orchestrated by the caller (``api/studio.py``)
 *after* fixes, using the validation rule engine, so failing rows are held — never dropped.
@@ -42,6 +43,7 @@ class HygieneOptions:
     net_correction: str = "auto"            # "auto" | "factor" | "gross" | "off"
     net_factor: float | None = None
     resolve_customers: bool = True
+    resolve_products: bool = True           # standardize the product column via the Product Reference chart
     dedupe_exact: bool = True
     dedupe_lifts_grain: bool = False
     quarantine_failures: bool = True
@@ -236,6 +238,22 @@ def _resolve_customers(df, table, opts, con, report, audit):
     return df
 
 
+def _resolve_products(df, table, opts, con, report, audit):
+    if not opts.resolve_products or con is None:
+        return df
+    if not schema.product_column(table):
+        return df
+    from . import crosswalk
+    df, n_remapped, rewrites = crosswalk.apply_products_to_frame(df, table, con)
+    if n_remapped:
+        sample = "; ".join(f"{r['from']}→{r['to']}" for r in rewrites[:3])
+        more = "" if len(rewrites) <= 3 else f" (+{len(rewrites) - 3} more)"
+        _emit(report, audit, "resolve_products",
+              f"Standardized {n_remapped} row(s)' product via the Product Reference chart "
+              f"[{sample}{more}].", n_remapped)
+    return df
+
+
 # ---- Public API -----------------------------------------------------------------
 def apply_fixes(df: pd.DataFrame, table: str, options: HygieneOptions | dict | None = None,
                 con=None) -> tuple[pd.DataFrame, list[dict], list[dict]]:
@@ -252,6 +270,7 @@ def apply_fixes(df: pd.DataFrame, table: str, options: HygieneOptions | dict | N
     df = _fill_defaults(df, table, opts, report, audit)
     df = _net_correction(df, table, opts, report, audit)
     df = _resolve_customers(df, table, opts, con, report, audit)
+    df = _resolve_products(df, table, opts, con, report, audit)
     return df, report, audit
 
 
