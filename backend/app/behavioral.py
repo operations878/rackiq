@@ -36,6 +36,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from . import calendar_days
 from .scoring_config import ScoringConfig
 
 # Plain-language descriptions of each behavioral label (used by the UI + the headline read).
@@ -169,6 +170,19 @@ def _longest_run(mask: np.ndarray) -> int:
     return int(best)
 
 
+def _longest_silent_weight(active: np.ndarray, weights: np.ndarray) -> float:
+    """Longest silent stretch in **working days** — the max run of inactive days summed by their
+    working-day weight (so Sundays/holidays add 0, a Fri→Mon weekend isn't a 'long silence')."""
+    best = run = 0.0
+    for a, w in zip(np.asarray(active, dtype=bool), np.asarray(weights, dtype=float)):
+        if a:
+            run = 0.0
+        else:
+            run += float(w)
+            best = max(best, run)
+    return best
+
+
 # ---- classification -------------------------------------------------------------
 def _frequency_class(active_rate: float, cfg: ScoringConfig) -> str:
     if active_rate >= cfg.behavior_freq_daily:
@@ -225,47 +239,64 @@ def _label(freq: str, size: str, timing: str, intermittent: bool, n_active: int,
 
 # ---- one window's stats ---------------------------------------------------------
 def _window_stats(net_arr: np.ndarray, cnt_arr: np.ndarray, idx: pd.DatetimeIndex,
-                  window: str, cfg: ScoringConfig) -> dict:
-    """All presence + size + naive-all-days stats and the classification for ONE calendar window.
+                  window: str, cfg: ScoringConfig, weights: np.ndarray,
+                  working_week_len: float) -> dict:
+    """All presence + size + naive-all-days stats and the classification for ONE window, computed on
+    the **working-day calendar**.
 
     ``net_arr`` / ``cnt_arr`` are the per-calendar-day net-gallons and lift-count over ``idx`` (zeros
-    on silent days included). Presence is read over ALL days; size-when-present over ACTIVE days only.
+    on silent days included); ``weights`` is the matching per-day working-day weight (0 for
+    Sun/holiday, the terminal's Saturday weight for Saturdays, 1 for Mon–Fri). Presence/cadence are
+    read over **weighted working days** (so a Mon–Fri buyer who skips Sat/Sun isn't penalized); size-
+    when-present is over ACTIVE days only (real loads, exceptions included).
     """
     n_days = len(idx)
+    weights = np.asarray(weights, dtype=float)
     active = cnt_arr > 0
+    counted = weights > 0                      # working days (excludes Sun/holiday)
     n_active = int(active.sum())
     n_lifts = int(cnt_arr.sum())
-    active_rate = (n_active / n_days) if n_days else 0.0
-    weeks = (n_days / 7.0) if n_days else 0.0
+    denom = float(weights.sum())               # the working-day denominator
+    active_weighted = float(weights[active].sum())
+    active_rate = (active_weighted / denom) if denom > 0 else 0.0
+    weeks = (denom / working_week_len) if working_week_len > 0 else 0.0
 
-    # ---- presence / frequency (zeros are data) ----
+    # ---- presence / cadence in WORKING days (a Fri→Mon gap is ~1, not 3) ----
+    cw = np.cumsum(weights)
     active_pos = np.flatnonzero(active)
-    gaps = np.diff(active_pos).astype(float) if len(active_pos) >= 2 else np.array([])
+    if len(active_pos) >= 2:
+        gaps = np.diff(cw[active_pos])         # working-day distance between consecutive active days
+        gaps = gaps[gaps > 0]
+    else:
+        gaps = np.array([])
     median_gap = float(np.median(gaps)) if len(gaps) else None
     gap_cv = _robust_gap_cv(gaps) if len(gaps) >= 2 else None
-    longest_silent = _longest_run(~active)
+    longest_silent = _longest_silent_weight(active, weights)
     presence = {
         "active_day_rate": round(active_rate, 4),
         "n_active_days": n_active, "n_days": n_days,
+        "working_days": round(denom, 1),
         "median_gap_days": round(median_gap, 1) if median_gap is not None else None,
         "gap_cv": round(gap_cv, 3) if gap_cv is not None else None,
-        "longest_silent_days": int(longest_silent),
+        "longest_silent_days": round(longest_silent, 1),
         "lifts_per_week": round(n_lifts / weeks, 2) if weeks else None,
         "active_days_per_week": round(n_active / weeks, 2) if weeks else None,
     }
 
-    # ---- size-when-present (active days only) ----
+    # ---- size-when-present (active days only; exception lifts on Sun/holiday kept) ----
     size = _describe(net_arr[active], cfg) if n_active else None
     size_cv = size["cv"] if size else None
 
-    # ---- naive all-days (incl. zeros) + the misleading-average detector ----
-    # The literal spec: an all-days MEDIAN of 0 with an all-days MEAN > 0 means most days are silent
-    # yet they do buy — so the naive daily average is a smear of "they never lift that". This is true
-    # for any sub-half-the-days buyer; the SEVERITY below scales how dangerous treating them as a
-    # daily rate is (a once-a-month marine parcel is far more misleading than an every-3-days ratable).
-    all_days = _describe(net_arr, cfg)
+    # ---- naive all-days over COUNTED (working) days + the misleading-average detector ----
+    # The literal spec: an all-days MEDIAN of 0 with an all-days MEAN > 0 means most working days are
+    # silent yet they do buy — so the naive daily average is a smear of "they never lift that". This
+    # is now measured on the corrected calendar (Sun/holidays excluded), so a steady Mon–Fri buyer is
+    # NOT mislabeled intermittent just because weekends are zeros. The SEVERITY below scales how
+    # dangerous treating them as a daily rate is (a once-a-month marine parcel >> an every-3-days ratable).
+    counted_net = net_arr[counted]
+    all_days = _describe(counted_net if len(counted_net) else net_arr, cfg)
     intermittent = bool(
-        all_days is not None and n_days >= cfg.behavior_intermittent_min_days and n_active >= 1
+        all_days is not None and denom >= cfg.behavior_intermittent_min_days and n_active >= 1
         and all_days["median"] <= 0 < all_days["mean"])
 
     # ---- classification ----
@@ -401,14 +432,19 @@ def _presence_lane(s: dict) -> dict:
 
 # ---- main entry: one customer's daily presence-aware profile ---------------------
 def daily_profile(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
-                  name: str | None = None) -> dict:
+                  name: str | None = None, cal=None, terminal: str | None = None) -> dict:
     """Daily presence-aware behavioral profile for ONE (master) customer's full lift history.
 
     Computed over rolling calendar windows (``cfg.behavior_windows`` + ``"all"``), each anchored to
     the last data date (``as_of``) and clipped at the customer's first active day so a brand-new
-    account isn't charged for days before it existed. Returns the full per-window stats (presence +
-    size-when-present + naive all-days + classification + daily bars), the headline label/read taken
-    from a primary window, and the presence-aware lane restatement.
+    account isn't charged for days before it existed. Everything is measured on the **working-day
+    calendar** (``cal`` — a :class:`calendar_days.WorkingCalendar`): Sundays/holidays are excluded
+    from the denominator and gaps, Saturdays carry the terminal's data-driven partial weight. When
+    ``cal`` is None a default calendar (US holidays + default Saturday weight) is built so direct /
+    test calls still work; ``terminal`` selects the terminal's learned Saturday weight.
+
+    Returns the full per-window stats (presence + size-when-present + naive all-days + classification
+    + daily bars), the headline label/read from a primary window, and the presence-aware lane.
     """
     out_unavailable = {"available": False, "windows": {}, "primary_window": None, "label": None,
                        "frequency_class": None, "size_class": None, "intermittent": False,
@@ -422,6 +458,10 @@ def daily_profile(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
     dts, net = dts[keep], net[keep].fillna(0.0)
     if not len(dts):
         return out_unavailable
+
+    if cal is None:
+        cal = calendar_days.default_calendar(calendar_days.DEFAULT_CONFIG, cl)
+    working_week_len = cal.working_week_length(terminal)
 
     day = dts.dt.normalize()
     by_net = net.groupby(day).sum()
@@ -439,13 +479,14 @@ def daily_profile(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
         idx = pd.date_range(start, end, freq="D")
         net_arr = by_net.reindex(idx, fill_value=0.0).to_numpy(dtype=float)
         cnt_arr = by_cnt.reindex(idx, fill_value=0).to_numpy(dtype=float)
-        return net_arr, cnt_arr, idx
+        weights = cal.weights_for_index(idx, terminal)
+        return net_arr, cnt_arr, idx, weights
 
     window_keys = [str(w) for w in cfg.behavior_windows] + ["all"]
     windows: dict[str, dict] = {}
     for w in window_keys:
-        net_arr, cnt_arr, idx = grid(w)
-        stats = _window_stats(net_arr, cnt_arr, idx, w, cfg)
+        net_arr, cnt_arr, idx, weights = grid(w)
+        stats = _window_stats(net_arr, cnt_arr, idx, w, cfg, weights, working_week_len)
         # make each window self-describing so the detail's 7/30/90/all toggle stays consistent
         stats["headline"] = _headline(name, stats, cfg)
         stats["presence_lane"] = _presence_lane(stats)

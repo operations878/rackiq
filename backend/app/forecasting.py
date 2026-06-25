@@ -371,13 +371,16 @@ def _model_series(periods: pd.DataFrame, grain: str, last_lift: pd.Timestamp) ->
 
 # ---- Main entry: forecast one customer ------------------------------------------
 def forecast_customer(core: dict, cfg: ScoringConfig, today: pd.Timestamp,
-                      as_of: pd.Timestamp) -> dict:
+                      as_of: pd.Timestamp, cal=None, terminal: str | None = None) -> dict:
     """Real forward forecast for one customer, anchored to ``today``.
 
     ``core`` is the scoring engine's per-customer bundle (periods, grain, lane, cadence, raw
     lifts). ``today`` is the real calendar date at request time; ``as_of`` is the book's last
-    data date. Returns the forecast block (horizons measured from today, chosen model + its
-    backtested accuracy, honest band, recency-gap note, and the forward lane series for the chart).
+    data date. ``cal`` (a :class:`calendar_days.WorkingCalendar`) makes the "days silent vs cadence"
+    overdue/slowing check count **working days** — consistent with the now-working-day
+    ``base_cadence_days`` — so a customer quiet only across a Fri–Sun isn't flagged slowing. Returns
+    the forecast block (horizons from today, chosen model + backtested accuracy, honest band,
+    recency-gap note, and the forward lane series for the chart).
     """
     grain = core["grain"]
     lane = core["lane"]
@@ -420,8 +423,14 @@ def forecast_customer(core: dict, cfg: ScoringConfig, today: pd.Timestamp,
     fc_path = _shrink(fc_path, y, rel_sigma0, cfg)  # reliability shrinkage toward the recent level
 
     # ---- recency damping: an account silent well past its own cadence is slowing / churning ----
+    # days-silent is counted in WORKING days (consistent with the working-day base_cadence_days), so
+    # a customer quiet only across a weekend isn't mistaken for overdue.
     cad = core.get("base_cadence_days")
-    days_silent = max(0.0, float((today - pd.Timestamp(last_lift)).days)) if last_lift is not None else 0.0
+    if last_lift is not None:
+        days_silent = (cal.working_days_between(last_lift, today, terminal) if cal is not None
+                       else max(0.0, float((today - pd.Timestamp(last_lift)).days)))
+    else:
+        days_silent = 0.0
     overdue = (days_silent / cad) if (cad and cad > 0) else 0.0
     damp = 1.0
     slowing = False
@@ -512,8 +521,8 @@ def forecast_customer(core: dict, cfg: ScoringConfig, today: pd.Timestamp,
             plain += (" Low predictability — no model beat a naive guess, so treat this as a "
                       "rough range, not a firm number.")
         elif slowing:
-            plain += (f" They've been quiet {round(days_silent)} days (past their usual "
-                      f"~{round(cad)}-day rhythm), so treat this as a rough range, not a firm number.")
+            plain += (f" They've been quiet ~{round(days_silent)} working days (past their usual "
+                      f"~{round(cad)}-working-day rhythm), so treat this as a rough range, not a firm number.")
         else:
             plain += " Their buying is choppy, so treat this as a rough range, not a firm number."
 

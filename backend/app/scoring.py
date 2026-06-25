@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from . import behavioral, db, forecasting, schema, weather
+from . import behavioral, calendar_days, db, forecasting, schema, weather
 from .scoring_config import (ARCHETYPE_POSTURE, ARCHETYPES, DEFAULT_CONFIG, WINDOWS,
                              ScoringConfig, grade)
 
@@ -509,18 +509,29 @@ def _lane_diagnostics(y: np.ndarray, fitted: np.ndarray, resid: np.ndarray,
 
 # ---- Per-customer computation ---------------------------------------------------
 def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
-                   light: bool = False) -> dict:
+                   light: bool = False, cal=None, terminal: str | None = None) -> dict:
     """VAR lane + cadence + raw volume/timing facts for one customer's (windowed) lifts.
 
     ``light=True`` skips the expensive diagnostics layer — used by the point-in-time VAR-trend
-    re-fits where only the headline score is needed.
+    re-fits where only the headline score is needed. ``cal`` is a
+    :class:`calendar_days.WorkingCalendar`: inter-lift **gaps** and **days-since-last** are measured
+    in **working days** (Sundays/holidays excluded, Saturdays partial), so the cadence lane and
+    recency reflect a real operating week (a Fri→Mon gap is ~1 working day, not 3). The **volume**
+    lane stays on calendar weekly/monthly buckets (it measures seasonal volume, not timing).
     """
     cl = cl.sort_values("lift_datetime")
     dts = pd.to_datetime(cl["lift_datetime"])
     vols = cl["net_gallons"].to_numpy(dtype=float)
     n = len(cl)
-    gaps = (np.diff(dts.to_numpy().astype("datetime64[ns]").astype("int64")) / (1e9 * 86400.0)
-            if n >= 2 else np.array([]))
+    if cal is None:
+        cal = calendar_days.default_calendar(calendar_days.DEFAULT_CONFIG, cl)
+    if n >= 2:
+        # vectorized working-day gaps: Δ of the cumulative working-day count at each lift date
+        cumvals = cal.cumulative_at(dts.to_numpy(), terminal)
+        gaps = np.diff(cumvals)
+        gaps = gaps[gaps > 0]                      # drop same-day pairs (0 working-day gap)
+    else:
+        gaps = np.array([])
     grain = _period_grain(gaps, cfg)
 
     # per-period series over the active span (interior zeros = missed periods → excursions)
@@ -549,7 +560,8 @@ def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
     var_status = "ok" if sufficient_var else "insufficient_history"
 
     last_lift = dts.max()
-    days_since = float((as_of - last_lift).days) if pd.notna(last_lift) else None
+    days_since = (cal.working_days_between(last_lift, as_of, terminal)
+                  if (pd.notna(last_lift) and as_of is not None) else None)
     # recent-vs-prior trend over the periods
     a = periods["actual"].to_numpy()
     if len(a) >= 6:
@@ -579,8 +591,8 @@ def _customer_core(cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
 # OWN backtest error, and every horizon anchored to TODAY (not the last data date). The VAR
 # score itself is untouched — this is a forward layer ON TOP of the frozen lane.
 def _forward_projection(core: dict, cfg: ScoringConfig, today: pd.Timestamp,
-                        as_of: pd.Timestamp) -> dict:
-    return forecasting.forecast_customer(core, cfg, today, as_of)
+                        as_of: pd.Timestamp, cal=None, terminal: str | None = None) -> dict:
+    return forecasting.forecast_customer(core, cfg, today, as_of, cal=cal, terminal=terminal)
 
 
 def _resolve_today(as_of, today):
@@ -714,7 +726,8 @@ def _trend_comp(now_s, now_g, prior_s, prior_g, label: str, cfg: ScoringConfig) 
             "note": f"Lane {verb}: VAR {round(prior_s)}→{round(now_s)}{gp} over the last {label}."}
 
 
-def _var_trend(full_cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp) -> dict:
+def _var_trend(full_cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp,
+               cal=None, terminal: str | None = None) -> dict:
     if as_of is None or not len(full_cl):
         return {"available": False, "comparisons": {}}
     look = pd.Timedelta(days=cfg.var_trend_lookback_days)
@@ -723,7 +736,7 @@ def _var_trend(full_cl: pd.DataFrame, cfg: ScoringConfig, as_of: pd.Timestamp) -
         sub = full_cl[(full_cl["lift_datetime"] <= point) & (full_cl["lift_datetime"] >= point - look)]
         if len(sub) < cfg.var_min_lifts:
             return None, None
-        c = _customer_core(sub, cfg, point, light=True)
+        c = _customer_core(sub, cfg, point, light=True, cal=cal, terminal=terminal)
         return c["var_score"], c["var_grade"]
 
     now_s, now_g = score_at(as_of)
@@ -1144,29 +1157,35 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all",
     q_by_id = (data["quotes"].groupby("customer_id") if len(data["quotes"]) else None)
     full_by_id = lifts.groupby("customer_id")  # full history (for the window-independent VAR trend)
 
+    # Working-day calendar learned from the FULL book (per-terminal Saturday weight, US holidays).
+    # Threaded through cadence/recency/behavioral/forecast so all day-counting uses working days.
+    cal, _rhythm = calendar_days.from_lifts(lifts, calendar_days.DEFAULT_CONFIG)
+
     # ---- pass 1: per-customer cores, facts, raw sub-score inputs ----
     rows = {}
     for cid, cl in lw.groupby("customer_id"):
         if not len(cl):
             continue
-        core = _customer_core(cl, cfg, as_of)
+        # the customer's home/dominant terminal selects the terminal's learned Saturday weight
+        term = home_by_id.get(cid)
+        if not term and "terminal" in cl and cl["terminal"].notna().any():
+            term = cl["terminal"].mode().iloc[0]
+        core = _customer_core(cl, cfg, as_of, cal=cal, terminal=term)
         inv = inv_by_id.get_group(cid) if (inv_by_id is not None and cid in inv_by_id.groups) else pd.DataFrame()
         q = q_by_id.get_group(cid) if (q_by_id is not None and cid in q_by_id.groups) else pd.DataFrame()
         facts = _facts(cl, core, inv, q, cfg, data)
         raw = _raw_subscore_inputs(cl, core, q, data["market"], cfg, data)
         sufficient = core["n_lifts"] >= cfg.suff_min_lifts and core["n_weeks"] >= (cfg.suff_min_days / 7.0)
         # VAR as a forecast: forward projection, lane-break (excursion) weather, and VAR-over-time trend
-        term = home_by_id.get(cid)
-        if not term and "terminal" in cl and cl["terminal"].notna().any():
-            term = cl["terminal"].mode().iloc[0]
-        forward = _forward_projection(core, cfg, today, as_of)
+        forward = _forward_projection(core, cfg, today, as_of, cal=cal, terminal=term)
         excursions = _excursions(core, term, con, cfg)
         full_cl = full_by_id.get_group(cid) if cid in full_by_id.groups else cl
-        var_trend = _var_trend(full_cl, cfg, as_of)
+        var_trend = _var_trend(full_cl, cfg, as_of, cal=cal, terminal=term)
         # Daily presence-aware behavioral profile — window-independent (it computes its OWN
         # 7/30/90/all calendar windows from the FULL history, anchored to as_of), so it reads the
         # same regardless of the scoring window. Enriches VAR; never touches the score.
-        behavior = behavioral.daily_profile(full_cl, cfg, as_of, name=name_by_id.get(cid, cid))
+        behavior = behavioral.daily_profile(full_cl, cfg, as_of, name=name_by_id.get(cid, cid),
+                                            cal=cal, terminal=term)
         rows[cid] = {"core": core, "facts": facts, "raw": raw, "inv": inv, "q": q,
                      "data_sufficient": sufficient, "forward": forward,
                      "excursions": excursions, "var_trend": var_trend, "terminal": term,
@@ -1614,10 +1633,11 @@ def backtest(con, cfg: ScoringConfig | None = None) -> dict:
     lifts, as_of = data["lifts"], data["as_of"]
     if not len(lifts):
         return {"customers": [], "methods": ["naive_last", "seasonal", "lane_base"], "summary": {}}
+    cal, _ = calendar_days.from_lifts(lifts, calendar_days.DEFAULT_CONFIG)
     rows = []
     agg = {"naive_last": [], "seasonal": [], "lane_base": []}
     for cid, cl in lifts.groupby("customer_id"):
-        core = _customer_core(cl, cfg, as_of)
+        core = _customer_core(cl, cfg, as_of, cal=cal)
         a = core["periods"]["actual"].to_numpy(float)
         starts = pd.DatetimeIndex(core["periods"]["period_start"])
         if len(a) < 6:
@@ -1662,13 +1682,14 @@ def forecast_backtest(con, cfg: ScoringConfig | None = None, today=None) -> dict
         return {"customers": [], "methods": methods, "summary": {}, "improvement": {},
                 "n_customers": 0, "n_beat_naive": 0, "n_beat_old": 0}
     today = _resolve_today(as_of, today)
+    cal, _ = calendar_days.from_lifts(lifts, calendar_days.DEFAULT_CONFIG)
     name_by_id = (dict(zip(data["customers"]["customer_id"], data["customers"]["name"]))
                   if len(data["customers"]) else {})
     rows = []
     agg = {m: [] for m in methods}
     n_beat_naive = n_beat_old = 0
     for cid, cl in lifts.groupby("customer_id"):
-        core = _customer_core(cl, cfg, as_of, light=True)
+        core = _customer_core(cl, cfg, as_of, light=True, cal=cal)
         comp = forecasting.compare_customer(core, cfg)
         if comp is None:
             continue

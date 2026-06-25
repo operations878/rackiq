@@ -11,6 +11,8 @@ import Scores from "./pages/Scores";
 import Reconciliation from "./pages/Reconciliation";
 import DailyOps from "./pages/DailyOps";
 import DemandCockpit from "./pages/DemandCockpit";
+import Hedging from "./pages/Hedging";
+import Calendar from "./pages/Calendar";
 import Pricing from "./pages/Pricing";
 import BookOverview from "./pages/BookOverview";
 import Radar from "./pages/Radar";
@@ -100,6 +102,7 @@ export default function App() {
       items: [
         { key: "daily", label: "Daily Operating", icon: "◎", match: (b) => b === "daily" },
         { key: "demand", label: "Demand Cockpit", icon: "↗", match: (b) => b === "demand" },
+        { key: "hedging", label: "Demand Hedging", icon: "⛁", match: (b) => b === "hedging" },
         { key: "pricing", label: "Pricing Sandbox", icon: "◇", match: (b) => b === "pricing" },
         { key: "scorecards", label: "Scorecards", icon: "▤", match: (b) => b === "scorecards" || b === "scorecard" },
         { key: "playbook", label: "Sales Playbook", icon: "✺", match: (b) => b === "playbook" },
@@ -119,6 +122,7 @@ export default function App() {
       title: "Data",
       items: [
         { key: "studio", label: "Data Studio", icon: "⥁", match: (b) => b === "studio" },
+        { key: "calendar", label: "Working-Day Calendar", icon: "▥", match: (b) => b === "calendar" },
         { key: "health", label: "Data Health", icon: "♥", match: (b) => b === "health", badge: quarantine },
       ],
     },
@@ -167,6 +171,8 @@ export default function App() {
           {base === "" && <VarHome summary={summary} navigate={navigate} />}
           {base === "daily" && <DailyOps summary={summary} navigate={navigate} />}
           {base === "demand" && <DemandCockpit summary={summary} navigate={navigate} />}
+          {base === "hedging" && <Hedging summary={summary} navigate={navigate} />}
+          {base === "calendar" && <Calendar summary={summary} navigate={navigate} />}
           {base === "pricing" && <Pricing summary={summary} navigate={navigate} />}
           {(base === "scorecards" || base === "scorecard") && <Scorecards summary={summary} customerId={scorecardId} />}
           {base === "playbook" && <Playbook summary={summary} />}

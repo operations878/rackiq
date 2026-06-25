@@ -208,7 +208,8 @@ def test_silent_account_is_damped_and_flagged(con):
     q = next(c for c in res["customers"] if c["customer_id"] == "Quiet Co")
     f = q["forecast"]
     assert f["available"]
-    assert f["slowing"] is True and f["days_silent"] >= 120
+    # days_silent is now counted in WORKING days (≈ 5/7 of the ~130+ calendar days of silence)
+    assert f["slowing"] is True and f["days_silent"] >= 90
     assert f["rough"] is True and "rough range" in f["plain"]
 
 

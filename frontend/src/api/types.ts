@@ -1499,3 +1499,134 @@ export interface PricingRecommendationsResponse {
   acceptance: AcceptanceSummary | null;
   recommendations: PricingRecommendations | null;
 }
+
+// ---- Working-day calendar (Phase 1) ----
+export interface WeekdayRhythm {
+  weekday: string;
+  dow: number;
+  occurrences: number;
+  lifts: number;
+  lift_share: number;
+  volume: number;
+  volume_share: number;
+  activity_per_day: number;
+  activity_index: number | null;
+  day_type: "full" | "low" | "nonlifting";
+}
+export interface RhythmGroup {
+  first_lift: string;
+  last_lift: string;
+  n_lifts: number;
+  total_net_gallons: number;
+  by_weekday: WeekdayRhythm[];
+  saturday_weight: number;
+  saturday_measured: boolean;
+  saturday_occurrences: number;
+  saturday_lifts: number;
+  full_weekday_activity: number;
+  holiday_count_in_span: number;
+  exception_lifts: number;
+  exception_share: number;
+}
+export interface CalendarResponse {
+  available: boolean;
+  config: Record<string, number | string | boolean | null>;
+  today: string;
+  network: RhythmGroup | null;
+  terminals: Record<string, RhythmGroup>;
+  terminal_names: string[];
+  saturday_weights: Record<string, number | null>;
+  holidays_in_span: { date: string; name: string }[];
+  upcoming_exclusions: { date: string; weekday: string; reason: string }[];
+}
+
+// ---- Operational demand hedging (Phase 2) ----
+export interface CoilDriver {
+  customer_id: string;
+  name: string;
+  coil_gallons: number;
+  overdue_ratio: number | null;
+  working_days_since_last: number | null;
+  cadence_working_days: number | null;
+  typical_load: number;
+  behavior_label: string | null;
+}
+export interface HedgingHorizon {
+  horizon_working_days: number;
+  by_date: string;
+  expected: number;
+  p10: number;
+  p50: number;
+  p90: number;
+  sigma: number;
+  floor: number;
+  upside: number;
+  floor_share: number | null;
+  service_level: number;
+  z: number;
+  band_buffer: number;
+  coil_buffer: number;
+  buffer: number;
+  recommended_staging: number;
+  buffer_elevated: boolean;
+  overdue_drivers: CoilDriver[];
+  readout: string;
+}
+export interface HedgingRiskRow {
+  customer_id: string;
+  name: string;
+  variability_share: number;
+  expected: number;
+  typical_load: number;
+  behavior_label: string | null;
+  var_grade: string | null;
+  overdue: boolean;
+  overdue_ratio: number | null;
+  is_bursty: boolean;
+  single_lift_exceeds_buffer: boolean;
+}
+export interface HedgingCustomer {
+  customer_id: string;
+  name: string;
+  behavior_label: string | null;
+  frequency_class: string | null;
+  var_score: number | null;
+  var_grade: string | null;
+  cadence_working_days: number | null;
+  working_days_since_last: number | null;
+  overdue_ratio: number | null;
+  overdue: boolean;
+  slowing: boolean;
+  typical_load: number;
+  terminal_share: number;
+  expected_primary_horizon: number;
+  is_bursty: boolean;
+  is_steady: boolean;
+  intermittent: boolean;
+  misleading_severity: string | null;
+  variability_share: number | null;
+  single_lift_exceeds_buffer: boolean;
+}
+export interface HedgingResponse {
+  terminal: string | null;
+  terminals: string[];
+  window: string;
+  windows: string[];
+  as_of: string | null;
+  forecast_anchor: string | null;
+  data_lag_days: number | null;
+  recency_note: string | null;
+  service_level: number;
+  saturday_weight: number;
+  config: Record<string, number | string | boolean | number[]>;
+  availability: Record<string, { available: boolean; reason: string }>;
+  inventory_connected: boolean;
+  inventory: { inventory: number; capacity: number; min_heel: number; as_of: string | null } | null;
+  inventory_note: string | null;
+  n_customers: number;
+  horizons: HedgingHorizon[];
+  primary_horizon: number | null;
+  readout: string;
+  watch_list: HedgingRiskRow[];
+  customers: HedgingCustomer[];
+}

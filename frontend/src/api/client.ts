@@ -39,6 +39,8 @@ import type {
   DemandForecastsResponse,
   PricingResponse,
   PricingRecommendationsResponse,
+  CalendarResponse,
+  HedgingResponse,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -269,5 +271,21 @@ export const api = {
     config: () =>
       getJSON<{ config: Record<string, number | string | boolean | Record<string, number>>; windows: string[] }>(
         "/pricing/config"),
+  },
+
+  // ---- Working-day calendar (Phase 1) ----
+  calendar: () => getJSON<CalendarResponse>("/calendar"),
+
+  // ---- Operational demand hedging (Phase 2) ----
+  hedging: {
+    get: (opts: { terminal?: string | null; window?: string; serviceLevel?: number } = {}) => {
+      const qs = new URLSearchParams({ window: opts.window ?? "all" });
+      if (opts.terminal) qs.set("terminal", opts.terminal);
+      if (opts.serviceLevel != null) qs.set("service_level", String(opts.serviceLevel));
+      return getJSON<HedgingResponse>(`/hedging?${qs.toString()}`);
+    },
+    config: () =>
+      getJSON<{ config: Record<string, number | string | boolean | number[]>; windows: string[] }>(
+        "/hedging/config"),
   },
 };
