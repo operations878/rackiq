@@ -57,10 +57,14 @@ export default function BaseRangeChart({
   series,
   grain,
   forecast,
+  anchorDate,
 }: {
   series: LanePoint[];
   grain: string;
   forecast?: LaneForecastPoint[];
+  /** Today's real date — draws a "Today" marker inside the forecast region when the data is
+   *  behind today, so the gap between end-of-data and now is visible. */
+  anchorDate?: string | null;
 }) {
   if (!series.length) {
     return (
@@ -103,6 +107,15 @@ export default function BaseRangeChart({
   const lastX = data[data.length - 1]?.x ?? boundary;
   const perLabel = grain === "monthly" ? "month" : "week";
 
+  // "Today" marker: the forecast point whose period contains today (only shown when it sits past
+  // the end-of-data boundary, i.e. the data is genuinely behind today — the recency gap).
+  let todayX: string | null = null;
+  if (anchorDate && fc.length) {
+    const before = fc.filter((p) => p.x <= anchorDate);
+    todayX = (before.length ? before[before.length - 1] : fc[0]).x;
+    if (todayX <= boundary) todayX = null;
+  }
+
   return (
     <div className="w-full">
       <div className="h-72 w-full">
@@ -130,6 +143,7 @@ export default function BaseRangeChart({
                 <Area type="monotone" dataKey="fvarRange" name="Projected ±2σ" stroke="none" fill={C.band2} fillOpacity={0.28} isAnimationActive={false} connectNulls />
                 <Area type="monotone" dataKey="fbaseRange" name="Projected ±1σ" stroke="none" fill={C.band1} fillOpacity={0.3} isAnimationActive={false} connectNulls />
                 <ReferenceLine x={boundary} stroke={C.boundary} strokeDasharray="3 3" label={{ value: "Forecast →", position: "insideTopRight", fontSize: 9, fill: "#64748b" }} />
+                {todayX && <ReferenceLine x={todayX} stroke="#ef4444" strokeDasharray="2 2" label={{ value: "Today", position: "insideTopRight", fontSize: 9, fill: "#ef4444" }} />}
                 <Line type="monotone" dataKey="fbase" name="Projected base" stroke={C.base} strokeDasharray="5 4" strokeWidth={2.5} dot={false} isAnimationActive={false} connectNulls />
               </>
             )}

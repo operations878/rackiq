@@ -395,18 +395,35 @@ percentile ranking. Results persist to `customer_scores` + `customer_lane`.
   `/api/scores/customer/{id}`.
 - **Part 1c — VAR AS A FORECAST** (the core purpose — turns the lane from a description of the past
   into a forward tool; the VAR math is untouched). Four pieces, all config-driven
-  (`forecast_horizons`, `forecast_band_z`, `excursion_*`, `var_trend_*`):
-  1. **Per-customer forward projection** (`_forward_projection`): expected volume over the next
-     **7/30/90 days** = base run-rate · (H ÷ period_days), with a confidence band that scales with
-     the lane width (`band = z·σ·√k`) — a **tight lane (high VAR) projects narrow, a wide lane (low
-     VAR) projects wide**. The base is the trailing **run-rate** (their normal pace, robust to a
-     sparse seasonal endpoint that would otherwise collapse erratic accounts to zero). Surfaced as a
-     plain sentence (*"Expect ~X gal over the next 30 days (likely Y–Z) … if they hold their
-     pattern"*) and a **dotted forward continuation** of the base-range chart (`forecast_series`).
-     **Honest confidence:** when the band is wide relative to the expected volume (half-width ÷
-     expected ≥ `forecast_rough_rel`, or the low end clamps to 0) the projection carries a
-     `rough: true` flag and the sentence says so plainly (*"…treat this as a rough range, not a firm
-     number"*); the UI badges it **"rough — wide lane"** rather than implying false precision.
+  (`forecast_*`, `excursion_*`, `var_trend_*`):
+  1. **Per-customer forward forecast** — a **real forecasting engine** (`forecasting.py`,
+     `forecast_customer`), NOT a flat run-rate. For each master customer it **backtests multiple
+     candidate models walk-forward and selects the lowest-error one *for that customer***: a
+     month-of-year **seasonal** model (robust to sparse history — month medians × recency scale, so
+     a winter-heavy distillate account forecasts high in DJF and ~0 in summer and **never collapses
+     to zero**), a Holt-Winters **seasonal** model (≥2 cycles), a Holt **trend** model, a **cadence**
+     (inter-order interval) model for clockwork buyers, a **recency-weighted** average, and a **flat**
+     mean — with a pure-persistence **naive-last** baseline as the bar every model must clear. The
+     winner is **reliability-shrunk** toward the recent run-rate (trusting the model less when its
+     backtest error is high) so the engine is never much worse than a flat average while keeping a
+     good seasonal shape. The **band comes from that customer's OWN backtested forecast error**
+     (steady → tight, erratic → wide), VAR-weighted and growing ∝√h. **Anchored to TODAY:** the
+     7/30/90-day horizons, the forward curve, and every period label are measured from the real
+     calendar date at request time (`compute_scores(..., today=)`, default `datetime.now()`), NOT the
+     last data date — each future period's volume is **prorated by its overlap with `[today, today+H]`**
+     so a forecast made in June covers late-June→late-July, never April. The **data-recency gap** is
+     surfaced honestly (`data_through`/`forecast_anchor`/`data_lag_days`/`recency_note`, plus a
+     per-customer `gap_note`) and projected across; a customer **silent past their own cadence** is
+     damped + flagged `slowing` (a possible slowdown/churn). Surfaced as a plain sentence naming the
+     **chosen model + its backtested accuracy** (*"…using a seasonal model (±12% typical error)"*), a
+     **dotted forward continuation** of the base-range chart (`forecast_series`, now the real possibly-
+     non-flat model curve with a **"Today"** marker over the gap), `model`/`mape`/`skill_vs_naive`
+     fields, and honesty flags: `low_predictability` (no model beat naive — *"treat this as a rough
+     guess"*) and `rough` (wide band relative to expected). **Proof:** `forecast_backtest`
+     (`GET /api/scores/forecast-backtest`) compares the new engine vs the **old flat run-rate** vs
+     **naive-last** per customer (out-of-sample walk-forward) and reports the aggregate improvement —
+     on the demo book the engine beats both on median MAPE (~+30% vs naive, ~+39% vs old), mean/median
+     MAE, and per-customer win rate (27/30 beat naive), flagging the rest honestly.
   2. **Book-level bottom-up forecast** (`aggregate_book_forecast` → `GET /api/scores/book-forecast`):
      sums every customer's projection into a total expected-demand band (variances add,
      `band = z·√Σσ²`), **filterable by terminal/product** via each customer's `tp_share` volume mix.
@@ -500,12 +517,13 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/customers` | per-customer rollups; `avg_margin_per_gal`/`dso_days` are `null` when those capabilities are off — the API itself honors the matrix |
 | `GET /api/market-prices?product=ULSD` | market vs street-rack time series (`available:false` when absent) |
 | `GET /api/monthly-volume` | monthly net gallons (needs only required fields; survives `core`) |
-| `GET /api/scores?window=all` | ranked customers (VAR+grade, base value+grade, archetype, volume, trend) + per-metric `availability` |
-| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, the full **VAR statistics layer** (base/variability ranges, score-component breakdown, cadence lane, steadiness-trend test, plain-English read, advanced diagnostics), the **forward projection** (7/30/90-day expected band + dotted `forecast_series`), the **lane-break list** (excursions tagged spike/shortfall/no-show + live-weather pattern), the **VAR trend** (tightening/widening), sub-scores, base value, archetype posture |
-| `GET /api/scores/book-forecast?window=&terminal=&product=` | the **bottom-up book demand forecast** (7/30/90-day expected band summed from every customer's lane, filterable by terminal/product) + the **forecastability** split (A/B-steady vs C/D-erratic volume share, with the quarter-over-quarter trend) |
+| `GET /api/scores?window=all` | ranked customers (VAR+grade, base value+grade, archetype, volume, trend, **per-customer forecast incl. chosen model + backtested accuracy**) + per-metric `availability` + the **data-recency block** (`data_through`/`forecast_anchor`/`data_lag_days`/`recency_note`) |
+| `GET /api/scores/customer/{id}?window=` | drill-down: lane series for the base-range chart, the full **VAR statistics layer** (base/variability ranges, score-component breakdown, cadence lane, steadiness-trend test, plain-English read, advanced diagnostics), the **forward forecast** (real per-customer engine: chosen model + backtested ±MAPE, 7/30/90-day band anchored to today, dotted `forecast_series` model curve, `low_predictability`/`slowing`/`gap_note`), the **lane-break list** (excursions tagged spike/shortfall/no-show + live-weather pattern), the **VAR trend** (tightening/widening), sub-scores, base value, archetype posture |
+| `GET /api/scores/book-forecast?window=&terminal=&product=` | the **bottom-up book demand forecast** (7/30/90-day expected band summed from every customer's per-customer forecast, anchored to today, filterable by terminal/product) + the **forecastability** split (A/B-steady vs C/D-erratic volume share, with the quarter-over-quarter trend) + the data-recency block |
 | `POST /api/studio/crosswalk/upload-names` · `GET /api/studio/unmapped-customers` | upload the hand-built raw→coded name map (confirmed; re-applied across the store) · list raw names still unmapped |
 | `GET /api/scores/quadrant?window=` | Explainability × Profitability scatter points with archetype tags |
-| `GET /api/scores/backtest` | per-customer one-step forecast error by method |
+| `GET /api/scores/backtest` | per-customer one-step forecast error by method (naive_last / seasonal / lane_base) |
+| `GET /api/scores/forecast-backtest` | **the proof** — per-customer out-of-sample walk-forward comparison of the **new forecasting engine** vs the **old flat run-rate** vs **naive-last**, with the aggregate accuracy improvement (median MAPE, mean/median MAE) and how many customers the engine beats each baseline on |
 | `GET /api/scores/config` | the scoring config (every weight) + windows + archetypes/posture |
 | `POST /api/scores/recompute` | recompute all windows (+ optional `{overrides}`) and write `customer_scores`/`customer_lane` |
 | `GET /api/reconciliation?period=month` | the full loss-control payload: network totals + mechanism split, ranked worst-offender tanks (control chart series), net-recon by meter/terminal, receipt basis, loss-tracking series, meter-drift ranking (`available:false` + missing feeds when locked) |
@@ -650,13 +668,17 @@ presentation: the home screen serves understanding demand & VAR; secondary metri
   prominent *"Across all customers, expect ~X gal in the next 30 days (range Y–Z)"* headline with
   **7/30/90-day** cards and **terminal/product filter** dropdowns — and the **forecastability
   summary** (the A/B-steady vs C/D-erratic volume split as a two-segment bar + one headline % with
-  its quarter trend). Below sits the **VAR movers** worklist (`MoversPanel`: who tightened / widened
-  most this quarter). Main: the customer list **ranked by VAR** — coded name · VAR+grade · **next-30d
-  forecast** · **trend badge** — with a **"show more columns"** toggle (cadence, archetype). Click a
-  customer → the **plain-English read**, the **forward projection** card
-  (`components/scores/ForwardProjection.tsx`), the **base-range chart** as the hero now **continued
-  forward as a dotted projection** past a "forecast →" boundary (base line, ±1σ lane, ±2σ band,
-  actual lifts) with a **legend/key**, the **lane-break list** (`components/scores/LaneBreaks.tsx` —
+  its quarter trend). A **data-recency banner** appears when the book is behind today (forecasts are
+  anchored to today and projected across the gap). Below sits the **VAR movers** worklist
+  (`MoversPanel`: who tightened / widened most this quarter). Main: the customer list **ranked by VAR**
+  — coded name · VAR+grade · **next-30d forecast** · **trend badge** — with a **"show more columns"**
+  toggle (cadence, archetype). Click a customer → the **plain-English read**, the **forward forecast**
+  card (`components/scores/ForwardProjection.tsx`, now showing the **chosen model + backtested accuracy**
+  — *"seasonal model · ±12% typ. error"* — plus `low predictability` / `slowing` / `rough` badges and
+  the per-customer gap note), the **base-range chart** as the hero now **continued forward as the real
+  (possibly non-flat, seasonal) model curve** past a "forecast →" boundary with a **"Today"** marker
+  over the recency gap (base line, ±1σ lane, ±2σ band, actual lifts) and a **legend/key**, the
+  **lane-break list** (`components/scores/LaneBreaks.tsx` —
   excursions tagged spike/shortfall/no-show + the weather pattern note), a **VAR-trend badge**
   (`components/scores/VarTrendBadge.tsx`), the **score-component breakdown**
   (`components/scores/VarBreakdown.tsx`), the **cadence lane**, the **steadiness-trend** result, and a
@@ -776,8 +798,9 @@ backend/
                             #   (scoring caches customer_scores/customer_lane are managed in scoring.ensure_tables)
     capabilities.py         # ★ FEATURES registry + runtime matrix (incl. "feed" collecting state)
     scoring.py              # ★ scoring engine: VAR lane (+ transparency/statistics layer; + VAR-as-forecast:
-                            #   forward projection, lane-break excursions+weather, book bottom-up forecast, VAR trend), sub-scores, base value, archetypes, backtest
-    scoring_config.py       # ★ ScoringConfig — every weight/threshold/window/forecast-horizon as a parameter
+                            #   forward forecast (→ forecasting.py), lane-break excursions+weather, book bottom-up forecast, VAR trend), sub-scores, base value, archetypes, backtest, forecast_backtest (new-vs-old-vs-naive proof)
+    forecasting.py          # ★ per-customer demand forecasting engine: multi-model (seasonal/HW/trend/cadence/recency/flat) selected by walk-forward backtest, must-beat-naive + low-pred flag, reliability shrinkage, honest per-customer band, TODAY-anchored horizons (proration over the data-recency gap)
+    scoring_config.py       # ★ ScoringConfig — every weight/threshold/window/forecast param (model selection, backtest, shrinkage, today-anchoring) as a parameter
     weather.py              # ★ HDD/CDD feed: live NOAA/ERA5 auto-fetch (no key) → weather_daily cache → seasonal proxy fallback (explains lane breaks)
     reconciliation.py       # ★ P8 loss-control engine: book vs physical, BOL-grouped disbursements,
                             #   net-recon cross-check, mechanism split, meter-drift control charts, $loss
@@ -800,12 +823,12 @@ backend/
     main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + pricing routers)
     api/{routes,queries}.py # read endpoints + SQL
     api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
-    api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / config / recompute
+    api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / forecast-backtest (new-vs-old-vs-naive) / config / recompute (+ data-recency block)
     api/reconciliation.py   # /api/reconciliation/* loss-control payload / config / recompute (cached)
     api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
     api/demand.py           # /api/demand/cockpit / persist / forecasts / config (the Demand Cockpit)
     api/pricing.py          # /api/pricing (sandbox + recommendations) / recommendations / config / recompute (cached base)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_name_map + test_regime + test_reconciliation + test_demand + test_pricing
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_name_map + test_regime + test_reconciliation + test_demand + test_pricing
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -845,21 +868,37 @@ CLAUDE.md
   (`var_w_in_band·in_band + var_w_tightness·tightness + var_w_excursion·(1−excursion)`, blended 70/30
   with cadence). Every stat is wrapped in `_safe(...)` so a degenerate/short series returns `None`
   rather than breaking scoring; thresholds live in `ScoringConfig`.
-- **VAR-as-a-forecast is a layer ON TOP of VAR — it never changes the score.** The forward
-  projection, book bottom-up forecast, excursion weather, and VAR trend all read the frozen lane.
-  The per-customer forward base is the **trailing run-rate** (mean of recent per-period actuals), NOT
-  the seasonal endpoint `fitted[-1]` — that endpoint collapses to ~0 for sparse/erratic accounts
-  (most periods empty → median 0), which would wrongly drop them from the book forecast and inflate
-  the predictable share to 100%. The book band assumes independent customers (`z·√Σσ²`); terminal/
-  product filtering uses each customer's `tp_share` volume mix. The **VAR trend** re-fits the lane at
-  `as_of − {30,90}d` over a trailing `var_trend_lookback_days` window using the cheap
-  diagnostics-free light path (`_customer_core(..., light=True)`, STL skipped) — it is
+- **VAR-as-a-forecast is a layer ON TOP of VAR — it never changes the score.** The forward forecast,
+  book bottom-up forecast, excursion weather, and VAR trend all read the frozen lane; the score math
+  is untouched. The **forward forecast is a real per-customer engine** (`forecasting.py`), not a flat
+  run-rate: it backtests several candidate models walk-forward and **selects the lowest-error one per
+  customer** (`select_model`), reliability-shrinks it toward the recent level, and bands it from that
+  customer's **own** backtest error. The book band sums per-customer forecasts assuming independent
+  customers (`z·√Σσ²`); terminal/product filtering uses each customer's `tp_share` volume mix. The
+  **VAR trend** re-fits the lane at `as_of − {30,90}d` over a trailing `var_trend_lookback_days` window
+  using the cheap diagnostics-free light path (`_customer_core(..., light=True)`, STL skipped) — it is
   **window-independent** (always from `as_of`), so it reads the same on every display window.
-- **Plain-English reads are honest across every account shape.** `_plain_read`/`_forward_projection`
-  read naturally for the awkward cases: a **one-time buyer** ("…has bought just once so far — too new
-  to read a buying pattern or forecast yet"), a **sparse/few-week** account ("…has only N lifts over
-  ~W weeks so far…"), and **erratic C/D** accounts (the in-band phrasing softens for very low rates).
-  `_plural(n, word)` kills the robotic "order(s)"/"lift(s)" placeholders (1 → "order", N → "orders").
+- **Forecasts anchor to TODAY, not the last data date** (the bug this fixed). `compute_scores(...,
+  today=)` defaults to `datetime.now()` (injectable for tests) and is **never before `as_of`**; the
+  rolling windows still measure from `as_of` (history depth) but the 7/30/90-day horizons, the forward
+  curve, and the period labels are measured from `today`. Each future period's expected volume is
+  **prorated by its day-overlap with `[today, today+H]`**, so periods that fall in the data-recency gap
+  (before today) are correctly excluded — a forecast made in June covers late-June→late-July, never a
+  past month. The gap is surfaced (`data_through`/`forecast_anchor`/`data_lag_days`/`recency_note`, per-
+  customer `gap_note`) and a customer **silent past their own cadence** is damped + flagged `slowing`
+  (slowdown/churn risk), so recency is reflected, not ignored. `date.today()` is in the `/api/scores`
+  cache signature so the anchor re-rolls at the day boundary. Model-class **selection** uses the full
+  series (what the engine displays); the `forecast_backtest` comparison evaluates that model strictly
+  **out-of-sample** (each prediction fit only on prior periods) — the honest proof it beats old+naive.
+  It selects **once per customer** (not per walk-forward step) to stay fast (~5s for the demo book).
+- **Plain-English reads are honest across every account shape.** `_plain_read` (the VAR read) and the
+  forecast engine (`forecasting.forecast_customer`) read naturally for the awkward cases: a **one-time
+  buyer** ("…has bought just once so far — too new to read a buying pattern or forecast yet"; the
+  forecast is `available:false`), a **sparse/few-week** account, **erratic C/D** accounts (the forecast
+  names a `low_predictability` "rough guess"), and a **silent** account ("…been quiet N days… treat
+  this as a rough range"). The forecast sentence always names the **chosen model + its backtested
+  accuracy** and every `rough` forecast says so in the same words ("treat this as a rough range").
+  `_plural(n, word)` kills the robotic "order(s)" placeholders (1 → "order", N → "orders").
   `_var_explanation` is None-guarded so a degenerate "ok" lane formats rather than raising.
 - **VAR Home is the polished, non-technical spine.** Presentation only — the math is untouched. The
   **base-range chart owns its own always-visible plain-language legend** (`BaseRangeChart`: Normal
@@ -970,10 +1009,14 @@ CLAUDE.md
 - Uploads are cached in-process by `upload_id`; a server restart between map/commit means
   re-uploading the file (the UI surfaces this as "upload expired").
 - **Tests:** `uv run pytest` (dev group adds `pytest` + `httpx`); covers VCF, profiling, crosswalk,
-  validation, the hygiene pipeline, scoring (incl. **VAR-as-forecast**: forward projection band,
+  validation, the hygiene pipeline, scoring (incl. **VAR-as-forecast**: forward band,
   tighter-band-for-higher-VAR, excursion weather pattern, VAR trend, book bottom-up forecast +
   terminal filter, the `/api/scores/book-forecast` endpoint; **plus the plain-English edge cases** —
   one-time/sparse/few-week reads, `_plural` pluralization, the `rough`-forecast flag, and
-  `_var_explanation` None-safety), the reconciliation engine (BOL
-  grouping, mechanism split, net-recon, meter drift, dollarize), and the full API flow against a
+  `_var_explanation` None-safety), the **forecasting engine** (`test_forecasting`: per-customer model
+  selection across the book, the seasonal model NOT collapsing to zero on sparse history, the new-vs-
+  old-vs-naive `forecast_backtest` measurably beating both baselines, the low-predictability + erratic
+  + silent/slowing flags, and the **critical today-anchoring** — a fixed future `today` starts the
+  forecast from today not the last data date and raises the recency note), the reconciliation engine
+  (BOL grouping, mechanism split, net-recon, meter drift, dollarize), and the full API flow against a
   throwaway DuckDB. Weather fetch is disabled under pytest (deterministic seasonal proxy).

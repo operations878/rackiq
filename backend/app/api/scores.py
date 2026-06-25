@@ -8,6 +8,8 @@ the payload carries ``availability`` so the UI greys out what the data can't sup
 
 from __future__ import annotations
 
+from datetime import date
+
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -26,8 +28,11 @@ _CACHE: dict = {}
 
 
 def _data_sig(con) -> tuple:
+    # `date.today()` is part of the signature so forecasts re-anchor when the calendar day rolls
+    # over (the forecast anchor is "today", not the last data date).
     return (db.row_count(con, schema.LIFTS), str(db.get_meta(con, "last_import_at")),
-            str(db.get_meta(con, "generated_at")), str(db.get_meta(con, "profile")))
+            str(db.get_meta(con, "generated_at")), str(db.get_meta(con, "profile")),
+            str(date.today()))
 
 
 def _result(con, cfg: ScoringConfig, window: str) -> dict:
@@ -44,6 +49,12 @@ def _result(con, cfg: ScoringConfig, window: str) -> dict:
 
 def _bust():
     _CACHE.clear()
+
+
+def _recency_fields(res: dict) -> dict:
+    """The data-recency block surfaced on every scores response (anchor / lag / honest note)."""
+    return {k: res.get(k) for k in
+            ("data_through", "forecast_anchor", "data_lag_days", "recency_note")}
 
 
 class RecomputeRequest(BaseModel):
@@ -105,7 +116,7 @@ def scores(window: str = Query(default="all")):
         "window": res["window"], "as_of": res["as_of"], "availability": res["availability"],
         "windows": WINDOWS, "n_customers": res["n_customers"],
         "customers": [_table_row(c) for c in res["customers"]],
-        "scores_computed_at": None,
+        "scores_computed_at": None, **_recency_fields(res),
     }
 
 
@@ -132,7 +143,7 @@ def book_forecast(window: str = Query(default="all"),
                                           terminal or None, product or None)
     return {"window": window, "as_of": res["as_of"], "windows": WINDOWS,
             "terminal": terminal or None, "product": product or None,
-            "terminals": sorted(terms), "products": sorted(prods), **agg}
+            "terminals": sorted(terms), "products": sorted(prods), **agg, **_recency_fields(res)}
 
 
 @router.get("/config")
@@ -145,6 +156,14 @@ def config():
 def backtest():
     with db.lock():
         return scoring.backtest(_con(), DEFAULT_CONFIG)
+
+
+@router.get("/forecast-backtest")
+def forecast_backtest():
+    """The proof: per-customer walk-forward comparison of the new forecasting engine vs the old
+    flat run-rate vs a naive-last baseline, with the aggregate accuracy improvement."""
+    with db.lock():
+        return scoring.forecast_backtest(_con(), DEFAULT_CONFIG)
 
 
 @router.get("/quadrant")
@@ -181,7 +200,7 @@ def customer(customer_id: str, window: str = Query(default="all")):
     with db.lock():
         match["excursions"] = scoring.customer_excursions(_con(), match, DEFAULT_CONFIG)
     return {"window": window, "as_of": res["as_of"], "availability": res["availability"],
-            "customer": match}
+            "customer": match, **_recency_fields(res)}
 
 
 @router.post("/recompute")

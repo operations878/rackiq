@@ -110,6 +110,12 @@ function BookForecastPanel({ window, summary, avgv }: { window: string; summary:
                 likely between <span className="font-medium text-slate-600">{fmtGal(h30.lo)}</span> and{" "}
                 <span className="font-medium text-slate-600">{fmtGal(h30.hi)} gal</span>
                 {relPct != null && <> · ±{relPct}%</>}
+                {bf.forecast_anchor && <> · from today ({bf.forecast_anchor})</>}
+              </div>
+            )}
+            {bf.recency_note && (
+              <div className="mt-1 text-[10px] text-amber-700" title="Forecasts measured from today's real date, projected across the data gap.">
+                ⏱ data through {bf.data_through} ({bf.data_lag_days}d behind today)
               </div>
             )}
           </div>
@@ -249,8 +255,10 @@ function Detail({ id, window }: { id: string; window: string }) {
       {/* Forward projection from the lane */}
       <ForwardProjection forecast={c.forecast} />
 
-      {/* Hero: the base-range chart, continued forward as a dotted projection (legend built in) */}
-      <BaseRangeChart series={c.lane_series ?? []} grain={c.grain} forecast={c.forecast_series} />
+      {/* Hero: the base-range chart, continued forward as the real (non-flat) forecast curve.
+          The "Today" marker appears inside the forecast region when the data is behind today. */}
+      <BaseRangeChart series={c.lane_series ?? []} grain={c.grain} forecast={c.forecast_series}
+        anchorDate={c.forecast?.forecast_anchor ?? data.forecast_anchor} />
 
       {/* Lane breaks + weather pattern */}
       <div>
@@ -348,6 +356,14 @@ export default function VarHome({ summary, navigate }: { summary: Summary; navig
           ))}
         </span>
       </div>
+
+      {/* Data-recency gap — forecasts are anchored to today, not the last data date */}
+      {data.recency_note && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-[12px] leading-snug text-amber-800">
+          <span className="mt-0.5">⏱</span>
+          <span>{data.recency_note}</span>
+        </div>
+      )}
 
       {/* Bottom-up book forecast + forecastability summary — THE headline */}
       <BookForecastPanel window={window} summary={summary} avgv={avgv} />

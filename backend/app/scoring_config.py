@@ -42,15 +42,52 @@ class ScoringConfig:
     var_trend_sig_p: float = 0.10         # Mann-Kendall / drift p-value significance threshold
 
     # ---- Forward projection (VAR → forecast) -----------------------------------
-    # The lane describes the past; these turn it into a forward expectation. Expected volume
-    # over the next H days = base_per_period · (H / period_days); the band scales with the lane
-    # width (√-of-periods aggregation), so a tight lane (high VAR) forecasts narrow and a wide
-    # lane (low VAR) forecasts wide. NOTHING here touches the VAR score.
+    # The forecast is a real per-customer engine (``forecasting.py``): multiple candidate models
+    # are backtested walk-forward and the lowest-error one is selected PER CUSTOMER, seasonality
+    # is preserved on sparse history, the band comes from that customer's OWN backtest error, and
+    # every horizon is anchored to TODAY (not the last data date). NOTHING here touches the VAR score.
     forecast_horizons: tuple = (7, 30, 90)    # days projected forward (per-customer + book)
     forecast_band_z: float = 1.0          # band half-width in σ (1.0 ≈ a 68% "likely" range)
-    forecast_max_horizon_days: int = 90   # how far the dotted lane continuation is drawn
+    forecast_max_horizon_days: int = 90   # how far the forward lane continuation is drawn
     forecast_rough_rel: float = 0.45      # band half-width ÷ expected ≥ this ⇒ flag as a ROUGH
     #                                       forecast (honest "wide lane — treat as a range")
+
+    # Model selection (walk-forward backtest; counted in *active*, non-zero periods).
+    forecast_min_periods: int = 4             # below this active count → flat only
+    forecast_min_seasonal_months: int = 8     # distinct months-of-year needed for the seasonal model
+    forecast_min_holt_periods: int = 8        # at/above (+ active frac) → eligible for the trend model
+    forecast_min_holt_active_frac: float = 0.30
+    forecast_seasonal_period_weeks: int = 52  # weekly seasonal cycle for Holt-Winters
+    forecast_min_seasonal_cycles: float = 2.0 # need ≥ this many full cycles for Holt-Winters seasonal
+    forecast_recent_level_periods: int = 8    # periods averaged for the seasonal model's recent level
+    forecast_shrink_model_max: float = 0.85   # reliability shrinkage: max weight on the model path
+    forecast_shrink_model_min: float = 0.35   # min weight on the model (poor backtest → shrink to level)
+    forecast_recency_window: int = 12         # periods in the recency-weighted average
+    forecast_recency_halflife: float = 4.0    # exponential half-life (periods) for recency weighting
+    forecast_select_tol_pct: float = 2.0      # MAPE-pt tolerance for the model-character tie-break
+    forecast_clockwork_cv: float = 0.35       # cadence CV at/below this ⇒ prefer the cadence model
+    forecast_seasonal_pref_strength: float = 0.45  # seasonal strength ≥ this ⇒ prefer the seasonal model
+    forecast_low_pred_skill: float = 0.0      # selected must beat naive by > this skill, else low-pred
+
+    # Backtest-driven uncertainty (the honest, per-customer band).
+    forecast_backtest_steps: int = 10         # expanding one-step over the last N periods
+    forecast_backtest_min_train: int = 6
+    forecast_mape_floor_gallons: float = 500.0  # MAPE denominator floor (a near-zero period can't blow it up)
+    forecast_rel_sigma_default: float = 0.40  # relative-error σ when a customer can't be backtested
+    forecast_rel_sigma_floor: float = 0.08
+    forecast_rel_sigma_band_cap: float = 1.25 # cap the band σ (a 3000%-MAPE marine account would
+    #                                           otherwise show an absurd ±10MM band) — the honest MAPE
+    #                                           still shows in the text; the band stays wide-but-sane
+    forecast_sigma_floor_gallons: float = 200.0
+    forecast_sigma_growth_cap: int = 8        # √h band growth plateaus after this many periods
+    forecast_var_band_lambda: float = 0.5     # VAR weighting: σ ×= 1 + λ·(1 − VAR/100)
+    forecast_var_default: float = 50.0        # VAR used when a customer is too thin to score
+
+    # Today-anchoring + recency gap.
+    forecast_gap_note_days: int = 10          # surface the data-recency note when ≥ this many days behind
+    forecast_recency_overdue_mult: float = 1.5  # silent past this × cadence ⇒ damp + widen (slowdown/churn)
+    forecast_recency_damp_min: float = 0.35   # floor on the recency damping factor
+    forecast_recency_damp_k: float = 0.5      # damping slope per unit of overdue-ness
 
     # ---- Excursion (lane-break) weather pattern --------------------------------
     excursion_min_breaks: int = 3         # need this many lane breaks to call a weather pattern

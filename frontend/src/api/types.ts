@@ -611,14 +611,43 @@ export interface ForecastBlock {
   grain: string;
   reason?: string;
   period_days?: number;
+  /** The model chosen for THIS customer by backtested accuracy, and its plain label/blurb. */
+  model?: string;
+  model_label?: string;
+  model_blurb?: string;
+  /** The chosen model's backtested typical error (MAPE %), its bias, and skill vs naive. */
+  mape?: number | null;
+  bias?: number | null;
+  skill_vs_naive?: number | null;
+  beats_naive?: boolean;
+  /** True when no model beat a naive guess — the forecast is an honest "rough guess". */
+  low_predictability?: boolean;
+  naive_mape?: number | null;
   base_per_period?: number;
   sigma_per_period?: number;
+  rel_sigma?: number;
   band_z?: number;
   /** True when the band is wide relative to the expected volume — an honest "this is a range,
-   *  not a firm number" signal for erratic / thin-lane accounts. */
+   *  not a firm number" signal for erratic / thin-lane / low-predictability accounts. */
   rough?: boolean;
+  /** True when the account has been silent well past its own cadence (slowdown / churn risk). */
+  slowing?: boolean;
+  days_silent?: number;
+  /** Today-anchoring + the data-recency gap (this customer's view of it). */
+  data_through?: string;
+  forecast_anchor?: string;
+  gap_days?: number;
+  gap_note?: string | null;
   horizons: ForecastHorizon[];
   plain?: string;
+}
+
+/** Shared data-recency block surfaced on every scores response. */
+export interface RecencyBlock {
+  data_through?: string | null;
+  forecast_anchor?: string | null;
+  data_lag_days?: number;
+  recency_note?: string | null;
 }
 
 /** A forward (forecast) lane point — same shape as a LanePoint but with no actual yet. */
@@ -679,7 +708,7 @@ export interface VarTrendBlock {
   comparisons: { month?: VarTrendComparison; quarter?: VarTrendComparison };
 }
 
-export interface BookForecast {
+export interface BookForecast extends RecencyBlock {
   window: string;
   as_of: string | null;
   windows: string[];
@@ -725,7 +754,7 @@ export interface ScoreCustomer {
   var_trend?: VarTrendBlock;
 }
 
-export interface ScoresResponse {
+export interface ScoresResponse extends RecencyBlock {
   window: string;
   as_of: string | null;
   availability: Record<string, Availability>;
@@ -754,7 +783,7 @@ export interface QuadrantResponse {
   axes: { x: string; y: string };
 }
 
-export interface CustomerScoreResponse {
+export interface CustomerScoreResponse extends RecencyBlock {
   window: string;
   as_of: string | null;
   availability: Record<string, Availability>;
@@ -773,6 +802,35 @@ export interface BacktestResponse {
   customers: BacktestRow[];
   methods: string[];
   summary: Record<string, number>;
+}
+
+// ---- Forecast backtest comparison (new engine vs old run-rate vs naive) ----------
+export interface ForecastBacktestRow {
+  customer_id: string;
+  name: string;
+  grain: string;
+  chosen_model: string;
+  model_label: string;
+  n_steps: number;
+  mae: Record<string, number>;
+  mape: Record<string, number>;
+  best: string;
+  beats_naive: boolean;
+  beats_old: boolean;
+}
+
+export interface ForecastBacktestResponse {
+  customers: ForecastBacktestRow[];
+  methods: string[];
+  summary: Record<string, number>;       // median per-customer MAPE %
+  summary_mean: Record<string, number>;  // mean per-customer MAPE %
+  mae_mean: Record<string, number>;      // mean absolute error (gal)
+  improvement: Record<string, number>;   // vs_naive_pct / vs_old_pct / mae_vs_*_pct
+  n_customers: number;
+  n_beat_naive: number;
+  n_beat_old: number;
+  as_of: string | null;
+  forecast_anchor: string;
 }
 
 // ---- Reconciliation & loss control (P8) -----------------------------------------
