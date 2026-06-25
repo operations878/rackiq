@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from . import db, forecasting, schema, weather
+from . import behavioral, db, forecasting, schema, weather
 from .scoring_config import (ARCHETYPE_POSTURE, ARCHETYPES, DEFAULT_CONFIG, WINDOWS,
                              ScoringConfig, grade)
 
@@ -1163,9 +1163,14 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all",
         excursions = _excursions(core, term, con, cfg)
         full_cl = full_by_id.get_group(cid) if cid in full_by_id.groups else cl
         var_trend = _var_trend(full_cl, cfg, as_of)
+        # Daily presence-aware behavioral profile — window-independent (it computes its OWN
+        # 7/30/90/all calendar windows from the FULL history, anchored to as_of), so it reads the
+        # same regardless of the scoring window. Enriches VAR; never touches the score.
+        behavior = behavioral.daily_profile(full_cl, cfg, as_of, name=name_by_id.get(cid, cid))
         rows[cid] = {"core": core, "facts": facts, "raw": raw, "inv": inv, "q": q,
                      "data_sufficient": sufficient, "forward": forward,
-                     "excursions": excursions, "var_trend": var_trend, "terminal": term}
+                     "excursions": excursions, "var_trend": var_trend, "terminal": term,
+                     "behavior": behavior}
 
     if not rows:
         return {"window": window, "as_of": str(as_of.date()), "availability": avail,
@@ -1384,6 +1389,7 @@ def compute_scores(con, cfg: ScoringConfig | None = None, window: str = "all",
             "monthly_volume": facts["monthly_volume"], "trend_pct": core["trend_pct"],
             "recency_gap": round((core["days_since_last"] or 0.0) / cad, 2),
             "var": _var_block(core, facts, name_by_id.get(cid, cid), cfg),
+            "behavior": r["behavior"],
             "var_trend": r["var_trend"],
             "forecast": {k: v for k, v in r["forward"].items() if k != "series"},
             "forecast_series": r["forward"].get("series", []),

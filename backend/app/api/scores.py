@@ -13,7 +13,7 @@ from datetime import date
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from .. import db, schema, scoring
+from .. import behavioral, db, schema, scoring
 from ..scoring_config import ARCHETYPE_POSTURE, ARCHETYPES, DEFAULT_CONFIG, WINDOWS, ScoringConfig
 
 router = APIRouter(prefix="/api/scores")
@@ -69,8 +69,8 @@ def _check_window(window: str) -> str:
 
 _TABLE_FIELDS = ("customer_id", "name", "archetype_true", "home_terminal", "window", "grain",
                  "data_sufficient", "n_lifts", "total_net_gallons", "monthly_volume", "trend_pct",
-                 "recency_gap", "var", "base_value", "account_value", "quadrant", "archetype",
-                 "forecast", "var_trend")
+                 "recency_gap", "var", "behavior", "base_value", "account_value", "quadrant",
+                 "archetype", "forecast", "var_trend")
 
 
 # A slim set of Layer-1 facts the Book Overview table needs (margin, credit, product mix)
@@ -98,6 +98,8 @@ def _table_row(c: dict) -> dict:
     row = {k: c[k] for k in _TABLE_FIELDS if k in c}
     if "var" in row:
         row["var"] = _slim_var(row["var"])
+    if "behavior" in row:
+        row["behavior"] = behavioral.slim_behavior(row["behavior"])
     row["subscores"] = {k: {kk: vv for kk, vv in v.items() if kk != "profile"}
                         for k, v in c["subscores"].items()}
     facts = c.get("facts") or {}

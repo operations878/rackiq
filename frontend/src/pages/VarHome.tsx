@@ -7,9 +7,14 @@ import VarBreakdown from "../components/scores/VarBreakdown";
 import ForwardProjection from "../components/scores/ForwardProjection";
 import LaneBreaks from "../components/scores/LaneBreaks";
 import VarTrendBadge from "../components/scores/VarTrendBadge";
+import BehaviorMap from "../components/scores/BehaviorMap";
+import BehaviorProfile from "../components/scores/BehaviorProfile";
 import NameMapPanel from "../components/studio/NameMapPanel";
 import ProductMapPanel from "../components/studio/ProductMapPanel";
-import { ScorePill, gradeTone, gradeWord, varMeaning, Tip, fmtGal, fmtGalFull } from "../lib/scoreui";
+import { ScorePill, gradeTone, gradeWord, varMeaning, Tip, fmtGal, fmtGalFull, BehaviorTag } from "../lib/scoreui";
+
+/** Frequency ordering for the "sort by pattern" column (daily → rare). */
+const FREQ_RANK: Record<string, number> = { daily: 0, frequent: 1, occasional: 2, rare: 3 };
 
 const WINDOW_LABEL: Record<string, string> = { "30": "30 days", "90": "90 days", "365": "365 days", all: "All-time" };
 
@@ -253,6 +258,10 @@ function Detail({ id, window }: { id: string; window: string }) {
         </div>
       )}
 
+      {/* Daily presence-aware behavioral profile — the centerpiece: presence vs size, the daily bar
+          view, the misleading-average flag, and the full stats panel (toggle 7/30/90/all). */}
+      <BehaviorProfile behavior={c.behavior} />
+
       {/* Forward projection from the lane */}
       <ForwardProjection forecast={c.forecast} />
 
@@ -284,6 +293,10 @@ export default function VarHome({ summary, navigate }: { summary: Summary; navig
   const [showProducts, setShowProducts] = useState(false);
   const [nUnmappedProducts, setNUnmappedProducts] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  // behavioral filter / sort for the ranked list
+  const [freqFilter, setFreqFilter] = useState<string>("all");
+  const [misOnly, setMisOnly] = useState(false);
+  const [sort, setSort] = useState<"var" | "pattern" | "next30" | "volume">("var");
 
   const reload = useCallback(() => {
     setError(null);
@@ -307,6 +320,24 @@ export default function VarHome({ summary, navigate }: { summary: Summary; navig
   }, [summary]);
 
   const avgv = useMemo(() => (data ? avgVar(data.customers) : null), [data]);
+
+  /** Ranked list with the behavioral filter + sort applied (the sortable/filterable column). */
+  const shown = useMemo(() => {
+    if (!data) return [] as ScoreCustomer[];
+    let list = data.customers.slice();
+    if (freqFilter !== "all") list = list.filter((c) => c.behavior?.frequency_class === freqFilter);
+    if (misOnly) list = list.filter((c) => c.behavior?.misleading_severity === "high");
+    const n30 = (c: ScoreCustomer) => c.forecast?.horizons?.find((h) => h.days === 30)?.expected ?? -1;
+    const byVar = (a: ScoreCustomer, b: ScoreCustomer) => (b.var.score ?? -1) - (a.var.score ?? -1);
+    const cmp: Record<string, (a: ScoreCustomer, b: ScoreCustomer) => number> = {
+      var: byVar,
+      volume: (a, b) => (b.total_net_gallons || 0) - (a.total_net_gallons || 0),
+      next30: (a, b) => n30(b) - n30(a),
+      pattern: (a, b) =>
+        (FREQ_RANK[a.behavior?.frequency_class ?? ""] ?? 9) - (FREQ_RANK[b.behavior?.frequency_class ?? ""] ?? 9) || byVar(a, b),
+    };
+    return list.sort(cmp[sort]);
+  }, [data, freqFilter, misOnly, sort]);
 
   const pick = useCallback((id: string) => {
     setSelected(id);
@@ -374,32 +405,59 @@ export default function VarHome({ summary, navigate }: { summary: Summary; navig
       {/* Bottom-up book forecast + forecastability summary — THE headline */}
       <BookForecastPanel window={window} summary={summary} avgv={avgv} />
 
+      {/* Behavioral map — frequency × size-consistency, so you can instantly see who's baseload
+          vs. a buffer-risk burst buyer. */}
+      <Panel title="Behavioral map" subtitle="How often they buy × how consistent the load is — baseload (↖) vs. buffer-risk bursts (↘).">
+        <BehaviorMap customers={data.customers} selected={selected} onPick={pick} />
+      </Panel>
+
       {/* Ranked list + detail — the other star */}
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-5">
         <section className="xl:col-span-2">
           <Panel title="Customers ranked by predictability"
-                 subtitle="Steadiest first."
+                 subtitle="Steadiest first — or sort/filter by daily buying pattern."
                  right={<button onClick={() => setShowMore((s) => !s)} className="text-[11px] font-medium text-indigo-600 hover:underline">
                    {showMore ? "Fewer columns" : "More columns"}
                  </button>}>
+            {/* behavioral filter toolbar */}
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px]">
+              <span className="text-slate-400">Pattern:</span>
+              <select value={freqFilter} onChange={(e) => setFreqFilter(e.target.value)} className="rounded-md border border-slate-200 bg-white px-2 py-1 text-slate-700">
+                <option value="all">All frequencies</option>
+                <option value="daily">Daily</option>
+                <option value="frequent">Frequent</option>
+                <option value="occasional">Occasional</option>
+                <option value="rare">Rare</option>
+              </select>
+              <label className="inline-flex cursor-pointer items-center gap-1 text-slate-600">
+                <input type="checkbox" checked={misOnly} onChange={(e) => setMisOnly(e.target.checked)} className="rounded border-slate-300" />
+                <span title="Only accounts whose median daily volume is 0 — silent most days, then a big load.">⚠ avg-misleading only</span>
+              </label>
+              <span className="ml-auto text-slate-400">{shown.length} shown</span>
+            </div>
             <div className="max-h-[40rem] overflow-auto">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 z-10 bg-white text-left text-[10px] uppercase tracking-wide text-slate-400">
                   <tr>
                     <th className="pb-2 pr-2 font-semibold">Customer</th>
-                    <th className="pb-2 text-right font-semibold">
+                    <th className="cursor-pointer pb-2 text-right font-semibold hover:text-slate-600" onClick={() => setSort("var")}>
                       <Tip text="Variability score 0–100 — how steady and forecastable their buying is. Higher = steadier.">
                         <span className="cursor-help underline decoration-dotted underline-offset-2">VAR</span>
-                      </Tip>
+                      </Tip>{sort === "var" ? " ↓" : ""}
                     </th>
-                    <th className="pb-2 text-right font-semibold">Next 30d</th>
+                    <th className="cursor-pointer pb-2 pl-2 font-semibold hover:text-slate-600" onClick={() => setSort("pattern")}>
+                      <Tip text="Daily buying pattern from the presence/size split — Steady Daily … Sporadic/Bursty. Sort groups daily→rare.">
+                        <span className="cursor-help underline decoration-dotted underline-offset-2">Pattern</span>
+                      </Tip>{sort === "pattern" ? " ↓" : ""}
+                    </th>
+                    <th className="cursor-pointer pb-2 text-right font-semibold hover:text-slate-600" onClick={() => setSort("next30")}>Next 30d{sort === "next30" ? " ↓" : ""}</th>
                     <th className="pb-2 text-right font-semibold">Trend</th>
                     {showMore && <th className="pb-2 text-right font-semibold">Cadence</th>}
                     {showMore && <th className="pb-2 pl-2 font-semibold">Archetype</th>}
                   </tr>
                 </thead>
                 <tbody>
-                  {data.customers.map((c) => {
+                  {shown.map((c) => {
                     const v = c.var;
                     const next30 = c.forecast?.horizons?.find((h) => h.days === 30);
                     const rough = c.forecast?.rough;
@@ -411,6 +469,7 @@ export default function VarHome({ summary, navigate }: { summary: Summary; navig
                           <div className="text-[10px] text-slate-400">{v.descriptor ?? (c.data_sufficient ? "" : "limited history")}</div>
                         </td>
                         <td className="py-1.5 text-right"><ScorePill score={v.score} grade={v.grade} hint={varMeaning(v.score, v.grade)} /></td>
+                        <td className="py-1.5 pl-2"><BehaviorTag label={c.behavior?.label} severity={c.behavior?.misleading_severity} compact /></td>
                         <td className="py-1.5 text-right text-slate-600">
                           {next30 ? (
                             <span title={`${fmtGal(next30.lo)}–${fmtGal(next30.hi)} gal${rough ? " · rough (wide lane)" : ""}`} className={rough ? "text-slate-400" : ""}>

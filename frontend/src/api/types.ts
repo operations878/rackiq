@@ -750,6 +750,100 @@ export interface BookForecast extends RecencyBlock {
   predictable_share_delta: number | null;
 }
 
+// ---- Daily presence-aware behavioral profile (enriches VAR; never changes the score) ------
+/** Full descriptive stats for one bucket of values (size-when-present, or naive all-days). */
+export interface BehaviorStats {
+  n: number;
+  mean: number;
+  median: number;
+  min: number;
+  max: number;
+  range: number;
+  std: number;
+  cv: number | null;
+  p10: number;
+  p50: number;
+  p90: number;
+  mode: { lo: number; hi: number; center: number; count: number; width: number } | null;
+}
+
+/** Presence / frequency stats — over ALL calendar days in the window, zeros included. */
+export interface BehaviorPresence {
+  active_day_rate: number;
+  n_active_days: number;
+  n_days: number;
+  median_gap_days: number | null;
+  gap_cv: number | null;
+  longest_silent_days: number;
+  lifts_per_week: number | null;
+  active_days_per_week: number | null;
+}
+
+export interface BehaviorBar {
+  date: string;
+  gallons: number;
+  lifts: number;
+}
+
+/** One calendar window's full profile (presence + size-when-present + naive all-days + bars). */
+export interface BehaviorWindow {
+  window: string;
+  n_days: number;
+  n_lifts: number;
+  n_active_days: number;
+  presence: BehaviorPresence;
+  size_when_present: BehaviorStats | null;
+  all_days: BehaviorStats | null;
+  intermittent: boolean;
+  misleading_average: boolean;
+  misleading_severity: "high" | "moderate" | null;
+  frequency_class: string;
+  size_class: string;
+  timing_class: string;
+  label: string;
+  label_blurb: string;
+  headline: string;
+  presence_lane: BehaviorPresenceLane;
+  bars: BehaviorBar[];
+}
+
+export interface BehaviorPresenceLane {
+  active_day_size_typical: number | null;
+  active_day_size_lo: number | null;
+  active_day_size_hi: number | null;
+  frequency_phrase: string;
+  naive_daily_average: number | null;
+  sentence: string | null;
+}
+
+/** The behavioral block. Heavy fields (windows / presence_lane) ride on the customer detail; the
+ *  ranked list ships a slim copy (the convenience fields below, no windows/bars). */
+export interface BehaviorBlock {
+  available: boolean;
+  primary_window?: string | null;
+  label?: string | null;
+  label_blurb?: string | null;
+  frequency_class?: string | null;
+  size_class?: string | null;
+  timing_class?: string | null;
+  intermittent?: boolean;
+  misleading_average?: boolean;
+  misleading_severity?: "high" | "moderate" | null;
+  headline?: string | null;
+  // detail only:
+  windows?: Record<string, BehaviorWindow>;
+  presence_lane?: BehaviorPresenceLane | null;
+  // slim (table / 2×2 map) only — copied from the primary window:
+  active_day_rate?: number | null;
+  active_days_per_week?: number | null;
+  median_gap_days?: number | null;
+  longest_silent_days?: number | null;
+  size_median_active?: number | null;
+  size_cv_active?: number | null;
+  all_days_mean?: number | null;
+  all_days_median?: number | null;
+}
+
 export interface ScoreCustomer {
   customer_id: string;
   name: string;
@@ -764,6 +858,7 @@ export interface ScoreCustomer {
   trend_pct: number;
   recency_gap: number;
   var: VarBlock;
+  behavior?: BehaviorBlock;
   base_value: BaseValueBlock;
   account_value: number | null;
   quadrant: QuadrantBlock;
