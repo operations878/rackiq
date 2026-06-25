@@ -1,11 +1,12 @@
 """Wide BOL / EDI export ingestion — required-only gating, grouping, corrections, junk.
 
 These lock in the fix for the real-world failure where a wide EDI BOL export was almost
-entirely quarantined. The only required fields for a valid lift are customer id (Consignee
-Number), ship date, and net gallons; every other column — including the dozens of optional
-admin/EDI columns — must NEVER quarantine a row on its own. Compartment rows sharing a BOL
-number are grouped (gross & net summed) into one lift; negatives are kept as corrections; and
-only genuine control rows (BOL 0 / gross 0 / net 0) are held as junk.
+entirely quarantined. The only required fields for a valid lift are customer id (the consignee
+account NAME when present, so the raw→coded crosswalk can resolve it), ship date, and net
+gallons; every other column — including the dozens of optional admin/EDI columns — must NEVER
+quarantine a row on its own. Compartment rows sharing a BOL number are grouped (gross & net
+summed) into one lift; negatives are kept as corrections; and only genuine control rows
+(BOL 0 / gross 0 / net 0) are held as junk.
 """
 
 from __future__ import annotations
@@ -18,15 +19,18 @@ from app import hygiene, ingest, schema, validation
 
 
 # ---- Column mapping: auto-match the required three, ignore admin noise ----------
-def test_consignee_number_maps_to_customer_id_and_infers_lifts():
+def test_consignee_name_maps_to_customer_id_and_infers_lifts():
     headers = ["Submission Type", "User ID", "Consignee Number", "Consignee Name", "Ship Date",
                "BOL Number", "Terminal Name", "Product Name", "Gross Amount", "Net Amount",
                "Temperature", "Gravity (API)", "Destination County", "Rack Driver ID"]
     assert ingest.infer_table(headers) == schema.LIFTS
     sugg = ingest.suggest_for_table(headers, schema.LIFTS)
     inv = {v["target"]: h for h, v in sugg.items()}
-    # The buyer is the Consignee Number — NOT the EDI submitter's "User ID".
-    assert inv["customer_id"] == "Consignee Number"
+    # The customer key is the consignee NAME (so the raw→coded name crosswalk resolves it and the
+    # UI shows names, never a bare account number) — and NOT the EDI submitter's "User ID".
+    assert inv["customer_id"] == "Consignee Name"
+    # The bare account number is left for the user / internal-only — not auto-keyed as the customer.
+    assert sugg.get("Consignee Number", {}).get("target") != "customer_id"
     assert inv["lift_datetime"] == "Ship Date"
     assert inv["net_gallons"] == "Net Amount"
     assert inv["gross_gallons"] == "Gross Amount"
@@ -183,7 +187,9 @@ def test_wide_bol_commit_keeps_majority_and_groups(client):
         "file": ("bol.csv", io.BytesIO(_wide_bol_csv()), "text/csv")}).json()
     assert ins["suggested_table"] == "lifts"
     mapping = {c: s["target"] for c, s in ins["suggestions_by_table"]["lifts"].items()}
-    assert mapping["Consignee Number"] == "customer_id"
+    # Customer key auto-resolves to the consignee NAME (not the bare account number).
+    assert mapping["Consignee Name"] == "customer_id"
+    assert mapping.get("Consignee Number") != "customer_id"
 
     com = client.post("/api/studio/commit", json={
         "upload_id": ins["upload_id"], "table": "lifts", "mapping": mapping,
@@ -194,8 +200,55 @@ def test_wide_bol_commit_keeps_majority_and_groups(client):
     assert com["rows_written"] == 4
     assert com["corrections"] == 1                          # the reversal compartment, kept
     assert com["quarantined"] == 1
-    assert com["quarantine_reasons"] == {"edi_control_row": 1}
+    # The one held row is the EDI control row — now keyed on the consignee NAME, its blank name
+    # also trips required-present, so it is held for BOTH reasons (still a single quarantined row).
+    assert com["quarantine_reasons"] == {"edi_control_row": 1, "required_present": 1}
     # the large majority of rows flow through — only the genuine control row is held
     assert com["clean_rows"] / com["rows_in_file"] >= 0.8
     # grouped totals are correct, incl. the reversal netting out within its BOL
     assert abs(com["summary"]["total_net_gallons"] - (3426 + 4120 + 603 + 6223)) < 0.5
+
+
+# ---- The real flow: a file with BOTH a number and a name keys on the NAME, and the -------
+#      raw→coded crosswalk then shows clean coded names everywhere (never a bare number).
+def _wide_bol_number_and_name_csv() -> bytes:
+    cols = ["Consignee Number", "Consignee Name", "BOL Number", "Ship Date", "Terminal",
+            "Product", "Gross Amount", "Net Amount", "Rack Driver ID"]
+    # Two raw spellings of Riverside (same account number) + Hudson — multi-compartment loads.
+    variants = [("88231", "RIVERSIDE FUEL CO-NJ"), ("88231", "Riverside Fuel Dist- NJ"),
+                ("4471", "HUDSON PETRO LLC")]
+    rows, bol, base = [], 700000, pd.Timestamp("2024-01-01")
+    for num, name in variants:
+        for w in range(10):
+            bol += 1
+            d = (base + pd.Timedelta(weeks=w)).strftime("%Y-%m-%d")
+            for _ in range(2):                                  # two compartments share one BOL
+                rows.append((num, name, bol, d, "Linden", "ULSD", 2010, 2000, ""))
+    return pd.DataFrame(rows, columns=cols).to_csv(index=False).encode()
+
+
+def test_wide_bol_keys_on_name_then_crosswalk_shows_coded_names(client):
+    ins = client.post("/api/studio/inspect", files={
+        "file": ("bol.csv", io.BytesIO(_wide_bol_number_and_name_csv()), "text/csv")}).json()
+    mapping = {c: s["target"] for c, s in ins["suggestions_by_table"]["lifts"].items()}
+    # Auto-map keys the customer on the NAME (so the name crosswalk resolves), NOT the number.
+    assert mapping["Consignee Name"] == "customer_id"
+    assert mapping.get("Consignee Number") != "customer_id"
+
+    com = client.post("/api/studio/commit", json={
+        "upload_id": ins["upload_id"], "table": "lifts", "mapping": mapping,
+        "mode": "replace", "options": {"group_bol": True, "net_correction": "off"}}).json()
+    assert com["rows_written"] < com["clean_rows"]              # compartments grouped into lifts
+    assert com["summary"]["customers"] == 3                     # three raw names, pre-crosswalk
+
+    # Upload the hand-built raw→coded map; the two Riverside spellings collapse into one master.
+    nm = pd.DataFrame({"Raw BOL Account Names": ["RIVERSIDE FUEL CO-NJ", "Riverside Fuel Dist- NJ",
+                                                 "HUDSON PETRO LLC"],
+                       "Coded Account Names": ["Riverside Fuel", "Riverside Fuel", "Hudson Petroleum"]})
+    client.post("/api/studio/crosswalk/upload-names",
+                files={"file": ("names.csv", io.BytesIO(nm.to_csv(index=False).encode()), "text/csv")})
+
+    names = {c["name"] for c in client.get("/api/scores?window=all").json()["customers"]}
+    assert names == {"Riverside Fuel", "Hudson Petroleum"}      # shown by clean coded names
+    # The consignee NUMBER never surfaces as a customer label.
+    assert not any(str(n).replace(".", "", 1).isdigit() for n in names)

@@ -113,7 +113,7 @@ export default function NameMapPanel({
                 <tbody>
                   {unmapped.map((u) => (
                     <tr key={u.customer_id} className="border-t border-slate-100">
-                      <td className="px-2 py-1 font-mono text-slate-700">{u.customer_id}</td>
+                      <td className="px-2 py-1 font-mono text-slate-700">{u.name}</td>
                       <td className="px-2 py-1 text-right text-slate-500">{u.lift_count}</td>
                       <td className="px-2 py-1 text-right text-slate-500">{fmtGal(u.total_net_gallons)}</td>
                     </tr>
