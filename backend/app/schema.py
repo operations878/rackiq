@@ -401,5 +401,15 @@ def customer_key_column(table: str) -> str | None:
     return CUSTOMER_KEY_COLUMN.get(table)
 
 
+# Tables carrying a `product` dimension that the Product Reference chart standardizes
+# (raw description → standardized code), mirroring the customer-name crosswalk.
+PRODUCT_TABLES = [LIFTS, INVENTORY, MARKET, QUOTES, RECEIPTS, BOL]
+
+
+def product_column(table: str) -> str | None:
+    """The product-dimension column on ``table`` (None if the table has no product)."""
+    return "product" if table in PRODUCT_TABLES else None
+
+
 def volume_fields_for_table(table: str) -> list[str]:
     return [f.name for f in CANONICAL_FIELDS if f.table == table and f.name in VOLUME_FIELDS]

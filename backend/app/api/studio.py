@@ -286,18 +286,28 @@ def crosswalk_clear():
 # Header keywords that identify the two columns of a hand-built name map.
 _RAW_NAME_KEYWORDS = ("raw", "bol", "variant", "source", "original", "consignee", "as is")
 _CODED_NAME_KEYWORDS = ("coded", "master", "clean", "mapped", "canonical", "standard", "resolved")
+_RAW_PRODUCT_KEYWORDS = ("raw", "source", "original", "as is", "description", "long", "terminal")
+_STD_PRODUCT_KEYWORDS = ("standard", "coded", "clean", "canonical", "mapped", "normalized", "short")
+
+
+def _detect_two_columns(df: pd.DataFrame, raw_kw: tuple, target_kw: tuple) -> tuple[str, str]:
+    """Pick the (raw, target) columns of a two-column reference chart by header keywords; fall
+    back to positional (first column = raw, second = target), which matches the documented layout."""
+    cols = list(df.columns)
+    lower = {c: str(c).lower() for c in cols}
+    raw_col = next((c for c in cols if any(k in lower[c] for k in raw_kw)), None)
+    tgt_col = next((c for c in cols if c != raw_col and any(k in lower[c] for k in target_kw)), None)
+    if raw_col is None or tgt_col is None:
+        raw_col, tgt_col = cols[0], cols[1]
+    return raw_col, tgt_col
 
 
 def _detect_name_map_columns(df: pd.DataFrame) -> tuple[str, str]:
-    """Pick the (raw, coded) columns of a two-column name map by header keywords; fall back to
-    positional (first column = raw, second = coded), which matches the documented layout."""
-    cols = list(df.columns)
-    lower = {c: str(c).lower() for c in cols}
-    raw_col = next((c for c in cols if any(k in lower[c] for k in _RAW_NAME_KEYWORDS)), None)
-    coded_col = next((c for c in cols if c != raw_col and any(k in lower[c] for k in _CODED_NAME_KEYWORDS)), None)
-    if raw_col is None or coded_col is None:
-        raw_col, coded_col = cols[0], cols[1]
-    return raw_col, coded_col
+    return _detect_two_columns(df, _RAW_NAME_KEYWORDS, _CODED_NAME_KEYWORDS)
+
+
+def _detect_product_map_columns(df: pd.DataFrame) -> tuple[str, str]:
+    return _detect_two_columns(df, _RAW_PRODUCT_KEYWORDS, _STD_PRODUCT_KEYWORDS)
 
 
 @router.post("/crosswalk/upload-names")
@@ -371,6 +381,74 @@ def unmapped_customers_list():
             "crosswalk_masters": db.crosswalk_master_count(con),
             "crosswalk_size": len(db.get_crosswalk(con)),
             "customers_total": db.row_count(con, schema.CUSTOMERS),
+        }
+
+
+@router.post("/product-map/upload")
+async def product_map_upload(file: UploadFile = File(...)):
+    """Upload a hand-built two-column Product Reference chart (Raw Product Code → Standardized
+    Code). Loads every row as a CONFIRMED product-crosswalk entry, then RE-APPLIES across the
+    whole store so already-loaded lifts/inventory/market/quotes/receipts/BOLs restate their
+    product to the standardized code and every product-level metric recomputes on it.
+    Re-uploadable any time to extend the chart."""
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+    try:
+        df = ingest.parse_file(content, file.filename or "product-map")
+    except ingest.IngestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if df is None or len(df.columns) < 2:
+        raise HTTPException(status_code=400,
+                            detail="A product reference chart needs two columns: the raw product "
+                                   "code and the standardized code.")
+
+    raw_col, std_col = _detect_product_map_columns(df)
+    pairs = list(zip(df[raw_col].tolist(), df[std_col].tolist()))
+
+    with db.lock():
+        con = _con()
+        loaded = crosswalk.load_product_map(con, pairs, _now())
+        applied = db.reapply_product_crosswalk(con)
+        db.set_meta(con, "last_import_at", _now())  # bust scoring / demand / pricing caches
+        db.log_hygiene_audit(con, _now_us(), schema.LIFTS, file.filename or "product-map", [
+            {"step": "product_map", "rows_affected": loaded["loaded"],
+             "detail": f"Loaded {loaded['loaded']} raw→standard product mapping(s) "
+                       f"({loaded['standards']} standardized code(s)); confirmed."},
+            {"step": "product_reapply", "rows_affected": applied["total_remapped"],
+             "detail": f"Standardized {applied['total_remapped']} existing row(s)' product code."},
+        ])
+        db.log_import(con, _now(), schema.LIFTS, file.filename or "product-map",
+                      loaded["loaded"], "product_map")
+        unmapped = db.unmapped_products(con)
+        state = _state(con)
+        standards = db.product_standard_count(con)
+
+    return {
+        "ok": True,
+        "raw_column": raw_col,
+        "standard_column": std_col,
+        "loaded": loaded["loaded"],
+        "standards": loaded["standards"],
+        "remapped": applied["remapped"],
+        "total_remapped": applied["total_remapped"],
+        "unmapped": unmapped,
+        "n_unmapped": len(unmapped),
+        "product_standards": standards,
+        **state,
+    }
+
+
+@router.get("/unmapped-products")
+def unmapped_products_list():
+    """Distinct product codes in lifts not standardized by the Product Reference chart yet."""
+    with db.lock():
+        con = _con()
+        rows = db.unmapped_products(con)
+        return {
+            "unmapped": rows,
+            "n_unmapped": len(rows),
+            "product_standards": db.product_standard_count(con),
         }
 
 

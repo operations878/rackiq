@@ -327,3 +327,78 @@ def load_name_map(con, pairs: list[tuple[object, object]], now: str) -> dict:
 
     written = db.upsert_crosswalk_entries(con, entries)
     return {"loaded": len(raw_to_coded), "masters": len(masters), "entries_written": written}
+
+
+# ---- Product Reference chart (raw product description -> standardized code) ------
+def load_product_map(con, pairs: list[tuple[object, object]], now: str) -> dict:
+    """Load a hand-built {raw product code -> standardized code} mapping as CONFIRMED
+    product-crosswalk entries — the human source of truth for product standardization.
+
+    Mirrors :func:`load_name_map`: every raw description that shares a standardized code
+    collapses onto it, chains (raw → std → std') are followed, and each standardized code is
+    pinned as a self-map so re-applying is idempotent. ``pairs`` is ``[(raw, standard), ...]``.
+    """
+    from . import db
+
+    raw_to_std: dict[str, str] = {}
+    for raw, std in pairs:
+        r = ("" if raw is None else str(raw)).strip()
+        s = ("" if std is None else str(std)).strip()
+        if not r or not s:
+            continue
+        raw_to_std[r] = s  # last write wins for a repeated raw code
+
+    def resolve(key: str) -> str:
+        seen: set[str] = set()
+        cur = key
+        while cur in raw_to_std and cur not in seen and raw_to_std[cur] != cur:
+            seen.add(cur)
+            cur = raw_to_std[cur]
+        return cur
+
+    entries: list[dict] = []
+    standards: set[str] = set()
+    for raw, std in raw_to_std.items():
+        standard = resolve(std) or std
+        standards.add(standard)
+        entries.append({"raw_code": raw, "standard_code": standard,
+                        "status": "confirmed", "source": "product_map", "updated_at": now})
+    for s in standards:
+        if s not in raw_to_std:   # pin the standard as a self-map (idempotent re-apply)
+            entries.append({"raw_code": s, "standard_code": s,
+                            "status": "confirmed", "source": "product_map", "updated_at": now})
+
+    written = db.upsert_product_crosswalk_entries(con, entries)
+    return {"loaded": len(raw_to_std), "standards": len(standards), "entries_written": written}
+
+
+def apply_products_to_frame(df, table: str, con) -> tuple[object, int, list[dict]]:
+    """Rewrite the table's ``product`` column to its standardized code using confirmed
+    product-crosswalk entries. Returns (df, n_rows_remapped, rewrites)."""
+    from . import db, schema
+
+    col = schema.product_column(table)
+    if not col or col not in df.columns:
+        return df, 0, []
+    confirmed = {k: v for k, v in db.get_product_crosswalk(con).items()
+                 if v.get("status") == "confirmed" and v.get("standard_code")}
+    if not confirmed:
+        return df, 0, []
+
+    df = df.copy()
+    rewrites: dict[tuple[str, str], int] = {}
+
+    def _resolve(v):
+        if v is None:
+            return v
+        key = str(v).strip()
+        info = confirmed.get(key)
+        if info and info["standard_code"] != key:
+            rewrites[(key, info["standard_code"])] = rewrites.get((key, info["standard_code"]), 0) + 1
+            return info["standard_code"]
+        return v
+
+    df[col] = df[col].map(_resolve)
+    n_remapped = sum(rewrites.values())
+    rewrite_list = [{"from": k[0], "to": k[1], "rows": n} for k, n in rewrites.items()]
+    return df, n_remapped, rewrite_list

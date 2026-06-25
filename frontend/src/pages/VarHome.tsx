@@ -8,6 +8,7 @@ import ForwardProjection from "../components/scores/ForwardProjection";
 import LaneBreaks from "../components/scores/LaneBreaks";
 import VarTrendBadge from "../components/scores/VarTrendBadge";
 import NameMapPanel from "../components/studio/NameMapPanel";
+import ProductMapPanel from "../components/studio/ProductMapPanel";
 import { ScorePill, gradeTone, gradeWord, varMeaning, Tip, fmtGal, fmtGalFull } from "../lib/scoreui";
 
 const WINDOW_LABEL: Record<string, string> = { "30": "30 days", "90": "90 days", "365": "365 days", all: "All-time" };
@@ -272,6 +273,8 @@ export default function VarHome({ summary, navigate }: { summary: Summary; navig
   const [showMore, setShowMore] = useState(false);
   const [showUnmapped, setShowUnmapped] = useState(false);
   const [nUnmapped, setNUnmapped] = useState(0);
+  const [showProducts, setShowProducts] = useState(false);
+  const [nUnmappedProducts, setNUnmappedProducts] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const reload = useCallback(() => {
@@ -289,6 +292,9 @@ export default function VarHome({ summary, navigate }: { summary: Summary; navig
   useEffect(() => {
     api.studio.unmappedCustomers()
       .then((u) => { setNUnmapped(u.n_unmapped); setShowUnmapped(u.n_unmapped > 0); })
+      .catch(() => {});
+    api.studio.unmappedProducts()
+      .then((u) => { setNUnmappedProducts(u.n_unmapped); })
       .catch(() => {});
   }, [summary]);
 
@@ -430,6 +436,20 @@ export default function VarHome({ summary, navigate }: { summary: Summary; navig
             {nUnmapped > 0
               ? `${nUnmapped} raw account name${nUnmapped === 1 ? "" : "s"} aren't mapped to a clean name yet.`
               : "Every customer name is mapped to a clean coded name."}
+          </p>
+        )}
+      </Panel>
+
+      {/* Product reference chart */}
+      <Panel
+        title={<span>Product reference {nUnmappedProducts > 0 && <span className="ml-1 rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] font-semibold text-white">{nUnmappedProducts} unmapped</span>}</span>}
+        right={<button onClick={() => setShowProducts((s) => !s)} className="text-[11px] font-medium text-indigo-600 hover:underline">{showProducts ? "Hide" : "Show"}</button>}
+      >
+        {showProducts ? <ProductMapPanel onState={() => reload()} compact /> : (
+          <p className="text-[11px] text-slate-500">
+            {nUnmappedProducts > 0
+              ? `${nUnmappedProducts} raw product code${nUnmappedProducts === 1 ? "" : "s"} aren't standardized yet.`
+              : "Every product code is standardized to a clean code."}
           </p>
         )}
       </Panel>

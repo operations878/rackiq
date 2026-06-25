@@ -15,6 +15,8 @@ import type {
   CrosswalkEntry,
   UnmappedResponse,
   NameMapResult,
+  ProductMapResult,
+  UnmappedProductResponse,
   DataHealth,
   QuarantineResponse,
   AuditEntry,
@@ -146,6 +148,14 @@ export const api = {
       return (await res.json()) as NameMapResult;
     },
     unmappedCustomers: () => getJSON<UnmappedResponse>("/studio/unmapped-customers"),
+    async uploadProductMap(file: File): Promise<ProductMapResult> {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(`${BASE}/studio/product-map/upload`, { method: "POST", body: fd });
+      if (!res.ok) throw new Error(await readError(res, "/studio/product-map/upload"));
+      return (await res.json()) as ProductMapResult;
+    },
+    unmappedProducts: () => getJSON<UnmappedProductResponse>("/studio/unmapped-products"),
 
     // ---- Data health, quarantine, audit ----
     dataHealth: () => getJSON<DataHealth>("/studio/data-health"),
