@@ -449,11 +449,12 @@ percentile ranking. Results persist to `customer_scores` + `customer_lane`.
   SIZE** at **daily** resolution over rolling calendar windows (`behavior_windows` = 7/30/90 + all,
   anchored to the last data date, clipped at first-active so a new account isn't charged for
   pre-existence):
-  1. **Presence / frequency** — over ALL calendar days, **zeros included**: active-day rate, median
-     gap, longest silent stretch, lifts/active-days per week.
+  1. **Presence / frequency** — over the **weighted working days** (Phase-1 calendar: Sun/holidays
+     excluded, Saturday a data-driven partial weight), **zeros included**: active-day rate, median gap,
+     longest silent stretch, lifts/active-days per week — all in working days (a Fri→Mon gap is ~1, not 3).
   2. **Size-when-present** — over ACTIVE days only: mean · median · **mode (bucketed)** · min · max ·
-     range · std · CV · P10·P50·P90 (the real load size when they buy).
-  3. **Naive all-days** — mean & median over every day; the **misleading-average detector** fires when
+     range · std · CV · P10·P50·P90 (the real load size when they buy; exception lifts included).
+  3. **Naive all-days** — mean & median over the counted (working) days; the **misleading-average detector** fires when
      the all-days **median = 0 while mean > 0** (`intermittent`/`misleading_average`), with a
      `misleading_severity` (high for occasional/rare burst buyers, moderate for chunky-but-frequent).
   Each customer is classified on **FREQUENCY** (daily/frequent/occasional/rare) × **SIZE-CONSISTENCY**
@@ -572,6 +573,10 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/pricing/recommendations?terminal=&window=&<regime axes>` | per-customer GP-maximizing quote price + accept-prob + expected GP + today's ranked underpriced accounts (regime-aware; surfaced inline on each scorecard) |
 | `GET /api/pricing/config` | the pricing config (spread/price grids, shadow-price schedule, acceptance-model priors) |
 | `POST /api/pricing/recompute` | recompute the full payload with `{overrides, window, terminal, regime}` (busts the cache) |
+| `GET /api/calendar` | the **working-day calendar** (Phase 1): the measured per-terminal + network **day-of-week rhythm**, the data-driven **Saturday weights**, the holidays in the data span, and the upcoming non-lifting (Sunday/holiday) days the model excludes |
+| `GET /api/calendar/config` · `POST /api/calendar/recompute` | the calendar config (holiday country/subdiv, Saturday default/min-obs, weights) · recompute with `{overrides}` |
+| `GET /api/hedging?terminal=&window=&service_level=` | the **operational demand-hedging readout** (Phase 2): per-terminal expected demand band (P10/P50/P90) over the next 3 & 5 **working** days, the FLOOR vs UPSIDE split, the **behavior-aware dynamic buffer** (statistical safety + overdue-burst coil), the risk watch-list, the morning readout, and the operational customer view (honest "inventory not connected" note when absent) |
+| `GET /api/hedging/overview` · `GET /api/hedging/config` · `POST /api/hedging/recompute` | every terminal's readout (shared scoring) · the hedging config · recompute with `{overrides, window, terminal, service_level}` |
 
 Interactive docs at `http://localhost:8000/docs`.
 
@@ -677,6 +682,78 @@ restates spreads as absolute quote prices for display.
   street is ever recommended when the shadow price is positive**. Surfaced inline on each scorecard
   (recommended price · accept-probability · expected GP) and as a ranked **underpriced-accounts**
   worklist (the GP-maximizing quote sits above today's realized price — room to raise).
+
+---
+
+## Working-day calendar (Phase 1) — day-type model · data-driven Saturday weight
+
+`backend/app/calendar_days.py` replaces "count every calendar day" with a real **three-day-type
+model** so daily presence / cadence / gap math stops being corrupted by non-lifting days. It is
+self-contained (numpy / pandas / the offline `holidays` library only — nothing from `scoring`) so the
+import graph stays acyclic; behavioral / scoring / forecasting / hedging all consume it.
+
+- **NON-LIFTING** — Sundays **and** US bank/federal holidays (via `holidays.country_holidays`,
+  configurable country/subdivision, with observed shifts). **Weight 0** — excluded from the working-day
+  denominator and from gap/silence counting; a customer is not "absent" on a Sunday/holiday. A real
+  lift that lands on one is an **exception**: its volume is kept (size stats / `n_lifts` include it) but
+  the day adds 0 to presence/gaps.
+- **LOW-ACTIVITY** — Saturdays. A **partial day** whose weight is **measured per terminal from the
+  data** (its real Saturday activity ÷ a full weekday's, clamped, with a min-observations fallback to
+  `saturday_default_weight`). Not fully excluded (keeps real Saturday lifts), not a full day (doesn't
+  make everyone look less steady).
+- **FULL** — Mon–Fri non-holiday, full weight.
+
+`WorkingCalendar` learns the rhythm per terminal (`from_lifts` / `from_connection` → `(calendar,
+rhythm_report)`), exposes `weight` / `weights_for_index` / `day_type`, and counts working days in O(1)
+via a lazily-built per-terminal cumulative-weight series (`cumulative_at` vectorizes the per-lift gaps;
+`working_days_between` does a `(a, b]` span; `window_working_days` a `[start, end)` window;
+`add_working_days` turns a working-day horizon into a real "by &lt;date&gt;"). Every knob lives in
+`CalendarConfig`. The measured **day-of-week rhythm** + Saturday weights + exclusions are served at
+`GET /api/calendar` (the Working-Day Calendar page renders them).
+
+**Propagation (the corrected calendar everywhere).** `behavioral.daily_profile` computes presence /
+active-day rate / cadence / longest-silence / the median-0/mean&gt;0 **intermittency** flag over
+**weighted working days** (a Mon–Fri buyer who skips Sat/Sun now reads fully *Steady Daily*).
+`scoring._customer_core` measures the inter-lift **gaps** (→ the cadence lane → VAR) and
+**days-since-last** (→ recency_gap, churn) in working days — so a Fri→Mon gap is ~1, not 3. The VAR
+**formula/weights are unchanged**; only its cadence/recency *inputs* are de-corrupted (so steady
+weekday buyers earn the VAR they deserve). `forecasting.forecast_customer` counts "days silent vs
+cadence" (the `slowing` damp/flag) in working days too. Each customer uses its home/dominant terminal's
+learned Saturday weight (network fallback).
+
+## Operational demand-hedging (Phase 2) — stage product against demand surprise
+
+`backend/app/hedging.py` (engine) + inline `HedgingConfig` tell the operator each morning, **per
+terminal**, how much product to stage = expected demand + a **behavior-aware buffer**, and who drives
+the risk. This is **physical/operational** hedging (staging against demand surprise), NOT financial
+price hedging. It is built entirely on the Phase-1 working-day calendar and reuses
+`scoring.compute_scores` (the today-anchored per-customer **forecast** + the daily **behavioral**
+profile + **VAR** + working-day cadence/recency). All accuracy is out-of-sample; bursty customers
+contribute wide, never fake-precise. Live-computed over the shared connection; `api/hedging.py` caches
+the heavy scoring per `(data-sig, window, date)` so the **service-level slider** and **terminal**
+selector re-derive only the cheap aggregation.
+
+Per terminal, over horizons in **working days** (default 3 & 5, config), anchored to today:
+
+- **Expected demand band.** Each customer's near-term per-**working-day** rate (from its 7-day
+  forecast, attributed to the terminal by its volume mix; behavioral fallback for thin/bursty accounts)
+  is summed to the terminal **P50**; the **P10/P50/P90** band combines per-customer out-of-sample error
+  **with correlation** (same-product and weather-linked accounts co-move — cold snaps lift distillate
+  together — so the band is honestly wider than independence). The reliable **FLOOR** (steady-customer
+  volume) is split from the volatile **UPSIDE**.
+- **Behavior-aware dynamic buffer (the heart).** `band_buffer` = z·σ at the service level, plus a
+  `coil_buffer`: for each **bursty/intermittent** customer, the share of its typical load that its
+  **overdue-ness** (working days silent ÷ its working-day cadence, measured against the data date so a
+  uniformly stale book doesn't make everyone look overdue) says is "coiled" and due now — a burst buyer
+  past its cadence **raises** the buffer; a recently-lifted one adds ~nothing. `recommended_staging =
+  P50 + band_buffer + coil_buffer`.
+- **Risk concentration.** Customers ranked by contribution to demand **variability** (variance share),
+  not volume — "who makes the buffer necessary"; flags any single customer whose one load could exceed
+  the buffer.
+- **Morning readout + operational customer view** (behavioral type · working-day cadence · working-days
+  since last vs normal + overdue flag · typical load · terminal share · risk contribution). **Honesty:**
+  if inventory/tank capacity isn't loaded, it advises **target** staging (not days-of-cover) and says so
+  — inventory is never fabricated (it only *reads* `demand._latest_inventory`).
 
 ---
 
@@ -840,6 +917,7 @@ backend/
     forecasting.py          # ★ per-customer demand forecasting engine: multi-model (seasonal/HW/trend/cadence/recency/flat) selected by walk-forward backtest, must-beat-naive + low-pred flag, reliability shrinkage, honest per-customer band, TODAY-anchored horizons (proration over the data-recency gap)
     behavioral.py           # ★ daily presence-aware behavioral profile (enriches VAR; never changes the score): split PRESENCE (all days, zeros incl.) from SIZE-WHEN-PRESENT (active days), full descriptive stats, median-0/mean>0 misleading-average flag, FREQUENCY×SIZE classifier (Steady Daily…Sporadic/Bursty) + plain read + daily bars, per master customer
     scoring_config.py       # ★ ScoringConfig — every weight/threshold/window/forecast param (model selection, backtest, shrinkage, today-anchoring) as a parameter
+    calendar_days.py        # ★ working-day calendar (Phase 1): 3 day-types (Sun+US-holiday excluded · Saturday data-driven partial weight per terminal · Mon–Fri full), holidays lib, learns the per-terminal day-of-week rhythm, O(1) working-day counting (CalendarConfig)
     weather.py              # ★ HDD/CDD feed: live NOAA/ERA5 auto-fetch (no key) → weather_daily cache → seasonal proxy fallback (explains lane breaks)
     reconciliation.py       # ★ P8 loss-control engine: book vs physical, BOL-grouped disbursements,
                             #   net-recon cross-check, mechanism split, meter-drift control charts, $loss
@@ -850,6 +928,7 @@ backend/
     demand.py               # ★ Demand Cockpit: per-customer HW/seasonal-naive forecast → terminal P10/P50/P90 band, days-of-cover/burn-down, order-up-to action, persisted distributions (DemandConfig)
     pricing.py              # ★ Pricing Sandbox + Engine (Blueprint I): spread what-if (per-customer vol/margin curves via β, margin-maximizing post), acceptance model (per-segment logistic from quotes + elasticity proxy), GP-maximizing quote price with shadow-price floor
     pricing_config.py       # ★ PricingConfig — spread/price grids, shadow-price schedule, acceptance priors, elasticity-class thresholds as parameters
+    hedging.py              # ★ Operational demand-hedging (Phase 2, on the working-day calendar): per-terminal expected band (P10/P50/P90 w/ customer correlation), FLOOR vs UPSIDE, behavior-aware dynamic buffer (statistical safety + overdue-burst coil), risk concentration, morning readout (HedgingConfig)
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping (BOL/EDI aliases, 2-tier threshold), inspect (+profiling), validate, coerce (mixed + Excel-serial dates)
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -859,7 +938,7 @@ backend/
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
     cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook
     config.py               # settings (db path, CORS, host/port)
-    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + pricing routers)
+    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + pricing + calendar + hedging routers)
     api/{routes,queries}.py # read endpoints + SQL
     api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
     api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / forecast-backtest (new-vs-old-vs-naive) / config / recompute (+ data-recency block)
@@ -867,7 +946,9 @@ backend/
     api/daily.py            # /api/daily, /api/regime/config, /api/scorecards, /api/playbook (Blueprints C/E/G)
     api/demand.py           # /api/demand/cockpit / persist / forecasts / config (the Demand Cockpit)
     api/pricing.py          # /api/pricing (sandbox + recommendations) / recommendations / config / recompute (cached base)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_name_map + test_regime + test_reconciliation + test_demand + test_pricing
+    api/calendar.py         # /api/calendar (measured day-of-week rhythm + Saturday weights + exclusions) / config / recompute
+    api/hedging.py          # /api/hedging (per-terminal staging readout) / overview / config / recompute (heavy scoring cached per data/window/day)
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -878,7 +959,7 @@ frontend/
     App.tsx, main.tsx, index.css       # App.tsx = the left-nav dashboard shell (Operate/Analyze/Data)
     lib/{useHashRoute,format}.ts, lib/scoreui.tsx
     api/{client,types}.ts
-    pages/{VarHome,DailyOps,DemandCockpit,Pricing,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx   # VarHome = the default landing (route "")
+    pages/{VarHome,DailyOps,DemandCockpit,Hedging,Calendar,Pricing,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx   # VarHome = the default landing (route ""); Hedging = Demand Hedging (Operate); Calendar = Working-Day Calendar (Data)
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
     components/scores/{BaseRangeChart,QuadrantScatter,VarBreakdown,ForwardProjection,LaneBreaks,VarTrendBadge,BehaviorMap,BehaviorProfile,DailyBars}.tsx   # BaseRangeChart draws the dotted forward projection; ForwardProjection/LaneBreaks/VarTrendBadge = VAR-as-forecast UI; BehaviorMap (2-axis freq×size map) / BehaviorProfile (presence/size split + stats panel + window toggle) / DailyBars (daily presence+size bars) = the presence-aware behavioral profile UI
     components/demand/{DemandForecastChart,BurnDownChart}.tsx
@@ -890,7 +971,25 @@ CLAUDE.md
 
 ## Notes & gotchas
 - **numpy < 2.5** on Python 3.11 (2.5 requires 3.12); pinned in `pyproject.toml`. The scoring
-  engine adds **statsmodels** (STL) + **scipy** (rank percentiles) — installed by `uv sync`.
+  engine adds **statsmodels** (STL) + **scipy** (rank percentiles) + the **holidays** library (the
+  working-day calendar — offline/algorithmic, no network) — all installed by `uv sync`.
+- **The working-day calendar (`calendar_days.py`) corrects the cadence/recency INPUTS to VAR — the
+  VAR formula stays frozen.** Daily presence / cadence / gaps / intermittency (behavioral) and the
+  inter-lift gaps → cadence lane + days-since → recency_gap/churn (scoring) are now counted in
+  **weighted working days** (Sun/holiday weight 0, Saturday a data-driven per-terminal partial weight,
+  Mon–Fri full). This shifts published VAR numbers (steady Mon–Fri buyers rise) but the formula/weights
+  are unchanged. The Saturday weight is **measured per terminal from the data** (min-obs fallback to the
+  default); a real lift on a Sun/holiday is an **exception** (volume kept, presence/gaps unaffected).
+  `working_days_between`/`cumulative_at` are O(1) via a per-terminal cumulative-weight cache, so the gap
+  math stays vectorized (no per-pair Python loop). Demonstrable best on real Mon–Fri operating data;
+  on the uniform synthetic demo book the measured Saturday weight is ~1.0 (honest).
+- **Operational hedging (`hedging.py`) is physical, not financial.** It stages product against demand
+  surprise (expected demand + a behavior-aware buffer), reusing the scoring forecast/behavior/VAR over
+  the working-day calendar. Overdue-ness is measured against the **data date** (a uniformly stale book
+  doesn't make everyone look overdue); the **coil buffer** only fires for **bursty/intermittent**
+  accounts past their working-day cadence. It never fabricates inventory — absent supply data ⇒ TARGET
+  staging + a note. The heavy scoring is cached per `(data-sig, window, day)` so the service-level
+  slider/terminal selector stay snappy.
 - **Customer identity vs. display.** The Consignee **Number** stays the internal stable key /
   crosswalk variant key; the UI **always shows the coded (master) Name**, falling back to the raw
   name only when unmapped (never a bare number). The hand-built **name map** (`raw → coded`) is the

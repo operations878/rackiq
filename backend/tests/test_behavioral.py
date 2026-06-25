@@ -49,9 +49,10 @@ def _taylor():
 
 
 def _super_quality():
-    # silent most days, then a big ~55k load on a few irregular days over ~8 weeks
-    offs = [2, 9, 13, 27, 33, 41, 50]
-    gals = [60000, 50000, 58000, 52000, 61000, 49000, 57000]
+    # silent most days, then a big ~55k load on a few IRREGULAR days (gaps vary widely even in
+    # working-day terms) — a genuine buffer-risk burst buyer (marine-parcel-like), not a weekly rhythm
+    offs = [4, 11, 38, 52, 95, 130]
+    gals = [60000, 50000, 58000, 52000, 61000, 49000]
     return _prof(offs, gals, "Super Quality")
 
 
@@ -155,20 +156,26 @@ def test_label_matrix():
 
 # ---- Presence stats are correct (zeros are data) --------------------------------
 def test_presence_stats_known_grid():
-    # active on days T, T-2, T-4, T-6 (4 of a 7-day span) → rate 4/7, gap 2, silent run 1
+    # AS_OF 2026-06-01 is a Monday; offsets [0,2,4,6] land on Mon, Sat, Thu, Tue. The 7-day span
+    # contains one Sunday (excluded, weight 0) and one Saturday (partial, default weight 0.35), so
+    # presence is read over WORKING days: denom = 5×1 + 1×0.35 = 5.35, active-weighted = Tue+Thu+Mon
+    # (3×1) + Sat (0.35) = 3.35 → rate 3.35/5.35 ≈ 0.626 (vs the naive 4/7 = 0.571).
     head = _prof([0, 2, 4, 6], 5000.0)["windows"]["all"]
     pres = head["presence"]
     assert pres["n_days"] == 7 and pres["n_active_days"] == 4
-    assert abs(pres["active_day_rate"] - 4 / 7) < 1e-3   # reported rounded to 4 dp
-    assert pres["median_gap_days"] == 2.0
-    assert pres["longest_silent_days"] == 1
+    assert abs(pres["working_days"] - 5.35) < 0.1   # 5.35 (reported rounded to 1 dp)
+    assert abs(pres["active_day_rate"] - 3.35 / 5.35) < 1e-3
+    # gaps in working days: Tue→Thu = 2, Thu→Sat = 1.35, Sat→Mon = 1.0 → median ~1.35
+    assert abs(pres["median_gap_days"] - 1.35) < 0.1
+    assert pres["longest_silent_days"] == 1.0   # at most one inactive working day between lifts
 
 
 def test_longest_silent_stretch():
-    # one early lift, then a 20-day silence, then daily for a week
+    # one early lift, then a ~20-calendar-day silence, then daily for a week. Measured in WORKING
+    # days the silence excludes the weekends it spans, so ~21 calendar days ≈ ~14 working days.
     offs = [27] + list(range(0, 7))
     head = _prof(offs, 5000.0)["windows"]["all"]
-    assert head["presence"]["longest_silent_days"] >= 18
+    assert 12.0 <= head["presence"]["longest_silent_days"] <= 16.0
 
 
 # ---- Full descriptive stats panel ----------------------------------------------
