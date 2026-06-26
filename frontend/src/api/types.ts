@@ -1848,24 +1848,35 @@ export interface MarginGap {
 }
 
 // ---- The convergence layer (/api/profile/*) — assembly of existing engine outputs ----
+/** The REAL Phase-6 MODELED missing-volume facet (peak ≈ wallet) — superset of the old interim shape. */
 export interface ProfileOpportunity {
   available: boolean;
-  kind: "win" | "win_stale" | "risk" | "matched" | "unknown";
+  modeled?: boolean;
+  source?: string;
+  premise?: string;
+  kind: "win" | "shrunk" | "matched" | "unknown";
   winnable_gal_per_yr: number;
   winnable_dollars_per_yr?: number | null;
-  gal_per_day?: number | null;
-  annualized_gal?: number;
-  at_risk_gal_per_yr?: number;
-  at_risk_dollars_per_yr?: number | null;
-  chase_channel?: string | null;
-  strength?: string | null;
+  gap_gal_per_yr?: number;
+  gap_dollars_per_yr?: number | null;
+  winnability?: number | null;        // 0–100; trend freshness × peak freshness
+  winnability_flag?: string | null;   // under_served | shrunk | thin_per_product | insufficient
+  chase_channel?: string | null;      // "rack/term" | "spot" | null
+  channel?: "RACK" | "SPOT" | null;
+  term_eligible?: boolean;
+  confidence_tier?: "High" | "Medium" | "Low" | null;
+  provisional?: boolean;
   stale?: boolean;
+  weather_adjusted?: boolean;
+  rank_by_gap?: number | null;
+  rank_by_dollars?: number | null;
+  rank_by_winnable?: number | null;
   note?: string;
-  reason?: string;
-  // interim-source labeling (Phase 6 swaps the data behind this, not the tile)
-  source?: string;
-  interim?: boolean;
+  headline?: string;
+  product?: string | null;
+  // honesty label — always MODELED (never let an estimate read as measured demand)
   interim_note?: string;
+  caveat?: string;
 }
 export type ProfileAction = "CALL" | "DE_RISK" | "FIX_PRICING" | "WATCH" | "PROTECT" | "LEAVE" | "REVIEW";
 export interface ProfileProductMix {
@@ -1981,6 +1992,12 @@ export interface ProfileCustomerListRow {
   winnable_dollars_per_yr?: number | null;
   commitment_label: string | null;
   opportunity_kind: string;
+  opportunity_available?: boolean;
+  winnability?: number | null;
+  winnability_flag?: string | null;
+  chase_channel?: string | null;
+  gap_gal_per_yr?: number | null;
+  opportunity_note?: string | null;
   action: ProfileAction;
   action_label: string;
   headline: string;
@@ -2014,6 +2031,8 @@ export interface ProfileTile {
   tone: "neutral" | "amber" | "emerald" | "rose";
   format?: string;
   available?: boolean;
+  modeled?: boolean;
+  unavailable_note?: string;
 }
 export interface ProfileDoorway {
   key: string;
@@ -2027,6 +2046,7 @@ export interface ProfileHome {
   available: boolean;
   tiles: ProfileTile[];
   margin_available: boolean;
+  opportunity_available?: boolean;
   sources: ProfileSource[];
   n_connected: number;
   n_total: number;
@@ -2038,6 +2058,7 @@ export interface ProfileCustomersResponse {
   as_of: string | null;
   n_customers: number;
   margin_available: boolean;
+  opportunity_available?: boolean;
   deals_available: boolean;
   customers: ProfileCustomerListRow[];
 }
@@ -2065,4 +2086,65 @@ export interface ProfileTerminalsResponse {
   deals_available: boolean;
   margin_available: boolean;
   terminals: ProfileTerminalRow[];
+}
+
+// ---- Phase 7: position & days-of-cover (/api/position) ----
+export interface PositionCure {
+  short: boolean;
+  target_cover_working_days: number;
+  gallons_short?: number;
+  implied_barge_bbl?: number;
+  nominate_by?: string;
+  to_hold_working_days?: number;
+}
+export interface PositionCell {
+  terminal: string;
+  product: string;
+  mode: "gauge" | "proxy";
+  mode_label: string;
+  position_gallons: number;
+  proxy_note?: string | null;
+  days_of_cover: number | null;
+  burn_gallons_per_working_day: number | null;
+  cover_window: {
+    lookback_days: number; from: string; to: string;
+    working_days: number; outbound_gallons: number; inbound_gallons: number;
+  };
+  run_out_date?: string | null;
+  trend: {
+    direction: string; net_flow_gallons_per_working_day: number;
+    trending_short: boolean; projected_short_date?: string | null;
+  };
+  cure: PositionCure;
+  facet: PositionFacet;
+  status: "short" | "watch" | "ok" | "unknown";
+}
+export interface PositionFacet {
+  terminal?: string;
+  product?: string;
+  headline_gallons: number;
+  headline: string;
+  mode_label: string;
+  days_of_cover: number | null;
+  status: "short" | "watch" | "ok" | "unknown";
+  sentence: string;
+}
+export interface PositionResponse {
+  as_of: string | null;
+  today: string;
+  data_lag_days: number | null;
+  recency_note?: string | null;
+  inbound: { source: string | null; source_label: string | null; connected: boolean; note: string };
+  availability: { available: boolean; reason: string };
+  working_day_note: string;
+  terminals: string[];
+  products: string[];
+  positions: PositionCell[];
+  facets: PositionFacet[];
+  summary: {
+    n_cells: number; n_short: number; n_watch: number;
+    gauge_cells: number; proxy_cells: number;
+    total_gallons_short: number; total_barrels_to_nominate: number;
+    shortest_cover: { terminal: string; product: string; days_of_cover: number | null; sentence: string } | null;
+  };
 }

@@ -52,6 +52,7 @@ import type {
   ProfileCustomersResponse,
   ProfileCustomerResponse,
   ProfileTerminalsResponse,
+  PositionResponse,
   MarginCustomerRow,
   MarginGap,
 } from "./types";
@@ -355,6 +356,17 @@ export const api = {
     customers: () => getJSON<ProfileCustomersResponse>("/profile/customers"),
     customer: (id: string) => getJSON<ProfileCustomerResponse>(`/profile/customer/${encodeURIComponent(id)}`),
     terminals: () => getJSON<ProfileTerminalsResponse>("/profile/terminals"),
+  },
+
+  // ---- Phase 7: net position & days-of-cover (gauge-vs-proxy, barge cure) ----
+  position: {
+    get: (opts: { terminal?: string | null; product?: string | null } = {}) => {
+      const qs = new URLSearchParams();
+      if (opts.terminal) qs.set("terminal", opts.terminal);
+      if (opts.product) qs.set("product", opts.product);
+      const s = qs.toString();
+      return getJSON<PositionResponse>(`/position${s ? `?${s}` : ""}`);
+    },
   },
 
   // ---- Working-day calendar (Phase 1) ----
