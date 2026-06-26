@@ -1814,3 +1814,255 @@ export interface HddStores {
   day_max: string | null;
   anchor_months: number;
 }
+
+// ---- Phase-2 margin layer (value ranking) — consumed by the convergence views ----
+export interface MarginCustomerRow {
+  customer_id: string;
+  name: string;
+  gallons: number;
+  lifts: number;
+  book_margin_dollars: number;
+  repl_margin_dollars: number;
+  book_cents_gal: number | null;
+  repl_cents_gal: number | null;
+  rank_by_volume: number;
+  rank_by_margin: number;
+  rank_delta: number;
+}
+export interface MarginGap {
+  terminal: string | null;
+  product: string | null;
+  product_family: string | null;
+  quantity_gallons: number;
+  reference_month: string;
+  committed_gallons: number;
+  committed_margin_cents_gal: number | null;
+  committed_margin_dollars: number | null;
+  spot_gallons: number;
+  spot_margin_cents_gal: number | null;
+  spot_margin_dollars: number | null;
+  total_margin_dollars: number | null;
+  blended_margin_cents_gal: number | null;
+  available: boolean;
+  flags: Record<string, string | number>;
+}
+
+// ---- The convergence layer (/api/profile/*) — assembly of existing engine outputs ----
+export interface ProfileOpportunity {
+  available: boolean;
+  kind: "win" | "win_stale" | "risk" | "matched" | "unknown";
+  winnable_gal_per_yr: number;
+  winnable_dollars_per_yr?: number | null;
+  gal_per_day?: number | null;
+  annualized_gal?: number;
+  at_risk_gal_per_yr?: number;
+  at_risk_dollars_per_yr?: number | null;
+  chase_channel?: string | null;
+  strength?: string | null;
+  stale?: boolean;
+  note?: string;
+  reason?: string;
+  // interim-source labeling (Phase 6 swaps the data behind this, not the tile)
+  source?: string;
+  interim?: boolean;
+  interim_note?: string;
+}
+export type ProfileAction = "CALL" | "DE_RISK" | "FIX_PRICING" | "WATCH" | "PROTECT" | "LEAVE" | "REVIEW";
+export interface ProfileProductMix {
+  product: string;
+  gallons: number;
+  lifts: number;
+  share: number;
+}
+export interface ProfileMarginFacet {
+  available: boolean;
+  book_cents_gal: number | null;
+  repl_cents_gal: number | null;
+  book_margin_dollars: number | null;
+  rank_by_margin: number | null;
+  rank_by_volume: number | null;
+  rank_delta: number | null;
+  gallons: number | null;
+}
+/** The unified customer record — one row per master, every engine's answer joined. */
+export interface ProfileCustomer {
+  customer_id: string;
+  name: string;
+  n_lifts: number;
+  span_days: number;
+  total_net_gallons: number;
+  primary_terminal: string | null;
+  top_product: string | null;
+  data_sufficient: boolean;
+  last_lift: string | null;
+  stale: boolean;
+  confidence_tier: "High" | "Medium" | "Low" | null;
+  confidence_provisional: boolean;
+  confidence_reason: string | null;
+  confidence_flag: string | null;
+  // steadiness
+  quadrant: string;
+  quadrant_label: string;
+  planning_note: string;
+  cadence_consistency: number | null;
+  size_consistency: number | null;
+  size_consistency_raw?: number | null;
+  cadence_inputs?: Record<string, number | string | null> | null;
+  size_inputs?: Record<string, number | null> | null;
+  behavior_label: string | null;
+  weather_sensitive: boolean;
+  size_weather_adjusted: boolean;
+  weather_beta?: number | null;
+  weather_beta_source?: string | null;
+  // channel
+  recommended_channel: "RACK" | "SPOT" | null;
+  channel_label: string;
+  current_channel_label: string;
+  current_channel_known: boolean;
+  mismatch: boolean;
+  mismatch_strength: string;
+  mismatch_direction: string | null;
+  mismatch_reason?: string | null;
+  term_eligible: boolean;
+  margin_note: string | null;
+  // margin
+  margin: ProfileMarginFacet | null;
+  margin_cents_gal: number | null;
+  margin_pctile?: number | null;
+  // opportunity
+  winnable_gal_per_yr: number;
+  opportunity: ProfileOpportunity;
+  // commitment
+  commitment_label: string | null;
+  commitment_available: boolean;
+  // synthesis (the prescriptive spine)
+  action: ProfileAction;
+  action_label: string;
+  headline: string;
+  summary: string | null;
+  // drill-down (added on the single-customer route)
+  product_mix?: ProfileProductMix[];
+}
+/** Slim row for the sortable/filterable customer list. */
+export interface ProfileCustomerListRow {
+  customer_id: string;
+  name: string;
+  n_lifts: number;
+  span_days: number;
+  total_net_gallons: number;
+  primary_terminal: string | null;
+  top_product: string | null;
+  data_sufficient: boolean;
+  stale: boolean;
+  last_lift: string | null;
+  confidence_tier: "High" | "Medium" | "Low" | null;
+  confidence_provisional: boolean;
+  confidence_flag: string | null;
+  quadrant: string;
+  quadrant_label: string;
+  planning_note: string;
+  cadence_consistency: number | null;
+  size_consistency: number | null;
+  behavior_label: string | null;
+  weather_sensitive: boolean;
+  recommended_channel: "RACK" | "SPOT" | null;
+  channel_label: string;
+  current_channel_label: string;
+  mismatch: boolean;
+  mismatch_strength: string;
+  mismatch_direction: string | null;
+  current_channel_known?: boolean;
+  margin_note: string | null;
+  margin_cents_gal: number | null;
+  margin_pctile?: number | null;
+  margin_dollars: number | null;
+  rank_by_margin: number | null;
+  winnable_gal_per_yr: number;
+  winnable_dollars_per_yr?: number | null;
+  commitment_label: string | null;
+  opportunity_kind: string;
+  action: ProfileAction;
+  action_label: string;
+  headline: string;
+}
+export interface ProfileSource {
+  key: string;
+  label: string;
+  connected: boolean;
+  count: number;
+  unit: string;
+  through?: string | null;
+  match_rate?: number | null;
+  match_label?: string;
+  unlocks: string;
+  cost_when_dark?: string;
+  upload_route?: string;
+  upload_action?: string;
+  primary?: boolean;
+}
+export interface ProfileFreshness {
+  last_upload_at: string | null;
+  note: string;
+}
+export interface ProfileTile {
+  key: string;
+  label: string;
+  value: number;
+  unit: string;
+  sub: string;
+  route: string;
+  tone: "neutral" | "amber" | "emerald" | "rose";
+  format?: string;
+  available?: boolean;
+}
+export interface ProfileDoorway {
+  key: string;
+  question: string;
+  answer: string;
+  route: string;
+}
+export interface ProfileHome {
+  company: string;
+  data_through: string | null;
+  available: boolean;
+  tiles: ProfileTile[];
+  margin_available: boolean;
+  sources: ProfileSource[];
+  n_connected: number;
+  n_total: number;
+  freshness: ProfileFreshness;
+  doorways: ProfileDoorway[];
+}
+export interface ProfileCustomersResponse {
+  available: boolean;
+  as_of: string | null;
+  n_customers: number;
+  margin_available: boolean;
+  deals_available: boolean;
+  customers: ProfileCustomerListRow[];
+}
+export interface ProfileCustomerResponse {
+  available: boolean;
+  as_of: string | null;
+  margin_available: boolean;
+  customer: ProfileCustomer;
+}
+export interface ProfileTerminalRow {
+  terminal: string;
+  total_net_gallons: number;
+  lifts: number;
+  customers: number;
+  committed_gallons: number;
+  spot_gallons: number;
+  winnable_gal_per_yr?: number;
+  at_risk_gal_per_yr?: number;
+  has_deals: boolean;
+}
+export interface ProfileTerminalsResponse {
+  available: boolean;
+  as_of?: string | null;
+  inventory_connected: boolean;
+  deals_available: boolean;
+  margin_available: boolean;
+  terminals: ProfileTerminalRow[];
+}

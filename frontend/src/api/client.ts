@@ -48,6 +48,12 @@ import type {
   VarCustomer,
   WeatherReadout,
   HddStores,
+  ProfileHome,
+  ProfileCustomersResponse,
+  ProfileCustomerResponse,
+  ProfileTerminalsResponse,
+  MarginCustomerRow,
+  MarginGap,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -318,8 +324,20 @@ export const api = {
     },
   },
 
-  // ---- Re-uploadable price/cost source (Phase-2 margin layer) ----
+  // ---- Re-uploadable price/cost source + the Phase-2 margin layer (read) ----
   margin: {
+    customers: (opts: { terminal?: string | null; window?: string } = {}) => {
+      const qs = new URLSearchParams({ window: opts.window ?? "all" });
+      if (opts.terminal) qs.set("terminal", opts.terminal);
+      return getJSON<{ available: boolean; customers?: MarginCustomerRow[]; coverage?: Record<string, number> }>(
+        `/margin/customers?${qs.toString()}`);
+    },
+    gap: (opts: { terminal?: string | null; product?: string | null; quantity: number }) => {
+      const qs = new URLSearchParams({ quantity: String(opts.quantity) });
+      if (opts.terminal) qs.set("terminal", opts.terminal);
+      if (opts.product) qs.set("product", opts.product);
+      return getJSON<MarginGap>(`/margin/gap?${qs.toString()}`);
+    },
     async upload(file: File, kind?: string): Promise<Record<string, unknown>> {
       const fd = new FormData();
       fd.append("file", file);
@@ -329,6 +347,14 @@ export const api = {
       return (await res.json()) as Record<string, unknown>;
     },
     loadSamples: () => postJSON<Record<string, unknown>>("/margin/load-samples", {}),
+  },
+
+  // ---- The convergence layer (one view per real-world unit) ----
+  profile: {
+    home: () => getJSON<ProfileHome>("/profile/home"),
+    customers: () => getJSON<ProfileCustomersResponse>("/profile/customers"),
+    customer: (id: string) => getJSON<ProfileCustomerResponse>(`/profile/customer/${encodeURIComponent(id)}`),
+    terminals: () => getJSON<ProfileTerminalsResponse>("/profile/terminals"),
   },
 
   // ---- Working-day calendar (Phase 1) ----

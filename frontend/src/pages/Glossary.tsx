@@ -51,11 +51,11 @@ export default function Glossary() {
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="text-xl font-semibold text-slate-800">Spot / Rack — definitions & glossary</h1>
+        <h1 className="text-2xl font-semibold tracking-tight text-slate-900">What does this mean?</h1>
         <p className="mt-1 max-w-3xl text-sm text-slate-500">
-          Every metric, axis, cutoff, quadrant, confidence tier, β, weather adjustment, and channel —
-          in plain English. The same definitions appear as hover tooltips throughout the app. Anyone
-          should be able to read <i>why</i> a customer got their recommendation without seeing code.
+          Every term in RackIQ — steadiness, confidence, channel, margin, winnable volume, demand,
+          position — in plain English. The same definitions appear as hover tooltips throughout the
+          app, so anyone can read <i>why</i> a customer or terminal got its read without seeing code.
         </p>
       </div>
 
@@ -92,6 +92,24 @@ export default function Glossary() {
         title="Channel, confidence & mismatch"
         sub="The channel is set by the quadrant and confidence ONLY. Margin ranks the book but never moves a channel between rack and spot."
         keys={["channel", "confidence", "current_channel", "mismatch", "margin_note"]}
+      />
+
+      <Section
+        title="Margin & value"
+        sub="Margin ranks the desk by VALUE, not volume — what each account actually earns per gallon against real landed cost. It never changes how steady a customer is or which channel they belong on."
+        keys={["margin", "value_rank"]}
+      />
+
+      <Section
+        title="Opportunity — winnable & at-risk volume"
+        sub="Volume on the table, read straight off the channel mismatch. Win steady accounts off spot onto rack/term; de-risk erratic accounts off firm commitments onto spot."
+        keys={["winnable_volume", "at_risk_volume"]}
+      />
+
+      <Section
+        title="Terminals — demand, position & the cure"
+        sub="The terminal view assembles existing outputs: expected demand, how much is committed must-serve, your position, and what a barge to cover a gap would cost."
+        keys={["demand_band", "committed_vs_spot", "days_of_cover", "barge_cure"]}
       />
 
       <Section
