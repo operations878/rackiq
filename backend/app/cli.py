@@ -64,6 +64,45 @@ def serve_main() -> None:
     uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=False)
 
 
+def load_realbook_main() -> None:
+    """Load the real book (Account Reference Chart → raw BOLs → deal book) into the store.
+
+    Repeatable: drop updated files into the deals dir (incl. a later year's *bols*.csv) and re-run.
+    """
+    from datetime import datetime, timezone
+
+    from . import bookload
+    repo_root = Path(__file__).resolve().parent.parent
+    ap = argparse.ArgumentParser(prog="rackiq-load-realbook",
+                                 description="Load the Account Reference Chart, raw BOLs, and deal book.")
+    ap.add_argument("--dir", default=str(repo_root / "sample_data" / "deals"),
+                    help="Directory holding account_reference_chart.xlsx, *bols*.csv, and the deal workbooks.")
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=False)
+    try:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        report = bookload.load_real_book(con, args.dir, now)
+    finally:
+        con.close()
+    print(json.dumps(report, indent=2, default=str))
+
+
+def variability_main() -> None:
+    """Print the two-axis variability validation readout (the real-book gate)."""
+    from . import variability
+    ap = argparse.ArgumentParser(prog="rackiq-variability",
+                                 description="Two-axis variability validation readout on the loaded book.")
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=True)
+    try:
+        rep = variability.validation_readout(con)
+    finally:
+        con.close()
+    print(json.dumps(rep, indent=2, default=str))
+
+
 def export_playbook_main() -> None:
     """Generate docs/playbook.md from the archetype plays + regime cheat-sheets (Blueprint G)."""
     from . import playbook

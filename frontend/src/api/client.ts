@@ -41,6 +41,11 @@ import type {
   PricingRecommendationsResponse,
   CalendarResponse,
   HedgingResponse,
+  DealsSummary,
+  DealBridge,
+  VariabilityResponse,
+  VariabilityValidation,
+  VarCustomer,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -271,6 +276,30 @@ export const api = {
     config: () =>
       getJSON<{ config: Record<string, number | string | boolean | Record<string, number>>; windows: string[] }>(
         "/pricing/config"),
+  },
+
+  // ---- Deal book + crosswalk bridge (commitment annotation) ----
+  deals: {
+    summary: () => getJSON<DealsSummary>("/deals/summary"),
+    bridge: () => getJSON<DealBridge>("/deals/bridge"),
+    confirmBridge: (pairs: [string, string][]) =>
+      postJSON<{ confirmed: number; deal_rows_resolved: number }>("/deals/bridge/confirm", { pairs }),
+    loadSamples: () => postJSON<Record<string, unknown>>("/deals/load-samples", {}),
+    async upload(file: File, source?: string): Promise<Record<string, unknown>> {
+      const fd = new FormData();
+      fd.append("file", file);
+      if (source) fd.append("source", source);
+      const res = await fetch(`${BASE}/deals/upload`, { method: "POST", body: fd });
+      if (!res.ok) throw new Error(await readError(res, "/deals/upload"));
+      return (await res.json()) as Record<string, unknown>;
+    },
+  },
+
+  // ---- Two-axis variability score (cadence consistency × size consistency) ----
+  variability: {
+    get: () => getJSON<VariabilityResponse>("/variability"),
+    validation: () => getJSON<VariabilityValidation>("/variability/validation"),
+    customer: (id: string) => getJSON<VarCustomer>(`/variability/customer/${encodeURIComponent(id)}`),
   },
 
   // ---- Working-day calendar (Phase 1) ----

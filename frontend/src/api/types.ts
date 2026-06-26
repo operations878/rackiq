@@ -1630,3 +1630,95 @@ export interface HedgingResponse {
   watch_list: HedgingRiskRow[];
   customers: HedgingCustomer[];
 }
+
+// ---- Deal book + crosswalk bridge + two-axis variability (Phase 1) ----
+export interface DealBridgeEntry {
+  customer_raw: string;
+  master?: string;
+  candidate_master?: string | null;
+  similarity?: number;
+  committed_gallons: number;
+  realized_gallons: number;
+  deal_rows: number;
+}
+export interface DealBridge {
+  n_deal_customers: number;
+  n_mapped: number;
+  n_candidates: number;
+  n_unmapped: number;
+  match_rate_by_committed_volume: number;
+  match_rate_by_count: number;
+  mapped: DealBridgeEntry[];
+  candidates: DealBridgeEntry[];
+  unmapped: DealBridgeEntry[];
+  threshold: number;
+}
+export interface DealsSummary {
+  sources: Array<Record<string, string | number | null>>;
+  total_rows: number;
+  masters_resolved: number;
+}
+export interface VarCommitment {
+  available: boolean;
+  label: string;
+  term_backed_share?: number | null;
+  has_term?: boolean;
+  has_forward?: boolean;
+  has_spot?: boolean;
+  requirements?: boolean;
+}
+export interface VarCustomer {
+  customer_id: string;
+  name: string;
+  n_lifts: number;
+  n_active_days: number;
+  total_net_gallons: number;
+  data_sufficient: boolean;
+  dominant_product: string | null;
+  cadence_consistency: number | null;
+  cadence_grade: string | null;
+  size_consistency: number | null;
+  size_grade: string | null;
+  overall_stability: number | null;
+  quadrant: string;
+  quadrant_label: string;
+  planning_note: string;
+  weather_sensitive?: boolean;
+  intermittent?: boolean;
+  cadence_inputs?: Record<string, number | string | null>;
+  size_inputs?: Record<string, number | null>;
+  commitment: VarCommitment;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [k: string]: any;
+}
+export interface VariabilityResponse {
+  available: boolean;
+  as_of?: string;
+  window?: string;
+  n_customers: number;
+  customers: VarCustomer[];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  distribution: any;
+  coverage: Record<string, number>;
+}
+export interface VariabilityValidation {
+  available: boolean;
+  as_of?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  axis1_cadence: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  axis2_size: any;
+  axis1_hist: Record<string, number>;
+  axis2_hist: Record<string, number>;
+  quadrants: Record<string, number>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  gut_check: any[];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  split_proof: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  annotation_sanity: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  conformance_anomalies: any[];
+  coverage: Record<string, number>;
+  bridge: DealBridge;
+}
