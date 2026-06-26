@@ -148,6 +148,50 @@ def variability_main() -> None:
     print(json.dumps(rep, indent=2, default=str))
 
 
+def load_hdd_main() -> None:
+    """Load an HDD workbook (the 'HDD'S' sheet) into the re-uploadable weather store. Idempotent."""
+    from datetime import datetime, timezone
+
+    from . import weather_hdd
+    repo_root = Path(__file__).resolve().parent.parent
+    ap = argparse.ArgumentParser(prog="rackiq-load-hdd",
+                                 description="Load the Heating Degree Day book (station × day → HDD).")
+    ap.add_argument("file", nargs="?", default=None, help="Path to the HDD workbook (.xlsx).")
+    ap.add_argument("--dir", default=str(repo_root / "sample_data" / "deals"),
+                    help="If no file is given, scan this dir for an HDD/demand-forecaster workbook.")
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=False)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        paths = [args.file] if args.file else [
+            str(p) for p in sorted(Path(args.dir).glob("*"))
+            if p.suffix.lower() in (".xlsx", ".xlsm")
+            and any(k in p.name.lower() for k in ("hdd", "demand_scenario", "forecaster"))]
+        reports = [weather_hdd.load_hdd_file(con, p, now) for p in paths]
+        if any(r["observations_written"] for r in reports):
+            db.set_meta(con, "last_hdd_import_at", now)
+        out = {"loaded": reports, "stores": weather_hdd.store_counts(con)}
+    finally:
+        con.close()
+    print(json.dumps(out, indent=2, default=str))
+
+
+def weather_main() -> None:
+    """Print the Stage-1 weather readout: station coverage, HDD→demand β/OOS, anchor, axis adjustment."""
+    from . import weather_model
+    ap = argparse.ArgumentParser(prog="rackiq-weather",
+                                 description="HDD→demand model + the raw-vs-weather-adjusted size axis.")
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=False)
+    try:
+        rep = weather_model.readout(con)
+    finally:
+        con.close()
+    print(json.dumps(rep, indent=2, default=str))
+
+
 def export_playbook_main() -> None:
     """Generate docs/playbook.md from the archetype plays + regime cheat-sheets (Blueprint G)."""
     from . import playbook

@@ -46,6 +46,8 @@ import type {
   VariabilityResponse,
   VariabilityValidation,
   VarCustomer,
+  WeatherReadout,
+  HddStores,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -300,6 +302,33 @@ export const api = {
     get: () => getJSON<VariabilityResponse>("/variability"),
     validation: () => getJSON<VariabilityValidation>("/variability/validation"),
     customer: (id: string) => getJSON<VarCustomer>(`/variability/customer/${encodeURIComponent(id)}`),
+  },
+
+  // ---- Weather / HDD (Stage 0 source + Stage 1 model) ----
+  weather: {
+    get: () => getJSON<WeatherReadout>("/weather"),
+    hddSummary: () => getJSON<{ stores: HddStores }>("/weather/hdd/summary"),
+    hddLoadSamples: () => postJSON<Record<string, unknown>>("/weather/hdd/load-samples", {}),
+    async hddUpload(file: File): Promise<Record<string, unknown>> {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(`${BASE}/weather/hdd/upload`, { method: "POST", body: fd });
+      if (!res.ok) throw new Error(await readError(res, "/weather/hdd/upload"));
+      return (await res.json()) as Record<string, unknown>;
+    },
+  },
+
+  // ---- Re-uploadable price/cost source (Phase-2 margin layer) ----
+  margin: {
+    async upload(file: File, kind?: string): Promise<Record<string, unknown>> {
+      const fd = new FormData();
+      fd.append("file", file);
+      if (kind) fd.append("kind", kind);
+      const res = await fetch(`${BASE}/margin/upload`, { method: "POST", body: fd });
+      if (!res.ok) throw new Error(await readError(res, "/margin/upload"));
+      return (await res.json()) as Record<string, unknown>;
+    },
+    loadSamples: () => postJSON<Record<string, unknown>>("/margin/load-samples", {}),
   },
 
   // ---- Working-day calendar (Phase 1) ----

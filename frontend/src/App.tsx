@@ -19,6 +19,7 @@ import BookOverview from "./pages/BookOverview";
 import Radar from "./pages/Radar";
 import Scorecards from "./pages/Scorecards";
 import Playbook from "./pages/Playbook";
+import Glossary from "./pages/Glossary";
 
 function Centered({ children }: { children: ReactNode }) {
   return (
@@ -113,7 +114,8 @@ export default function App() {
       title: "Analyze",
       items: [
         { key: "overview", label: "Book Overview", icon: "☰", match: (b) => b === "overview" },
-        { key: "variability", label: "Variability (2-axis)", icon: "⇎", match: (b) => b === "variability" },
+        { key: "variability", label: "Spot vs Rack", icon: "⇎", match: (b) => b === "variability" },
+        { key: "glossary", label: "Spot/Rack Glossary", icon: "❔", match: (b) => b === "glossary" },
         { key: "radar", label: "Early-Warning Radar", icon: "◔", match: (b) => b === "radar" },
         { key: "scores", label: "Scores & Quadrant", icon: "✦", match: (b) => b === "scores" },
         { key: "reconciliation", label: "Reconciliation", icon: "⚖", match: (b) => b === "reconciliation" },
@@ -180,6 +182,7 @@ export default function App() {
           {base === "playbook" && <Playbook summary={summary} />}
           {base === "overview" && <BookOverview summary={summary} navigate={navigate} />}
           {base === "variability" && <Variability summary={summary} navigate={navigate} />}
+          {base === "glossary" && <Glossary />}
           {base === "radar" && <Radar summary={summary} />}
           {base === "scores" && <Scores summary={summary} />}
           {base === "reconciliation" && <Reconciliation summary={summary} navigate={navigate} />}

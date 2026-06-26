@@ -1667,29 +1667,95 @@ export interface VarCommitment {
   has_spot?: boolean;
   requirements?: boolean;
 }
+export interface VarConfidence {
+  tier: "High" | "Medium" | "Low";
+  n_lifts: number;
+  span_days: number;
+  provisional: boolean;
+  reason: string;
+  flag: string | null;
+}
+export interface VarChannel {
+  recommended_channel: "RACK" | "SPOT" | null;
+  channel_label: string;
+  term_eligible: boolean;
+  channel_note: string | null;
+  quadrant: string;
+  quadrant_label: string;
+  confidence: string;
+  provisional: boolean;
+  confidence_reason: string;
+  confidence_flag: string | null;
+  rationale: string;
+  current_channel: string;
+  current_channel_label: string;
+  current_channel_known: boolean;
+  mismatch: boolean;
+  mismatch_strength: "strong" | "soft" | "none";
+  mismatch_direction: string | null;
+  mismatch_reason: string | null;
+  margin_rank?: number | null;
+  margin_cents_gal?: number | null;
+  margin_note: string | null;
+}
 export interface VarCustomer {
   customer_id: string;
   name: string;
   n_lifts: number;
   n_active_days: number;
+  span_days?: number;
   total_net_gallons: number;
   data_sufficient: boolean;
   dominant_product: string | null;
   cadence_consistency: number | null;
   cadence_grade: string | null;
   size_consistency: number | null;
+  size_consistency_raw?: number | null;
   size_grade: string | null;
   overall_stability: number | null;
   quadrant: string;
   quadrant_label: string;
   planning_note: string;
+  regular_timing?: boolean | null;
+  consistent_size?: boolean | null;
   weather_sensitive?: boolean;
+  size_weather_adjusted?: boolean;
+  weather_beta?: number | null;
+  weather_beta_source?: string | null;
+  weather_note?: string | null;
   intermittent?: boolean;
   cadence_inputs?: Record<string, number | string | null>;
   size_inputs?: Record<string, number | null>;
   commitment: VarCommitment;
+  confidence?: VarConfidence;
+  channel?: VarChannel;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   [k: string]: any;
+}
+export interface ChannelSummary {
+  recommended: Record<string, number>;
+  by_confidence: Record<string, number>;
+  n_provisional: number;
+}
+export interface MismatchEntry {
+  name: string;
+  customer_id: string;
+  n_lifts: number;
+  quadrant: string;
+  recommended: string | null;
+  channel_label: string;
+  current: string;
+  strength: string;
+  reason: string | null;
+  confidence: string;
+  provisional: boolean;
+  volume: number | null;
+  margin_note: string | null;
+}
+export interface MismatchReport {
+  n_mismatches: number;
+  stuck_on_spot_should_be_rack: MismatchEntry[];
+  committed_should_be_spot: MismatchEntry[];
 }
 export interface VariabilityResponse {
   available: boolean;
@@ -1700,6 +1766,10 @@ export interface VariabilityResponse {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   distribution: any;
   coverage: Record<string, number>;
+  channel_summary?: ChannelSummary;
+  mismatches?: MismatchReport;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  weather?: any;
 }
 export interface VariabilityValidation {
   available: boolean;
@@ -1712,13 +1782,35 @@ export interface VariabilityValidation {
   axis2_hist: Record<string, number>;
   quadrants: Record<string, number>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  quadrant_spread?: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  four_quadrant_walk?: any[];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   gut_check: any[];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  split_proof: any;
+  confidence?: any;
+  channel_summary?: ChannelSummary;
+  mismatches?: MismatchReport;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  margin_audit?: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  weather?: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  split_proof?: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   annotation_sanity: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   conformance_anomalies: any[];
   coverage: Record<string, number>;
   bridge: DealBridge;
+}
+// ---- weather model (Stage 1) ----
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type WeatherReadout = any;
+export interface HddStores {
+  hdd_observations: number;
+  stations: string[];
+  day_min: string | null;
+  day_max: string | null;
+  anchor_months: number;
 }
