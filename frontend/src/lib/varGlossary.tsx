@@ -117,6 +117,63 @@ export const DEFS: Record<string, Def> = {
     how: "E.g. a rack-recommended account that earns thin margin, or a spot account that earns fat margin ('earns more on spot today'). Margin RANKS the book; it never sets the channel.",
     meaning: "A prompt for a human call, not an automatic action. Channel stays set by variability + confidence.",
   },
+  margin: {
+    term: "Margin (¢/gal)",
+    short: "What you actually earn per gallon — sell minus landed cost — and where it ranks in the book.",
+    what: "Realized margin per gallon, valued against actual landed cost (the barge cost), not a list price.",
+    how: "Per BOL lift: sell price (deal → grid → invoice) minus landed cost (barge trips running cost → invoice). Rolled up per customer as ¢/gal and total $. Shown two ways: BOOK (vs your inventory cost basis) and replacement (vs the latest barge).",
+    meaning: "Ranks the desk by VALUE, not volume — a high-volume thin-margin account and a low-volume fat-margin one are both visible. It NEVER changes how steady a customer is or which channel they belong on.",
+  },
+  value_rank: {
+    term: "Value rank",
+    short: "Where a customer sits when you rank the book by margin dollars instead of gallons.",
+    what: "The customer's rank by total margin $ earned, contrasted with their rank by volume.",
+    how: "Rank every account by book margin $ (1 = most valuable). 'Ranks higher on margin than volume' is the fat-margin tell; the reverse is a high-volume, thin account.",
+    meaning: "Tells you who's actually worth the most — not just who lifts the most gallons.",
+  },
+  winnable_volume: {
+    term: "Winnable volume",
+    short: "Steady volume currently bought on spot that you could lock onto a rack/term deal.",
+    what: "Volume on the table — a plannable account buying spot when it belongs on rack/term.",
+    how: "Taken straight from the channel mismatch: a metronome / predictable account whose current channel is spot. The figure is that customer's annualized lift volume. Accounts gone quiet (stale) are excluded so you don't chase dead volume.",
+    threshold: "Excludes accounts with no lift in ~90 days.",
+    meaning: "Your 'sell more / commit it' worklist — capture the volume on a deal before a competitor does.",
+  },
+  at_risk_volume: {
+    term: "At-risk committed volume",
+    short: "Committed volume riding on an account too erratic to plan — exposure if they don't lift.",
+    what: "The risk side of a channel mismatch: an unpredictable account that's term-committed.",
+    how: "An account in the unpredictable quadrant whose current channel is a term/forward contract. Their annualized volume is the exposure.",
+    meaning: "Move it to spot to cut volume risk — you're committed to product an erratic buyer may not take.",
+  },
+  days_of_cover: {
+    term: "Days of cover",
+    short: "How many days the tank holds at the expected burn rate before it hits the heel.",
+    what: "Inventory above the minimum heel divided by near-term expected daily demand.",
+    how: "Latest book inventory − min heel, divided by the forecast P50 daily demand. Needs inventory loaded; without it, the view shows a target carry instead and says so.",
+    meaning: "Low days of cover at a terminal = you're tight and may need to nominate a barge soon.",
+  },
+  demand_band: {
+    term: "Expected demand band (P10 / P50 / P90)",
+    short: "The range of likely demand over the next few working days — floor, middle, and high case.",
+    what: "A terminal's near-term expected demand as a range, not a single number.",
+    how: "Each customer's forecast is summed to the terminal P50; the P10–P90 band comes from historical forecast error, widened for erratic accounts and for correlated cold-weather demand.",
+    meaning: "Stage to the middle (P50) and carry a buffer toward P90 for the accounts that drive the surprise.",
+  },
+  committed_vs_spot: {
+    term: "Committed vs spot",
+    short: "How much of a terminal's demand is locked on contracts vs bought opportunistically.",
+    what: "The split of expected/served volume between committed (term + forward) and spot.",
+    how: "Summed from the deal book per terminal: term + forward committed gallons vs realized spot gallons.",
+    meaning: "Committed volume is must-serve; if you're tight, that's the volume (and margin) at risk first.",
+  },
+  barge_cure: {
+    term: "Barge-nomination cost (the cure)",
+    short: "What it costs per gallon to bring in a barge to cover a shortfall.",
+    what: "The landed cost of nominating product to cover a demand gap at a terminal.",
+    how: "Read from the barge Trips landed cost for that terminal × product. The margin-priced gap splits the volume into must-serve (committed) margin vs spot upside.",
+    meaning: "If a terminal is tight, this is the price of the fix — weighed against the committed margin you'd protect.",
+  },
 };
 
 /** Inline tooltip that pulls its text from the shared glossary by key. */

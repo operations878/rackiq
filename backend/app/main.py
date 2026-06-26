@@ -14,6 +14,7 @@ from .api.hedging import router as hedging_router
 from .api.margin import router as margin_router
 from .api.position import router as position_router
 from .api.pricing import router as pricing_router
+from .api.profile import router as profile_router
 from .api.reconciliation import router as reconciliation_router
 from .api.routes import router
 from .api.scores import router as scores_router
@@ -45,6 +46,7 @@ def create_app() -> FastAPI:
     app.include_router(variability_router)
     app.include_router(margin_router)
     app.include_router(weather_router)
+    app.include_router(profile_router)
     app.include_router(position_router)
 
     @app.get("/")
