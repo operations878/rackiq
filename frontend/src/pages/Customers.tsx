@@ -127,12 +127,11 @@ export default function Customers({ navigate, initialFilter }: {
         <span className="ml-auto text-xs text-slate-400">{rows.length} shown</span>
       </Card>
 
-      {(!marginOn || !dealsOn) && (
-        <div className="mb-3 text-xs text-slate-400">
-          {!dealsOn && <>Channel & winnable columns need the <b>deal book</b>. </>}
-          {!marginOn && <>Margin column needs the <b>price &amp; cost grid</b>.</>}
-        </div>
-      )}
+      <div className="mb-3 text-xs text-slate-400">
+        Winnable is a <span className="font-medium text-violet-600">modeled</span> estimate (peak ≈ wallet).
+        {!dealsOn && <> The <b>channel</b> column shows the recommended channel; comparing it to the current one needs the <b>deal book</b>.</>}
+        {!marginOn && <> Margin is estimated from lift prices until the <b>price &amp; cost grid</b> is loaded.</>}
+      </div>
 
       {/* table */}
       <Card className="overflow-hidden">
@@ -160,7 +159,7 @@ export default function Customers({ navigate, initialFilter }: {
                       <span className="font-medium text-slate-800">{c.name}</span>
                       <ActionChip action={c.action} small />
                     </div>
-                    <div className="text-[11px] text-slate-400">
+                    <div className="tnum text-[11px] text-slate-400">
                       {c.primary_terminal ?? "—"}{c.top_product ? ` · ${c.top_product}` : ""} · {c.n_lifts.toLocaleString()} lifts
                     </div>
                   </td>
@@ -181,9 +180,9 @@ export default function Customers({ navigate, initialFilter }: {
                   <td className="px-3 py-2.5">
                     {marginOn && c.margin_cents_gal != null ? (
                       <div>
-                        <div className="font-medium text-slate-800">{cents(c.margin_cents_gal)}</div>
+                        <div className="tnum font-medium text-slate-800">{cents(c.margin_cents_gal)}</div>
                         {c.margin_dollars != null && (
-                          <div className="text-[11px] text-slate-400">
+                          <div className="tnum text-[11px] text-slate-400">
                             {money(c.margin_dollars)}{c.rank_by_margin ? ` · #${c.rank_by_margin}` : ""}
                           </div>
                         )}
@@ -201,18 +200,21 @@ export default function Customers({ navigate, initialFilter }: {
                       <ChannelChip rec={c.recommended_channel} label={c.channel_label} small />
                     )}
                   </td>
-                  {/* winnable */}
+                  {/* winnable (modeled) */}
                   <td className="px-3 py-2.5">
                     {(c.winnable_gal_per_yr || 0) > 0 ? (
                       <div>
-                        <span className="font-medium text-emerald-700">{gal(c.winnable_gal_per_yr)}<span className="text-[10px] text-slate-400">/yr</span></span>
-                        {c.winnable_dollars_per_yr ? <div className="text-[11px] text-slate-400">≈ {money(c.winnable_dollars_per_yr)}/yr</div> : null}
+                        <span className="tnum font-medium text-emerald-700">{gal(c.winnable_gal_per_yr)}<span className="text-[10px] text-slate-400">/yr</span></span>
+                        {c.winnable_dollars_per_yr ? <div className="tnum text-[11px] text-slate-400">≈ {money(c.winnable_dollars_per_yr)}/yr</div> : null}
+                        {c.winnability != null && <div className="tnum text-[10px] text-slate-400">winnability {Math.round(c.winnability)}</div>}
                       </div>
+                    ) : c.opportunity_kind === "shrunk" ? (
+                      <span className="text-[11px] text-slate-400">looks shrunk</span>
                     ) : <span className="text-xs text-slate-300">—</span>}
                   </td>
                   {/* volume */}
                   <td className="px-3 py-2.5 text-right">
-                    <span className="font-medium text-slate-700">{gal(c.total_net_gallons)}</span>
+                    <span className="tnum font-medium text-slate-700">{gal(c.total_net_gallons)}</span>
                   </td>
                 </tr>
               ))}

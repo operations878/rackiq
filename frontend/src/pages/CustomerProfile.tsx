@@ -3,8 +3,8 @@
  * one-breath verdict (the spine), then facet tiles that REFERENCE EACH OTHER (channel → margin →
  * winnable $), each with a because-clause and expand-to-inputs, then scrollable drill-down depth
  * (the existing VAR lane / behavior / forecast charts, the plotted 2×2, product mix, peak-vs-actual).
- * Every number traces to its engine; every caveat (estimated-vs-contract, interim) is on screen.
- * No new math — synthesis, connection and legibility over the existing outputs.
+ * The opportunity tile reads the REAL Phase-6 modeled engine (peak ≈ wallet, labelled MODELED).
+ * Every number traces to its engine; every caveat (estimated-vs-contract, modeled) is on screen.
  */
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
@@ -12,7 +12,8 @@ import type { ProfileCustomer, CustomerScoreResponse, BehaviorStats } from "../a
 import { fmtDate } from "../lib/format";
 import {
   PageHeader, Card, FacetTile, FacetValue, ConfidencePill, ChannelChip, MismatchFlag, QuadrantChip,
-  ActionChip, actionTone, Because, Inputs, InputRow, Meter, cents, gal, money, num, type Tone,
+  ActionChip, actionTone, Because, Inputs, InputRow, Meter, Verdict, ProvenanceTag, Caveat,
+  SectionHeading, SoWhat, cents, gal, money, num, type Tone,
 } from "../lib/ui";
 import { DefTip } from "../lib/varGlossary";
 import { opportunitySignal } from "../lib/adapters";
@@ -21,11 +22,6 @@ import BaseRangeChart from "../components/scores/BaseRangeChart";
 import ForwardProjection from "../components/scores/ForwardProjection";
 import BehaviorProfile from "../components/scores/BehaviorProfile";
 import LaneBreaks from "../components/scores/LaneBreaks";
-
-const SPINE_TONE: Record<string, Tone> = {
-  CALL: "emerald", PROTECT: "indigo", FIX_PRICING: "amber", WATCH: "amber",
-  DE_RISK: "rose", LEAVE: "slate", REVIEW: "slate",
-};
 
 export default function CustomerProfile({ id, navigate }: { id: string; navigate: (to: string) => void }) {
   const [c, setC] = useState<ProfileCustomer | null>(null);
@@ -43,17 +39,13 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
   }, [id]);
 
   if (error) return <div className="text-sm text-rose-600">Could not load customer: {error}</div>;
-  if (!c) return <div className="text-sm text-slate-400">Loading customer…</div>;
+  if (!c) return <LoadingDossier />;
 
   const opp = opportunitySignal(c);
   const sc = score?.customer;
   const ci = c.cadence_inputs ?? {};
   const si = c.size_inputs ?? {};
-  const tone = SPINE_TONE[c.action] ?? "indigo";
-
-  // closed-loop dollar phrase for the channel tile
-  const winGal = c.opportunity.winnable_gal_per_yr || 0;
-  const winDol = c.opportunity.winnable_dollars_per_yr;
+  const tone = actionTone(c.action);
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
@@ -64,22 +56,18 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
         subtitle={
           <span className="flex flex-wrap gap-x-4 gap-y-1">
             <span>{c.n_lifts.toLocaleString()} lifts over {Math.round((c.span_days ?? 0) / 30)} months</span>
-            <span>·</span><span>{c.primary_terminal ?? "—"}</span>
-            <span>·</span><span>{c.top_product ?? "—"}</span>
-            <span>·</span><span>{gal(c.total_net_gallons)} all-time</span>
-            {c.last_lift && <><span>·</span><span>last lift {fmtDate(c.last_lift)}</span></>}
+            <span className="text-slate-300">·</span><span>{c.primary_terminal ?? "—"}</span>
+            <span className="text-slate-300">·</span><span>{c.top_product ?? "—"}</span>
+            <span className="text-slate-300">·</span><span>{gal(c.total_net_gallons)} all-time</span>
+            {c.last_lift && <><span className="text-slate-300">·</span><span>last lift {fmtDate(c.last_lift)}</span></>}
           </span>
         }
       />
 
       {/* THE SPINE — the prescriptive one-breath verdict, the first thing read */}
-      <div className={`rounded-2xl border-l-4 px-6 py-5 ${spineBar(tone)}`}>
-        <div className="mb-2 flex items-center gap-2">
-          <ActionChip action={c.action} />
-          <span className="text-[11px] font-medium uppercase tracking-wide text-slate-400">the verdict</span>
-        </div>
-        <p className="text-[19px] font-medium leading-snug text-slate-800">{c.headline}</p>
-      </div>
+      <Verdict action={<ActionChip action={c.action} />} tone={tone}>
+        {c.headline}
+      </Verdict>
 
       {/* CONNECTED FACET TILES — each references the others, each says why */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
@@ -111,10 +99,14 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
 
         {/* MARGIN */}
         <FacetTile title="Margin" defKey="margin" accent="indigo"
-          available={marginOn && c.margin?.book_cents_gal != null}
+          available={c.margin?.book_cents_gal != null}
           unavailableNote={<span>Connect the <b>price &amp; cost grid</b> to value this account on contract terms.</span>}>
           {c.margin && (
             <div>
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-[10px]" />
+                <ProvenanceTag kind={marginOn ? "measured" : "estimated"} small />
+              </div>
               <FacetValue value={cents(c.margin.book_cents_gal)}
                 tone={(c.margin_pctile ?? 0) >= 0.75 ? "emerald" : (c.margin_pctile ?? 1) <= 0.34 ? "amber" : "neutral"}
                 caption={<>
@@ -146,37 +138,49 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
             <div className="text-xs text-slate-500">
               {c.current_channel_known
                 ? <>On <span className="font-medium text-slate-700">{c.current_channel_label}</span> today{c.mismatch ? " — mismatch." : " — a match."}</>
-                : <span className="text-slate-400">No deal book — can't compare to the current channel.</span>}
+                : <span className="text-slate-400">No deal book — comparing to the current channel needs it.</span>}
             </div>
             {/* the so-what: channel × margin × opportunity, on one line */}
-            {c.mismatch && c.mismatch_direction === "upgrade_to_rack" && winGal > 0 && (
-              <div className="rounded-lg bg-emerald-50 px-2.5 py-2 text-[11px] leading-snug text-emerald-800">
-                On spot but behaves like rack — {c.margin_cents_gal != null ? <>~{cents(c.margin_cents_gal)} margin on </> : ""}
-                <b>{gal(winGal)}/yr</b>{winDol ? <> (~{money(winDol)}/yr)</> : ""} you could lock onto rack/term.
-              </div>
+            {opp.kind === "win" && opp.gallons > 0 && (
+              <SoWhat tone="emerald">
+                {c.mismatch && c.mismatch_direction === "upgrade_to_rack" ? "On spot but behaves like rack — " : "Under-served — "}
+                {c.margin_cents_gal != null ? <>~{cents(c.margin_cents_gal)} margin on </> : ""}
+                <b>{gal(opp.gallons)}/yr</b>{opp.dollars ? <> (~{money(opp.dollars)}/yr)</> : ""} of modeled upside to win{opp.chaseChannel ? <> via {opp.chaseChannel}</> : ""}.
+              </SoWhat>
             )}
             <Because>Set by steadiness + confidence only. Margin is a ranking note — it never moves the channel.</Because>
             <Inputs label="the 2×2">
-              <Quadrant2x2 cadence={c.cadence_consistency} size={c.size_consistency} />
+              <Quadrant2x2 cadence={c.cadence_consistency} size={c.size_consistency} label={c.name.split(" ")[0]} />
             </Inputs>
           </div>
         </FacetTile>
 
-        {/* MISSING / WINNABLE VOLUME (INTERIM — Phase 6) */}
-        <FacetTile title="Missing volume" defKey={c.opportunity.kind === "risk" ? "at_risk_volume" : "winnable_volume"}
-          accent={c.opportunity.kind === "win" ? "emerald" : c.opportunity.kind === "risk" ? "rose" : "slate"}
-          available={opp.available} unavailableNote={<span>{c.opportunity.reason ?? "No comparison available."}</span>}>
-          {opp.kind === "win" || opp.kind === "win_stale" ? (
-            <FacetValue value={<>{gal(opp.gallons)}<span className="text-sm font-normal text-slate-400">/yr</span></>} tone="emerald"
-              caption={<>{opp.dollars ? <><b>≈ {money(opp.dollars)}/yr</b> at current margin · </> : ""}chase via {opp.chaseChannel}.</>} />
-          ) : opp.kind === "risk" ? (
-            <FacetValue value={<>{gal(opp.gallons)}<span className="text-sm font-normal text-slate-400">/yr</span></>} tone="rose"
-              caption={<>{opp.dollars ? <><b>≈ {money(opp.dollars)}/yr</b> committed · </> : ""}move to spot to de-risk.</>} />
-          ) : (
-            <FacetValue value="None to chase" tone="slate" caption={opp.note} />
-          )}
-          <Because>{opp.note}</Because>
-          <p className="mt-1.5 rounded bg-slate-50 px-2 py-1 text-[10px] text-slate-400">{opp.caveat}</p>
+        {/* MISSING / WINNABLE VOLUME (REAL — Phase-6 modeled) */}
+        <FacetTile title="Missing volume"
+          defKey={opp.kind === "win" ? "winnable_volume" : "quadrant"}
+          accent={opp.kind === "win" ? "emerald" : opp.kind === "shrunk" ? "amber" : "slate"}
+          available={opp.available}
+          unavailableNote={<span>{opp.note ?? "Not enough history yet to model a demand gap."}</span>}>
+          <div>
+            <div className="mb-1 flex justify-end"><ProvenanceTag kind="modeled" small /></div>
+            {opp.kind === "win" ? (
+              <FacetValue value={<>{gal(opp.gallons)}<span className="text-sm font-normal text-slate-400">/yr</span></>} tone="emerald"
+                caption={<>{opp.dollars ? <><b>≈ {money(opp.dollars)}/yr</b> at current margin · </> : ""}winnability {Math.round(opp.winnability ?? 0)}/100 · chase via {opp.chaseChannel}.</>} />
+            ) : opp.kind === "shrunk" ? (
+              <FacetValue value="Looks shrunk" tone="amber"
+                caption={<>~{gal(opp.gapGallons)}/yr gap on paper, but buying less year-over-year and the big days are old — <b>not winnable</b>.</>} />
+            ) : (
+              <FacetValue value="Near peak" tone="slate"
+                caption="Already lifts near their weather-adjusted peak — little modeled upside to chase." />
+            )}
+            <Because>{opp.note}</Because>
+            <Inputs>
+              <InputRow k="Modeled annual gap" v={`${gal(opp.gapGallons)}/yr`} hint="Top-decile active-day peak (weather-adjusted) vs the normal active-day rate, annualized." />
+              <InputRow k="Winnable slice" v={`${gal(opp.gallons)}/yr`} hint="The share of the gap judged winnable (under-served, not shrunk)." />
+              <InputRow k="Winnability" v={opp.winnability != null ? `${Math.round(opp.winnability)}/100` : "—"} hint="Trend freshness × peak freshness. Low = the wallet shrank, not winnable." />
+            </Inputs>
+            <Caveat tone="indigo">{opp.caveat}</Caveat>
+          </div>
         </FacetTile>
 
         {/* WEATHER (heating fuels only) */}
@@ -198,12 +202,9 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
       </div>
 
       {/* ───── DRILL-DOWN DOSSIER ───── */}
-      <SectionTitle>Steadiness — how they buy</SectionTitle>
+      <SectionHeading note="base ±1σ usual · ±2σ wider · dots = lifts · dotted = forecast">Steadiness — how they buy</SectionHeading>
       <Card className="p-5">
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <h3 className="text-sm font-medium text-slate-700">Normal lane &amp; forecast</h3>
-          <span className="text-[11px] text-slate-400">base ±1σ usual · ±2σ wider · dots = lifts · dotted = forecast</span>
-        </div>
+        <h3 className="mb-2 text-sm font-medium text-slate-700">Normal lane &amp; forecast</h3>
         {scoreLoading && !sc ? <ChartSkeleton /> :
           <BaseRangeChart series={sc?.lane_series ?? []} grain={sc?.grain ?? "weekly"}
             forecast={sc?.forecast_series} anchorDate={score?.forecast_anchor} />}
@@ -214,14 +215,14 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
           <Quadrant2x2 cadence={c.cadence_consistency} size={c.size_consistency} label={c.name.split(" ")[0]} />
         </Card>
         <Card className="p-5">{sc?.excursions ? <LaneBreaks excursions={sc.excursions} /> :
-          <div className="text-xs text-slate-400">Lane-break detail loads with the customer's history.</div>}</Card>
+          <div className="flex h-full items-center text-xs text-slate-400">Lane-break detail loads with the customer's history.</div>}</Card>
       </div>
       {sc?.behavior && <Card className="p-5"><BehaviorProfile behavior={sc.behavior} /></Card>}
 
       {/* MARGIN detail — product mix (volume only; per-product margin isn't computed, never implied) */}
       {(c.product_mix?.length ?? 0) > 0 && (
         <>
-          <SectionTitle>Margin — what they're worth</SectionTitle>
+          <SectionHeading>Margin — what they're worth</SectionHeading>
           <Card className="p-5">
             <h3 className="mb-3 text-sm font-medium text-slate-700">Volume by product</h3>
             <div className="space-y-2">
@@ -231,7 +232,7 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
                   <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
                     <div className="h-2 rounded-full bg-indigo-400" style={{ width: `${Math.round(p.share * 100)}%` }} />
                   </div>
-                  <span className="w-28 shrink-0 text-right text-xs text-slate-500">{gal(p.gallons)} · {Math.round(p.share * 100)}%</span>
+                  <span className="tnum w-28 shrink-0 text-right text-xs text-slate-500">{gal(p.gallons)} · {Math.round(p.share * 100)}%</span>
                 </div>
               ))}
             </div>
@@ -240,29 +241,30 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
         </>
       )}
 
-      {/* WHAT'S NEXT — forecast + the peak-vs-actual (interim peak≈wallet hint for Phase 6) */}
-      <SectionTitle>What's next</SectionTitle>
+      {/* WHAT'S NEXT — forecast + the modeled peak-vs-actual (the peak ≈ wallet premise made visible) */}
+      <SectionHeading>What's next</SectionHeading>
       <div className="grid gap-4 lg:grid-cols-2">
         <Card className="p-5">{scoreLoading && !sc ? <div className="text-xs text-slate-400">Loading forecast…</div> :
           <ForwardProjection forecast={sc?.forecast} />}</Card>
-        <Card className="p-5"><PeakVsActual stats={peakStats(sc)} /></Card>
+        <Card className="p-5"><PeakVsActual stats={peakStats(sc)} opp={opp} /></Card>
       </div>
 
-      <div className="pt-2 text-[11px] text-slate-400">Internal id {c.customer_id} · every number above traces to its engine; estimates are labelled.</div>
+      <div className="pt-2 text-[11px] text-slate-400">Internal id {c.customer_id} · every number above traces to its engine; estimates and modeled figures are labelled.</div>
     </div>
   );
 }
 
 // ---- helpers ---------------------------------------------------------------------
-function spineBar(tone: Tone): string {
-  return ({
-    emerald: "border-emerald-400 bg-emerald-50/50", indigo: "border-indigo-400 bg-indigo-50/50",
-    amber: "border-amber-400 bg-amber-50/50", rose: "border-rose-400 bg-rose-50/50",
-    slate: "border-slate-300 bg-slate-50", neutral: "border-slate-300 bg-slate-50",
-  } as Record<string, string>)[tone];
-}
-function SectionTitle({ children }: { children: React.ReactNode }) {
-  return <h2 className="pt-3 text-sm font-semibold text-slate-700">{children}</h2>;
+function LoadingDossier() {
+  return (
+    <div className="mx-auto max-w-5xl space-y-6">
+      <div className="h-8 w-64 animate-pulse rounded bg-slate-200" />
+      <div className="h-24 animate-pulse rounded-2xl bg-slate-100" />
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        {[0, 1, 2, 3, 4, 5].map((i) => <div key={i} className="h-40 animate-pulse rounded-xl bg-slate-100" />)}
+      </div>
+    </div>
+  );
 }
 function ChartSkeleton() {
   return <div className="flex h-72 items-center justify-center rounded-lg bg-slate-50 text-xs text-slate-400">Loading the lane…</div>;
@@ -300,7 +302,7 @@ function AxisRow({ label, defKey, value, weatherAdjusted }: {
         <DefTip k={defKey}>
           <span className="cursor-help text-slate-500 underline decoration-slate-300 decoration-dotted underline-offset-2">{label}</span>
         </DefTip>
-        <span className="font-medium text-slate-700">
+        <span className="tnum font-medium text-slate-700">
           {value == null ? "—" : Math.round(value)}
           {weatherAdjusted && <span className="ml-1 text-[9px] text-indigo-400">wx-adj</span>}
         </span>
@@ -314,34 +316,41 @@ function peakStats(sc: CustomerScoreResponse["customer"] | undefined): BehaviorS
   const w = sc?.behavior?.windows?.all ?? sc?.behavior?.windows?.["90"];
   return w?.size_when_present ?? null;
 }
-function PeakVsActual({ stats }: { stats: BehaviorStats | null }) {
+function PeakVsActual({ stats, opp }: { stats: BehaviorStats | null; opp: ReturnType<typeof opportunitySignal> }) {
   if (!stats) return <div className="text-xs text-slate-400">Active-day load detail loads with history.</div>;
   const typical = stats.median ?? stats.p50;
   const peak = stats.p90;
   const headroom = typical > 0 ? peak / typical : null;
   return (
     <div>
-      <h3 className="mb-2 text-sm font-medium text-slate-700">Typical vs peak load (active days)</h3>
+      <div className="mb-2 flex items-center justify-between">
+        <h3 className="text-sm font-medium text-slate-700">Typical vs peak load (active days)</h3>
+        <ProvenanceTag kind="modeled" small />
+      </div>
       <div className="flex items-end gap-6">
         <div>
           <div className="text-[11px] text-slate-400">typical</div>
-          <div className="text-xl font-semibold text-slate-700">{gal(typical)}</div>
+          <div className="tnum text-xl font-semibold text-slate-700">{gal(typical)}</div>
         </div>
         <div>
           <div className="text-[11px] text-slate-400">peak (P90)</div>
-          <div className="text-xl font-semibold text-indigo-700">{gal(peak)}</div>
+          <div className="tnum text-xl font-semibold text-indigo-700">{gal(peak)}</div>
         </div>
         {headroom && headroom > 1.3 && (
           <div className="ml-auto text-right">
             <div className="text-[11px] text-slate-400">peak ≈ wallet</div>
-            <div className="text-sm font-medium text-emerald-700">{headroom.toFixed(1)}× headroom</div>
+            <div className="tnum text-sm font-medium text-emerald-700">{headroom.toFixed(1)}× headroom</div>
           </div>
         )}
       </div>
-      <p className="mt-3 rounded bg-slate-50 px-2 py-1 text-[10px] text-slate-400">
-        Interim peak≈wallet read from active-day sizes — a hint at untapped volume. Phase 6 replaces
-        this with a modeled missing-volume estimate.
-      </p>
+      <Caveat tone="indigo">
+        The peak ≈ wallet premise: their best active days hint at the wallet.{" "}
+        {opp.available && opp.kind === "win" && opp.gallons > 0
+          ? <>The modeled engine reads <b>{gal(opp.gallons)}/yr</b> of that as winnable upside.</>
+          : opp.available && opp.kind === "shrunk"
+          ? <>But the trend says it's <b>shrinking, not winnable</b>.</>
+          : <>The engine reads them as <b>near peak</b> — little to chase.</>}
+      </Caveat>
     </div>
   );
 }

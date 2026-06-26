@@ -8,9 +8,11 @@ the operator reads first (a prescriptive one-breath verdict templated from the r
 and the DOLLAR joins that make the closed loop visible (winnable gallons × the existing margin
 ¢/gal). Every number already exists in another engine; this layer only joins, names, and phrases.
 
-Two tiles ride INTERIM data sources that Phase 6/7 will replace — they are isolated and labelled
-(``opportunity.interim`` = channel-mismatch volume, not modeled demand; the terminal position tile,
-on the frontend, = hedging/demand net-flow, not a gauge) so the later swap is data-source-only.
+The opportunity facet is the REAL Phase-6 modeled missing-volume engine (peak ≈ wallet), pulled per
+master from ``opportunity.compute_opportunity`` and labelled MODELED everywhere it surfaces. The
+terminal view reads the REAL Phase-7 position / days-of-cover engine (``/api/position``) directly.
+Both degrade honestly to "not enough data" — never a zero that reads as a real number — when an
+engine returns empty.
 
 If you find yourself adding a calculation here, it belongs in an engine, not in this view layer.
 """
@@ -84,9 +86,29 @@ def _margin_by_customer(con) -> tuple[dict, dict]:
     return by, res
 
 
+def _opportunity_facets(con) -> tuple[dict, bool]:
+    """{master_id: the REAL Phase-6 modeled facet} + an availability flag.
+
+    The facet is a superset of the old interim opportunity shape (winnable gal/$ + winnability +
+    shrunk-vs-under-served + the spot/rack tag + a MODELED headline), so the view reads it directly.
+    Best-effort: an empty ({}, False) when the engine is locked or the book is too thin — the tile
+    then degrades honestly to "not enough data" rather than fabricating a zero.
+    """
+    try:
+        from .. import opportunity
+        res = opportunity.compute_opportunity(con)
+    except Exception:  # noqa: BLE001 — opportunity is an optional layer; never break the view
+        return {}, False
+    if not res.get("available"):
+        return {}, False
+    return ({c["customer_id"]: c.get("facet") for c in res.get("customers", []) if c.get("facet")},
+            True)
+
+
 def _build_bundle(con) -> dict:
     var = variability.compute_variability(con)
     margin_by, margin_full = _margin_by_customer(con)
+    opp_facets, opp_available = _opportunity_facets(con)
     last_lifts = _last_lifts(con)
     as_of = var.get("as_of")
     as_of_d = _parse_date(as_of)
@@ -98,13 +120,14 @@ def _build_bundle(con) -> dict:
         m = margin_by.get(cid)
         last = last_lifts.get(cid)
         stale = _is_stale(last, as_of_d)
-        customers.append(_assemble_customer(c, m, last, stale, n_margin))
+        customers.append(_assemble_customer(c, m, last, stale, n_margin, opp_facets.get(cid)))
 
     return {
         "available": bool(var.get("available")),
         "as_of": as_of,
         "margin_available": bool(margin_full.get("available")),
         "margin_full": margin_full,
+        "opportunity_available": opp_available,
         "customers": customers,
         "by_id": {c["customer_id"]: c for c in customers},
         "mismatches": var.get("mismatches") or {},
@@ -113,7 +136,7 @@ def _build_bundle(con) -> dict:
 
 
 def _assemble_customer(c: dict, m: dict | None, last_lift: str | None, stale: bool,
-                       n_margin: int = 0) -> dict:
+                       n_margin: int = 0, opp_facet: dict | None = None) -> dict:
     """Join one customer's facets from every engine into a single record (the spine of the list)."""
     ch = c.get("channel") or {}
     conf = c.get("confidence") or {}
@@ -138,7 +161,7 @@ def _assemble_customer(c: dict, m: dict | None, last_lift: str | None, stale: bo
         }
     margin_cents = (margin_facet or {}).get("book_cents_gal") if margin_facet else ch.get("margin_cents_gal")
 
-    opp = _opportunity(c, ch, stale, margin_cents)
+    opp = _opportunity(opp_facet)
 
     rec = {
         "customer_id": c["customer_id"],
@@ -185,8 +208,8 @@ def _assemble_customer(c: dict, m: dict | None, last_lift: str | None, stale: bo
         "margin": margin_facet,
         "margin_cents_gal": margin_cents,
         "margin_pctile": margin_pctile,
-        # opportunity facet (INTERIM source — see _opportunity)
-        "winnable_gal_per_yr": opp["winnable_gal_per_yr"],
+        # opportunity facet (REAL Phase-6 modeled missing-volume — see _opportunity)
+        "winnable_gal_per_yr": opp.get("winnable_gal_per_yr") or 0,
         "opportunity": opp,
         # commitment context
         "commitment_label": com.get("label"),
@@ -196,51 +219,28 @@ def _assemble_customer(c: dict, m: dict | None, last_lift: str | None, stale: bo
     return rec
 
 
-def _opportunity(c: dict, ch: dict, stale: bool, margin_cents: float | None) -> dict:
-    """Missing / winnable volume = the channel-mismatch upside, an existing number from the deal book.
+_OPP_PREMISE = ("MODELED: a customer's weather-normalized peak with us ≈ their whole wallet "
+                "(peak ≈ wallet) — an estimate of opportunity, not measured demand.")
 
-    INTERIM SOURCE (Phase 6 swaps in modeled missing-volume / peak~wallet): a steady account on SPOT
-    is volume you can lock onto rack/term (winnable); an over-committed erratic account is the risk
-    side. Stale accounts are excluded from the winnable headline. The DOLLAR figure is the existing
-    annualized gallons x the existing margin ¢/gal — a display join, ranking-only; it never moves a
-    channel.
+
+def _opportunity(facet: dict | None) -> dict:
+    """The REAL Phase-6 modeled missing-volume facet for one master, or an honest empty read.
+
+    ``opportunity.compute_opportunity`` already shapes the facet as a drop-in superset of the old
+    interim opportunity tile: winnable gal/$, the gap, a 0–100 winnability with the shrunk-vs-
+    under-served split, the reused spot/rack tag, and a MODELED plain-English headline. We pass it
+    straight through. When the engine returned nothing for this customer (locked layer or too thin a
+    book) we return ``available: False`` with a plain reason so the tile reads "not enough data" —
+    never a fabricated zero that looks like measured demand.
     """
-    total = float(c.get("total_net_gallons") or 0)
-    span = max(int(c.get("span_days") or 0), 1)
-    per_day = total / span
-    per_yr = round(per_day * 365.0, 0)
-
-    def dollars(g: float) -> float | None:
-        return None if margin_cents is None else round(g * margin_cents / 100.0, 0)
-
-    base = {"source": "channel_mismatch", "interim": True,
-            "interim_note": "Interim: channel-mismatch volume, not modeled demand (Phase 6 will replace)."}
-
-    if not ch.get("current_channel_known"):
-        return {**base, "available": False, "kind": "unknown", "winnable_gal_per_yr": 0,
-                "winnable_dollars_per_yr": None, "gal_per_day": None, "chase_channel": None,
-                "reason": "no deal book loaded — can't compare to the current channel"}
-
-    direction = ch.get("mismatch_direction")
-    if ch.get("mismatch") and direction == "upgrade_to_rack":
-        win_gal = 0 if stale else per_yr
-        return {**base, "available": True, "kind": "win" if not stale else "win_stale",
-                "winnable_gal_per_yr": win_gal, "winnable_dollars_per_yr": dollars(win_gal),
-                "gal_per_day": round(per_day, 0), "annualized_gal": per_yr,
-                "chase_channel": "rack/term", "strength": ch.get("mismatch_strength"), "stale": stale,
-                "note": (("Bought on spot today — but quiet for a while, so confirm they're still "
-                          "active before chasing.") if stale else
-                         "Bought on spot today, behaves like rack — lock this volume onto rack/term.")}
-    if ch.get("mismatch") and direction == "downgrade_to_spot":
-        return {**base, "available": True, "kind": "risk", "winnable_gal_per_yr": 0,
-                "winnable_dollars_per_yr": None, "gal_per_day": round(per_day, 0),
-                "annualized_gal": per_yr, "at_risk_gal_per_yr": per_yr,
-                "at_risk_dollars_per_yr": dollars(per_yr), "chase_channel": "spot",
-                "strength": ch.get("mismatch_strength"),
-                "note": "On a firm commitment but buys erratically — move to spot to cut volume risk."}
-    return {**base, "available": True, "kind": "matched", "winnable_gal_per_yr": 0,
-            "winnable_dollars_per_yr": None, "gal_per_day": round(per_day, 0), "chase_channel": None,
-            "note": "Correctly channeled — no channel upside to chase right now."}
+    if facet:
+        return facet
+    return {"available": False, "modeled": True, "source": "modeled_peak_demand",
+            "kind": "unknown", "winnable_gal_per_yr": 0, "winnable_dollars_per_yr": None,
+            "gap_gal_per_yr": 0, "winnability": None, "winnability_flag": "insufficient",
+            "chase_channel": None,
+            "note": "Not enough history yet to model a demand gap for this account.",
+            "premise": _OPP_PREMISE, "interim_note": _OPP_PREMISE, "caveat": _OPP_PREMISE}
 
 
 # =================================================================================
@@ -255,10 +255,10 @@ _QUAD_READ = {
     "insufficient": "too new to read a pattern yet",
 }
 _ACTIONS = {
-    "CALL": "CALL to pull onto rack/term",
+    "CALL": "CALL — chase the modeled upside",
     "DE_RISK": "DE-RISK — move off the firm commitment",
     "FIX_PRICING": "FIX PRICING — steady but underpriced",
-    "WATCH": "WATCH — gone quiet, possible churn",
+    "WATCH": "WATCH — possible churn",
     "PROTECT": "PROTECT with a term deal",
     "LEAVE": "LEAVE as-is — on the right channel",
     "REVIEW": "REVIEW — not enough history to call it",
@@ -266,7 +266,14 @@ _ACTIONS = {
 
 
 def _verdict(cust: dict) -> dict:
-    """Return {action, action_label, headline, summary} — the spine sentence + a one-word action."""
+    """Return {action, action_label, headline, summary} — the spine sentence + a one-word action.
+
+    Reasons over EVERY facet (steadiness · margin · channel · the REAL modeled opportunity), picks
+    the single most useful next move, and phrases it like a desk colleague's one-breath take. Dark
+    facets are omitted, never spelled out as "unknown"; the modeled upside is always labelled as a
+    modeled estimate, and a low-winnability account reads "looks shrunk, not winnable" rather than
+    dangling a tempting gallons number.
+    """
     quad = cust.get("quadrant") or "insufficient"
     rec = cust.get("recommended_channel")
     opp = cust.get("opportunity") or {}
@@ -275,12 +282,17 @@ def _verdict(cust: dict) -> dict:
     pct = cust.get("margin_pctile")
     steady = quad in ("metronome", "predictable_size")
 
+    win_gal = opp.get("winnable_gal_per_yr") or 0
+    is_win = bool(opp.get("available") and opp.get("kind") == "win" and win_gal > 0)
+    is_shrunk = bool(opp.get("available") and opp.get("kind") == "shrunk")
+    channel_risk = bool(cust.get("mismatch") and cust.get("mismatch_direction") == "downgrade_to_spot")
+
     # ---- pick the action (priority order; first to fire wins the headline) ----
-    if opp.get("kind") == "win" and (opp.get("winnable_gal_per_yr") or 0) > 0:
+    if is_win:
         action = "CALL"
-    elif opp.get("kind") == "risk":
+    elif channel_risk:
         action = "DE_RISK"
-    elif cust.get("stale"):
+    elif cust.get("stale") or is_shrunk:
         action = "WATCH"
     elif steady and pct is not None and pct <= 0.34 and rec == "RACK":
         action = "FIX_PRICING"
@@ -307,24 +319,41 @@ def _verdict(cust: dict) -> dict:
     if cust.get("current_channel_known"):
         if cust.get("mismatch") and cust.get("mismatch_direction") == "upgrade_to_rack":
             clauses.append("on spot but behaves like rack")
-        elif cust.get("mismatch") and cust.get("mismatch_direction") == "downgrade_to_spot":
+        elif channel_risk:
             clauses.append("over-committed for how it buys")
         elif rec:
             clauses.append("on the right channel")
+    elif rec:
+        clauses.append("rack/term-suited" if rec == "RACK" else "spot-suited")
 
-    win_gal = opp.get("winnable_gal_per_yr") or 0
+    # ---- the closing clause + the action verb, phrased per action ----
     win_d = opp.get("winnable_dollars_per_yr")
-    if action == "CALL" and win_gal > 0:
-        money = f" (~${_compact(win_d)})" if win_d else ""
-        clauses.append(f"~{_compact(win_gal)} gal/yr winnable{money}")
-    elif action == "DE_RISK" and (opp.get("at_risk_gal_per_yr") or 0):
-        clauses.append(f"~{_compact(opp['at_risk_gal_per_yr'])} gal/yr at risk")
+    if action == "CALL":
+        money = f" (≈ ${_compact(win_d)}/yr)" if win_d else ""
+        chase = opp.get("chase_channel")
+        clauses.append(f"~{_compact(win_gal)} gal/yr modeled upside{money}")
+        tail = f"CALL — chase it{f' via {chase}' if chase else ''}"
+    elif action == "DE_RISK":
+        tail = "DE-RISK — move off the firm commitment"
+    elif action == "WATCH" and is_shrunk:
+        clauses.append("buying less lately, big days are old")
+        tail = "WATCH — looks shrunk, not winnable"
+    elif action == "WATCH":
+        tail = "WATCH — gone quiet, possible churn"
+    elif action == "FIX_PRICING":
+        tail = "FIX PRICING — steady but underpriced"
+    elif action == "PROTECT":
+        tail = "PROTECT with a term deal"
+    elif action == "REVIEW":
+        tail = "REVIEW — not enough history to call it"
+    else:
+        tail = "LEAVE as-is — on the right channel"
 
     name = cust.get("name") or cust.get("customer_id")
-    headline = f"{name} — " + ", ".join(clauses) + f" — {_ACTIONS[action]}."
+    headline = f"{name} — " + ", ".join(clauses) + f" — {tail}."
     if tier == "Low":
         headline += f" Provisional — only {_int(cust.get('n_lifts'))} lifts."
-    return {"action": action, "action_label": _ACTIONS[action], "headline": headline,
+    return {"action": action, "action_label": _ACTIONS.get(action, tail), "headline": headline,
             "summary": headline}
 
 
@@ -418,6 +447,7 @@ def home():
         customers = b["customers"]
         mismatches = b["mismatches"]
         deals_on = bool(srcs["sources"][1]["connected"])
+        opp_on = bool(b["opportunity_available"])
         n_active = sum(1 for c in customers if c.get("data_sufficient"))
         n_mismatch = int(mismatches.get("n_mismatches") or 0)
         win = [c for c in customers if c["opportunity"].get("kind") == "win"]
@@ -431,17 +461,20 @@ def home():
             {"key": "mismatches", "label": "Channel mismatches", "value": n_mismatch,
              "unit": "accounts", "sub": "on the wrong channel for how they buy",
              "route": "opportunity", "tone": "amber" if n_mismatch else "neutral",
-             "available": deals_on},
-            {"key": "winnable", "label": "Winnable volume on spot", "value": winnable,
+             "available": deals_on,
+             "unavailable_note": "Connect the deal book to compare channels"},
+            {"key": "winnable", "label": "Winnable volume", "value": winnable,
              "unit": "gal/yr", "format": "gal",
-             "sub": (f"≈ ${_compact(winnable_d)}/yr at current margin" if winnable_d else
-                     "steady accounts you could move to rack/term"),
+             "sub": (f"≈ ${_compact(winnable_d)}/yr at current margin · MODELED" if winnable_d else
+                     "modeled missing volume you could win back"),
              "route": "opportunity", "tone": "emerald" if winnable else "neutral",
-             "available": deals_on},
+             "available": opp_on, "modeled": True,
+             "unavailable_note": "Needs more lift history to model demand"},
         ]
         return {
             "company": company, "data_through": b["as_of"], "available": b["available"],
             "tiles": tiles, "margin_available": b["margin_available"],
+            "opportunity_available": opp_on,
             "sources": srcs["sources"], "n_connected": srcs["n_connected"], "n_total": srcs["n_total"],
             "freshness": _freshness(con), "doorways": _doorways(),
         }
@@ -479,14 +512,22 @@ def customers():
         for c in b["customers"]:
             row = {k: c.get(k) for k in _LIST_FIELDS}
             mf = c.get("margin")
+            opp = c["opportunity"]
             row["margin_dollars"] = (mf or {}).get("book_margin_dollars")
             row["rank_by_margin"] = (mf or {}).get("rank_by_margin")
-            row["opportunity_kind"] = c["opportunity"].get("kind")
-            row["winnable_dollars_per_yr"] = c["opportunity"].get("winnable_dollars_per_yr")
+            row["opportunity_kind"] = opp.get("kind")
+            row["opportunity_available"] = bool(opp.get("available"))
+            row["winnable_dollars_per_yr"] = opp.get("winnable_dollars_per_yr")
+            row["winnability"] = opp.get("winnability")
+            row["winnability_flag"] = opp.get("winnability_flag")
+            row["chase_channel"] = opp.get("chase_channel")
+            row["gap_gal_per_yr"] = opp.get("gap_gal_per_yr")
+            row["opportunity_note"] = opp.get("note")
             out.append(row)
         return {
             "available": b["available"], "as_of": b["as_of"], "n_customers": len(out),
             "margin_available": b["margin_available"],
+            "opportunity_available": b["opportunity_available"],
             "deals_available": any(c.get("current_channel_known") for c in b["customers"]),
             "customers": out,
         }
@@ -553,16 +594,21 @@ def terminals():
                    count(DISTINCT customer_id) AS customers
             FROM lifts WHERE terminal IS NOT NULL GROUP BY 1 ORDER BY 2 DESC""").df()
 
-        # winnable / at-risk per terminal, carried over from the joined book (the action overlay)
+        # winnable / at-risk per terminal, carried over from the joined book (the action overlay).
+        # winnable = the REAL modeled missing-volume; at-risk = the over-committed-erratic CHANNEL
+        # signal (annualized lift volume on a firm commitment that buys like spot).
         win_by, risk_by = {}, {}
         for c in b["customers"]:
             t = c.get("primary_terminal")
             if not t:
                 continue
-            if c["opportunity"].get("kind") == "win":
-                win_by[t] = win_by.get(t, 0) + (c["opportunity"].get("winnable_gal_per_yr") or 0)
-            elif c["opportunity"].get("kind") == "risk":
-                risk_by[t] = risk_by.get(t, 0) + (c["opportunity"].get("at_risk_gal_per_yr") or 0)
+            opp = c["opportunity"]
+            if opp.get("kind") == "win":
+                win_by[t] = win_by.get(t, 0) + (opp.get("winnable_gal_per_yr") or 0)
+            if c.get("mismatch") and c.get("mismatch_direction") == "downgrade_to_spot":
+                per_yr = (float(c.get("total_net_gallons") or 0)
+                          / max(int(c.get("span_days") or 0), 1)) * 365.0
+                risk_by[t] = risk_by.get(t, 0) + per_yr
 
         inv_connected = _inventory_connected(con)
         terms = []

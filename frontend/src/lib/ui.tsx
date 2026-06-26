@@ -91,19 +91,25 @@ export function Card({ children, className = "", onClick, hover }: {
 }
 
 // ---- home: headline stat tile ---------------------------------------------------
-export function StatTile({ label, value, unit, sub, tone = "neutral", onClick, muted }: {
+export function StatTile({ label, value, unit, sub, tone = "neutral", onClick, muted, modeled }: {
   label: string; value: ReactNode; unit?: string; sub?: string; tone?: Tone;
-  onClick?: () => void; muted?: boolean;
+  onClick?: () => void; muted?: boolean; modeled?: boolean;
 }) {
   return (
     <Card hover={!!onClick && !muted} onClick={muted ? undefined : onClick}
-      className={`p-5 ${muted ? "opacity-70" : ""}`}>
-      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-400">{label}</div>
+      className={`group p-5 ${muted ? "opacity-70" : ""}`}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{label}</div>
+        {modeled && !muted && <ProvenanceTag kind="modeled" />}
+      </div>
       <div className="mt-2 flex items-baseline gap-1.5">
-        <span className={`text-3xl font-semibold ${muted ? "text-slate-400" : toneText[tone]}`}>{value}</span>
+        <span className={`tnum text-[2rem] font-semibold leading-none tracking-tight ${muted ? "text-slate-400" : toneText[tone]}`}>{value}</span>
         {unit && <span className="text-xs font-medium text-slate-400">{unit}</span>}
       </div>
-      {sub && <div className="mt-1.5 text-xs text-slate-500">{sub}</div>}
+      {sub && <div className="mt-2 text-xs leading-snug text-slate-500">{sub}</div>}
+      {onClick && !muted && (
+        <div className="mt-2 text-[11px] font-medium text-indigo-400 opacity-0 transition group-hover:opacity-100">View →</div>
+      )}
     </Card>
   );
 }
@@ -149,7 +155,7 @@ export function FacetValue({ value, caption, tone = "neutral" }: {
 }) {
   return (
     <div>
-      <div className={`text-2xl font-semibold ${toneText[tone]}`}>{value}</div>
+      <div className={`tnum text-[1.65rem] font-semibold leading-tight tracking-tight ${toneText[tone]}`}>{value}</div>
       {caption && <div className="mt-1 text-xs leading-snug text-slate-500">{caption}</div>}
     </div>
   );
@@ -227,7 +233,7 @@ export function Stat({ label, children, hint }: { label: string; children: React
   const inner = (
     <div>
       <div className="text-[11px] uppercase tracking-wide text-slate-400">{label}</div>
-      <div className="mt-0.5 text-sm font-medium text-slate-800">{children}</div>
+      <div className="tnum mt-0.5 text-sm font-medium text-slate-800">{children}</div>
     </div>
   );
   return hint ? <Tip text={hint}>{inner}</Tip> : inner;
@@ -285,7 +291,7 @@ export function InputRow({ k, v, hint }: { k: ReactNode; v: ReactNode; hint?: st
   const row = (
     <div className="flex items-baseline justify-between gap-3">
       <span className="text-slate-500">{k}</span>
-      <span className="font-medium text-slate-700">{v}</span>
+      <span className="tnum font-medium text-slate-700">{v}</span>
     </div>
   );
   return hint ? <Tip text={hint}>{row}</Tip> : row;
@@ -299,8 +305,95 @@ export function Meter({ value, tone = "indigo" }: { value: number | null; tone?:
   };
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200">
-      <div className={`h-1.5 rounded-full ${fill[tone]}`}
+      <div className={`h-1.5 rounded-full transition-all ${fill[tone]}`}
         style={{ width: `${Math.max(0, Math.min(100, value ?? 0))}%` }} />
     </div>
   );
+}
+
+// ---- provenance: the modeled-vs-measured / estimated-vs-contract / gauge-vs-proxy marker --------
+// One consistent vocabulary so a viewer always knows how solid a number is. Never let an estimate
+// read as ground truth: modeled & estimated are violet/amber and hover-explain; verified is emerald.
+type Provenance = "modeled" | "estimated" | "measured" | "verified" | "proxy" | "contract";
+const PROV: Record<Provenance, { label: string; cls: string; tip: string }> = {
+  modeled:   { label: "modeled", cls: "bg-violet-50 text-violet-700 ring-violet-200",
+               tip: "A modeled estimate (peak ≈ wallet), not measured demand." },
+  estimated: { label: "estimated", cls: "bg-amber-50 text-amber-700 ring-amber-200",
+               tip: "Estimated from lift invoice prices — not your contract terms / sell grid." },
+  measured:  { label: "measured", cls: "bg-slate-100 text-slate-600 ring-slate-200",
+               tip: "Measured directly from the loaded book." },
+  verified:  { label: "gauge-verified", cls: "bg-emerald-50 text-emerald-700 ring-emerald-200",
+               tip: "Anchored to a verified physical tank gauge — a true level." },
+  proxy:     { label: "net-flow proxy", cls: "bg-amber-50 text-amber-700 ring-amber-200",
+               tip: "Cumulative inbound − outbound — a flow delta, not a tank gauge level." },
+  contract:  { label: "contract", cls: "bg-indigo-50 text-indigo-700 ring-indigo-200",
+               tip: "From the loaded deal book — actual contract terms." },
+};
+export function ProvenanceTag({ kind, small }: { kind: Provenance; small?: boolean }) {
+  const p = PROV[kind];
+  const size = small ? "px-1.5 py-0 text-[9px]" : "px-2 py-0.5 text-[10px]";
+  return (
+    <Tip text={p.tip}>
+      <span className={`inline-flex cursor-help items-center gap-1 rounded-full font-semibold uppercase tracking-wide ring-1 ring-inset ${size} ${p.cls}`}>
+        <span aria-hidden className="text-[0.85em] leading-none opacity-70">◇</span>{p.label}
+      </span>
+    </Tip>
+  );
+}
+
+// ---- a small, consistent caveat line (the always-present honesty note) --------------------------
+export function Caveat({ children, tone = "slate" }: { children: ReactNode; tone?: Tone }) {
+  const bar: Record<string, string> = {
+    slate: "border-slate-200 text-slate-400", neutral: "border-slate-200 text-slate-400",
+    amber: "border-amber-200 text-amber-600", rose: "border-rose-200 text-rose-600",
+    indigo: "border-indigo-200 text-indigo-500", emerald: "border-emerald-200 text-emerald-600",
+  };
+  return (
+    <p className={`mt-2 border-l-2 pl-2 text-[10.5px] leading-snug ${bar[tone]}`}>{children}</p>
+  );
+}
+
+// ---- the prescriptive verdict banner — the SPINE, the first thing read on a profile -------------
+const VERDICT_BAR: Record<Tone, string> = {
+  emerald: "border-emerald-400 bg-gradient-to-r from-emerald-50/80 to-transparent",
+  indigo: "border-indigo-400 bg-gradient-to-r from-indigo-50/80 to-transparent",
+  amber: "border-amber-400 bg-gradient-to-r from-amber-50/80 to-transparent",
+  rose: "border-rose-400 bg-gradient-to-r from-rose-50/80 to-transparent",
+  slate: "border-slate-300 bg-gradient-to-r from-slate-50 to-transparent",
+  neutral: "border-slate-300 bg-gradient-to-r from-slate-50 to-transparent",
+};
+export function Verdict({ action, tone, children, meta, caveat }: {
+  action?: ReactNode; tone: Tone; children: ReactNode; meta?: ReactNode; caveat?: ReactNode;
+}) {
+  return (
+    <div className={`riq-rise rounded-2xl border-l-4 px-6 py-5 ${VERDICT_BAR[tone]}`}>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        {action}
+        <span className="text-[11px] font-semibold uppercase tracking-widest text-slate-400">the verdict</span>
+        {meta && <span className="ml-auto">{meta}</span>}
+      </div>
+      <p className="text-[1.25rem] font-medium leading-snug tracking-[-0.01em] text-slate-800">{children}</p>
+      {caveat && <div className="mt-2 text-[11px] text-slate-400">{caveat}</div>}
+    </div>
+  );
+}
+
+// ---- a section heading with an optional one-line note (drill-down dossier rhythm) ---------------
+export function SectionHeading({ children, note }: { children: ReactNode; note?: ReactNode }) {
+  return (
+    <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 pt-2">
+      <h2 className="text-sm font-semibold tracking-tight text-slate-700">{children}</h2>
+      {note && <span className="text-[11px] text-slate-400">{note}</span>}
+    </div>
+  );
+}
+
+// ---- the "so-what" link line inside a tile (the closed loop made visible) -----------------------
+export function SoWhat({ tone = "emerald", children }: { tone?: Tone; children: ReactNode }) {
+  const bg: Record<string, string> = {
+    emerald: "bg-emerald-50 text-emerald-800", amber: "bg-amber-50 text-amber-800",
+    rose: "bg-rose-50 text-rose-700", indigo: "bg-indigo-50 text-indigo-800",
+    slate: "bg-slate-50 text-slate-600", neutral: "bg-slate-50 text-slate-600",
+  };
+  return <div className={`rounded-lg px-2.5 py-2 text-[11px] leading-snug ${bg[tone]}`}>{children}</div>;
 }
