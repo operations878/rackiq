@@ -23,6 +23,8 @@ rackiq-serve = "app.cli:serve_main"
 rackiq-info = "app.cli:info_main"
 rackiq-export-samples = "app.cli:export_samples_main"
 rackiq-export-playbook = "app.cli:export_playbook_main"
+rackiq-load-realbook = "app.cli:load_realbook_main"
+rackiq-variability = "app.cli:variability_main"
 
 [dependency-groups]
 dev = [

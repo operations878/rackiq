@@ -80,6 +80,31 @@ STUDIO_DDL = [
     )""",
 ]
 
+# The deal book (term + forward-fixed + spot). The commitment SPINE: actuals come from BOL lifts,
+# the deal book records what is *contracted* (term/forward) vs *opportunistic* (spot). Grain =
+# master customer × product family × terminal × month, tagged by source. It survives reset/demo
+# (it is uploaded real data, not generated) because it is NOT in schema.ALL_TABLES.
+DEALS_DDL = """CREATE TABLE IF NOT EXISTS deals (
+    deal_key VARCHAR PRIMARY KEY,
+    source VARCHAR,                 -- 'term' | 'forward_fixed' | 'spot'
+    customer_master VARCHAR,        -- resolved coded master (NULL until the bridge confirms a match)
+    customer_raw VARCHAR,           -- raw deal-book customer name
+    product_family VARCHAR,         -- normalized family (ULSD / ULSHO / DYED / HO4 / RD ...)
+    product_raw VARCHAR,
+    terminal VARCHAR,
+    month DATE,
+    committed_gallons DOUBLE,       -- term / forward committed gallons (NULL for spot & requirements)
+    realized_gallons DOUBLE,        -- spot realized gallons (NULL for term / forward)
+    price DOUBLE,                   -- basis differential (term) / locked $/gal (forward) / realized $/gal (spot)
+    price_type VARCHAR,             -- 'basis' | 'fixed' | 'realized'
+    commitment_type VARCHAR,        -- 'firm' | 'requirements'
+    volume_basis VARCHAR,           -- 'net' | 'gross' | 'unknown'
+    deal_date DATE,
+    representative VARCHAR,
+    source_file VARCHAR,
+    imported_at VARCHAR
+)"""
+
 # Lightweight, idempotent migrations for stores created before a column existed.
 STUDIO_MIGRATIONS = [
     "ALTER TABLE import_profiles ADD COLUMN IF NOT EXISTS hygiene VARCHAR",
@@ -131,6 +156,7 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(META_DDL)
     for ddl in STUDIO_DDL:
         con.execute(ddl)
+    con.execute(DEALS_DDL)
     for stmt in STUDIO_MIGRATIONS:
         try:
             con.execute(stmt)
@@ -591,3 +617,106 @@ def clear_quarantine(con, table: str | None = None) -> None:
         con.execute("DELETE FROM quarantine WHERE target_table = ?", [table])
     else:
         con.execute("DELETE FROM quarantine")
+
+
+# ---- Deal book (the commitment spine) -------------------------------------------
+_DEALS_COLS = ["deal_key", "source", "customer_master", "customer_raw", "product_family",
+               "product_raw", "terminal", "month", "committed_gallons", "realized_gallons",
+               "price", "price_type", "commitment_type", "volume_basis", "deal_date",
+               "representative", "source_file", "imported_at"]
+
+
+def deals_count(con, source: str | None = None) -> int:
+    if source:
+        return int(con.execute("SELECT count(*) FROM deals WHERE source = ?", [source]).fetchone()[0])
+    return int(con.execute("SELECT count(*) FROM deals").fetchone()[0])
+
+
+def upsert_deals(con, rows: list[dict], source: str, source_file: str, now: str) -> dict:
+    """Idempotent upsert of parsed deal rows for one ``source``.
+
+    Idempotency: within the file, rows colliding on ``deal_key`` (customer × product × terminal ×
+    month × source × deal_date) are aggregated (gallons summed, price volume-weighted); then the
+    table is **scope-replaced** for the (source, month) cells present in the file, so re-uploading a
+    month (or the full term/forward snapshot) replaces it cleanly and never double-counts.
+    """
+    if not rows:
+        return {"written": 0, "months": 0, "replaced_scope": 0}
+
+    # aggregate within-file collisions on the stable key
+    agg: dict[str, dict] = {}
+    for r in rows:
+        k = r["deal_key"]
+        cur = agg.get(k)
+        if cur is None:
+            agg[k] = dict(r)
+            continue
+        for g in ("committed_gallons", "realized_gallons"):
+            a, b = cur.get(g), r.get(g)
+            if a is None and b is None:
+                continue
+            cur[g] = (a or 0.0) + (b or 0.0)
+        # volume-weight the price by realized/committed gallons
+        wa = (cur.get("realized_gallons") or cur.get("committed_gallons") or 0.0)
+        if r.get("price") is not None and cur.get("price") is not None and wa:
+            wb = (r.get("realized_gallons") or r.get("committed_gallons") or 0.0)
+            cur["price"] = (cur["price"] * (wa - wb) + r["price"] * wb) / wa if wa else cur["price"]
+    deduped = list(agg.values())
+
+    months = sorted({r["month"] for r in deduped if r.get("month") is not None})
+    has_null_month = any(r.get("month") is None for r in deduped)
+
+    # scope-replace: drop the (source, month) cells this file covers, then insert
+    replaced = 0
+    if months:
+        placeholders = ", ".join("?" for _ in months)
+        replaced = int(con.execute(
+            f"SELECT count(*) FROM deals WHERE source = ? AND month IN ({placeholders})",
+            [source, *[m.isoformat() if hasattr(m, 'isoformat') else m for m in months]]).fetchone()[0])
+        con.execute(f"DELETE FROM deals WHERE source = ? AND month IN ({placeholders})",
+                    [source, *[m.isoformat() if hasattr(m, 'isoformat') else m for m in months]])
+    if has_null_month:
+        con.execute("DELETE FROM deals WHERE source = ? AND month IS NULL", [source])
+
+    import pandas as _pd
+    df = _pd.DataFrame(deduped)
+    df["source_file"] = source_file
+    df["imported_at"] = now
+    for c in _DEALS_COLS:
+        if c not in df.columns:
+            df[c] = None
+    df = df[_DEALS_COLS]
+    con.register("_deals_ins", df)
+    try:
+        sel = ", ".join(
+            f"CAST(\"{c}\" AS {'DATE' if c in ('month', 'deal_date') else 'DOUBLE' if c in ('committed_gallons','realized_gallons','price') else 'VARCHAR'}) AS \"{c}\""
+            for c in _DEALS_COLS)
+        con.execute(f"INSERT INTO deals ({', '.join(_DEALS_COLS)}) SELECT {sel} FROM _deals_ins")
+    finally:
+        con.unregister("_deals_ins")
+    return {"written": len(deduped), "months": len(months), "replaced_scope": replaced}
+
+
+def resolve_deal_masters(con) -> int:
+    """Set ``deals.customer_master`` from the confirmed crosswalk (raw deal name → master).
+
+    Only attaches a master where the raw deal-book name resolves to a CONFIRMED crosswalk master —
+    unmapped / unconfirmed-candidate names stay NULL (the annotation shows "no commitment data"
+    rather than a wrong master). Idempotent.
+    """
+    con.execute("UPDATE deals SET customer_master = NULL")
+    moved = con.execute("""
+        UPDATE deals SET customer_master = cw.master_id
+        FROM customer_crosswalk cw
+        WHERE TRIM(deals.customer_raw) = cw.variant_key
+          AND cw.status = 'confirmed' AND cw.master_id IS NOT NULL
+    """)
+    return int(con.execute("SELECT count(*) FROM deals WHERE customer_master IS NOT NULL").fetchone()[0])
+
+
+def read_deals_df(con):
+    return con.execute(f"SELECT {', '.join(_DEALS_COLS)} FROM deals").df()
+
+
+def reset_deals(con) -> None:
+    con.execute("DELETE FROM deals")

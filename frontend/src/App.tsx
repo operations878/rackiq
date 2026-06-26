@@ -4,6 +4,7 @@ import type { Summary, Capabilities, StudioState } from "./api/types";
 import { useHashRoute } from "./lib/useHashRoute";
 import ProfileBadge from "./components/ProfileBadge";
 import VarHome from "./pages/VarHome";
+import Variability from "./pages/Variability";
 import Dashboard from "./pages/Dashboard";
 import DataStudio from "./pages/DataStudio";
 import DataHealth from "./pages/DataHealth";
@@ -112,6 +113,7 @@ export default function App() {
       title: "Analyze",
       items: [
         { key: "overview", label: "Book Overview", icon: "☰", match: (b) => b === "overview" },
+        { key: "variability", label: "Variability (2-axis)", icon: "⇎", match: (b) => b === "variability" },
         { key: "radar", label: "Early-Warning Radar", icon: "◔", match: (b) => b === "radar" },
         { key: "scores", label: "Scores & Quadrant", icon: "✦", match: (b) => b === "scores" },
         { key: "reconciliation", label: "Reconciliation", icon: "⚖", match: (b) => b === "reconciliation" },
@@ -177,6 +179,7 @@ export default function App() {
           {(base === "scorecards" || base === "scorecard") && <Scorecards summary={summary} customerId={scorecardId} />}
           {base === "playbook" && <Playbook summary={summary} />}
           {base === "overview" && <BookOverview summary={summary} navigate={navigate} />}
+          {base === "variability" && <Variability summary={summary} navigate={navigate} />}
           {base === "radar" && <Radar summary={summary} />}
           {base === "scores" && <Scores summary={summary} />}
           {base === "reconciliation" && <Reconciliation summary={summary} navigate={navigate} />}

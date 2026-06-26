@@ -525,6 +525,60 @@ computed over the shared connection with a data-signature cache (`api/reconcilia
   ranked (e.g. *"Tank 4 ULSD 0.18% vs 0.05% network avg ≈ $X/yr"*), with a **network recoverable**
   total (loss above routine shrink).
 
+## Deal book & two-axis variability (Phase 1) — the real-book score
+
+The standing VAR grade collapsed on the *real* book (everyone graded B/C, ~half labelled
+"Sporadic/Bursty") because one number conflated two unrelated things. **`backend/app/variability.py`**
+(engine, `VariabilityConfig`) replaces it with **two independent axes**, scored and displayed
+separately (a combined roll-up exists only as a secondary convenience):
+
+- **AXIS 1 — cadence consistency** (`0–100`): how predictably a customer *shows up*, over **working
+  days** (reuse the calendar; zeros are data). `= 0.72·regularity + 0.28·presence`, where
+  `regularity = clamp(1 − gap_cv)` (gap_cv = 1.0 is the random/Poisson reference) and `presence` is a
+  gentle active-days/week term. Regularity dominates so a strictly-periodic buyer scores high at ANY
+  frequency, and a frequent-but-erratic one **cannot** buy steadiness with frequency alone.
+- **AXIS 2 — size consistency** (`0–100`): when they DO lift, how alike each **per-lift** load is —
+  on active lifts only (never diluted by silent days). `= 100·clamp(1 − size_cv/1.0)` over the raw
+  per-BOL net gallons + P10/P50/P90. **Reported raw and on its own**, so a steady-cadence /
+  variable-size account reads "steady cadence, *variable loads*" — size swings are never smoothed away.
+  A **weather-adjustment SEAM** (`_weather_residual_sizes`) is built for heating fuels (ULSHO/HO4):
+  raw size CV now, residual-after-β·HDD when the weather layer lands. Nothing is touched for
+  non-heating products.
+
+The frequency × size **2×2** names the planning quadrant: **metronome** (plannable both ways) ·
+**shows up steadily, size unpredictable** (plan presence, not size) · **infrequent but identical**
+(plan the quantity, watch timing) · **sporadic / bursty** (honest low-confidence). Reuses
+`behavioral.daily_profile` (presence/size split, intermittency `median-0/mean>0`), guarded by a
+data-sufficiency floor. On the real Soundview book both axes **spread** (cadence std ≈ 24 vs the old
+VAR's ≈ 11; size std ≈ 17) and the textbook cases separate: a daily-clockwork lifter → *metronome*, a
+daily-but-lumpy account (Taylor) → *shows up steadily, size unpredictable*, a rare-but-identical
+account → *infrequent but identical*. Validation gate at `GET /api/variability/validation` (`rackiq-variability`).
+
+**The deal book ANNOTATES, never grades.** `backend/app/dealbook.py` ingests the three deal sources
+into the canonical **`deals`** table (the spine P2/P3 read) via three **format-aware parsers** (no
+generic mapper): **term** (`deals_summary.xlsx` "Term" — month-pivot blocked by product, col0 product
+forward-filled, col1 customer, alternating volume/basis-price rows; a basis-only row is NOT read as
+gallons), **forward-fixed** (`forward_fixed_price_sales.xlsx` "Active Deals" — month headers row 1,
+col0 customer-or-"Approved" forward-filled, col3 deal date, col4 locked $/gal, orphan rows excluded,
+REMAINING ignored), and **spot** (monthly sheets; the date column is titled "SPOT DEALS"). Grain =
+master customer × product family × terminal × month, tagged `term|forward_fixed|spot`, with
+committed/realized gallons, basis/locked/realized price, `commitment_type` (firm|requirements),
+`volume_basis` (net|gross|unknown). Re-uploadable Data Studio **"Deals"** source with **idempotent**
+upsert (scope-replace on (source, month); dedupe on the stable `deal_key` = customer×product×terminal×
+month×source×deal_date). Product families via `product_family()` (ULSD/ULSHO/DYED/HO4/RD; blend
+numbers like B5/B10/B20/B99 are a sub-attribute, NOT a separate family; **"GEC 10"/"GEC 20" → GEC**).
+
+**The join is the whole ball game.** `backend/app/bookload.py` loads the **Account Reference Chart**
+(`raw BOL account → coded master`) as the customer crosswalk, the raw **BOLs** into `lifts` (group
+compartments by BOL → one lift, sum gross+net, drop 0/0/0 control rows, **Ship Date**, product→family,
+consignee name → coded master by normalized match), and the deal book. The deal-book→master **bridge**
+(`dealbook.bridge_candidates`) resolves deal names to BOL masters where confirmed, **proposes** fuzzy
+candidates for the rest (staged in the extend-crosswalk panel — **never auto-merged**; "KW Rastall" vs
+"Rastall" stay candidates), and reports the **match rate** (what share of committed volume bridges to a
+real BOL customer) loudly. The commitment annotation attaches ONLY to masters that bridge; everything
+else shows "no commitment data". On the real book the chart maps ~100% of BOL volume; ~60% of committed
+deal volume auto-bridges, the rest staged for confirmation.
+
 ## API endpoints
 
 All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
@@ -577,6 +631,11 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/calendar/config` · `POST /api/calendar/recompute` | the calendar config (holiday country/subdiv, Saturday default/min-obs, weights) · recompute with `{overrides}` |
 | `GET /api/hedging?terminal=&window=&service_level=` | the **operational demand-hedging readout** (Phase 2): per-terminal expected demand band (P10/P50/P90) over the next 3 & 5 **working** days, the FLOOR vs UPSIDE split, the **behavior-aware dynamic buffer** (statistical safety + overdue-burst coil), the risk watch-list, the morning readout, and the operational customer view (honest "inventory not connected" note when absent) |
 | `GET /api/hedging/overview` · `GET /api/hedging/config` · `POST /api/hedging/recompute` | every terminal's readout (shared scoring) · the hedging config · recompute with `{overrides, window, terminal, service_level}` |
+| `GET /api/variability` | the **two-axis variability score** per master: **cadence consistency** + **size consistency** (separate), the frequency×size **2×2** quadrant, the commitment **annotation**, and per-axis distributions + coverage |
+| `GET /api/variability/validation` | the **real-book validation gate**: both axis histograms + spread verdict, named-account 2×2 gut check, the split proof, annotation sanity, conformance anomalies, coverage, and the deal-book→master bridge match rate |
+| `GET /api/variability/customer/{id}` · `GET /api/variability/config` | one customer's two axes + full behavioral drill-down (all windows + daily bars) · the variability config |
+| `GET /api/deals/summary` · `GET /api/deals/bridge` | deal-book row/master counts by source · the **crosswalk bridge** (mapped / fuzzy candidates / unmapped + the committed-volume match rate) |
+| `POST /api/deals/upload` (multipart) · `POST /api/deals/bridge/confirm` · `POST /api/deals/load-samples` | re-uploadable **Deals** source (term/forward/spot, auto-detected, idempotent) · confirm staged bridges (never auto-merged) · load the bundled real book (chart→BOLs→deals) |
 
 Interactive docs at `http://localhost:8000/docs`.
 
@@ -884,6 +943,10 @@ uv run rackiq-serve                       # FastAPI on http://localhost:8000
 uv run rackiq-generate --seed 42 --profile full
 uv run rackiq-export-samples              # write sample CSV/XLSX (+ dirty demo files) into ../samples/
 uv run rackiq-export-playbook             # (re)generate ../docs/playbook.md from the archetype plays
+uv run rackiq-load-realbook               # load the real book: Account Reference Chart → raw BOLs → deal book
+                                          #   (reads backend/sample_data/deals/: account_reference_chart.xlsx,
+                                          #    *bols*.csv [multi-year ok], deals_summary/forward_fixed/spot workbooks)
+uv run rackiq-variability                 # print the two-axis variability validation readout (the real-book gate)
 uv run pytest                             # run the test suite (units + e2e API flow)
 # rackiq-info  -> print row counts + enabled capability count
 ```
@@ -929,6 +992,9 @@ backend/
     pricing.py              # ★ Pricing Sandbox + Engine (Blueprint I): spread what-if (per-customer vol/margin curves via β, margin-maximizing post), acceptance model (per-segment logistic from quotes + elasticity proxy), GP-maximizing quote price with shadow-price floor
     pricing_config.py       # ★ PricingConfig — spread/price grids, shadow-price schedule, acceptance priors, elasticity-class thresholds as parameters
     hedging.py              # ★ Operational demand-hedging (Phase 2, on the working-day calendar): per-terminal expected band (P10/P50/P90 w/ customer correlation), FLOOR vs UPSIDE, behavior-aware dynamic buffer (statistical safety + overdue-burst coil), risk concentration, morning readout (HedgingConfig)
+    variability.py          # ★ TWO-AXIS variability (Phase-1 score): cadence consistency (working-day gap regularity + presence) × size consistency (raw per-lift CV; weather-adjust SEAM for heating fuels), separate axes + frequency×size 2×2 + commitment annotation; validation_readout (the real-book gate). Reuses behavioral/calendar; never collapses to one grade
+    dealbook.py             # ★ Deal-book parsers + canonical deals table: product_family() normalization (blends are product not identity, GEC 10/20→GEC), three format-aware parsers (term pivot / forward-fixed Active-Deals / spot monthly), stable deal_key, crosswalk bridge_candidates + confirm_bridge (propose, never auto-merge)
+    bookload.py             # ★ Repeatable real-book loaders: Account Reference Chart → crosswalk, raw BOLs → lifts (group-by-BOL, drop 0/0/0, Ship Date, product→family, consignee→master), deal book → deals (idempotent); multi-year BOL concat; load_real_book one-shot
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping (BOL/EDI aliases, 2-tier threshold), inspect (+profiling), validate, coerce (mixed + Excel-serial dates)
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -948,7 +1014,10 @@ backend/
     api/pricing.py          # /api/pricing (sandbox + recommendations) / recommendations / config / recompute (cached base)
     api/calendar.py         # /api/calendar (measured day-of-week rhythm + Saturday weights + exclusions) / config / recompute
     api/hedging.py          # /api/hedging (per-terminal staging readout) / overview / config / recompute (heavy scoring cached per data/window/day)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing
+    api/variability.py      # /api/variability (two-axis score) / validation (the real-book gate) / customer / config (cached per data+deal signature)
+    api/deals.py            # /api/deals/* deal-book Data Studio source (upload/idempotent) + crosswalk bridge (summary / bridge / confirm / load-samples)
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability
+  sample_data/deals/        # (gitignored) the operator's real book: account_reference_chart.xlsx, *bols*.csv, deal workbooks — read by the repeatable loaders
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
@@ -959,7 +1028,7 @@ frontend/
     App.tsx, main.tsx, index.css       # App.tsx = the left-nav dashboard shell (Operate/Analyze/Data)
     lib/{useHashRoute,format}.ts, lib/scoreui.tsx
     api/{client,types}.ts
-    pages/{VarHome,DailyOps,DemandCockpit,Hedging,Calendar,Pricing,Scorecards,Playbook,BookOverview,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx   # VarHome = the default landing (route ""); Hedging = Demand Hedging (Operate); Calendar = Working-Day Calendar (Data)
+    pages/{VarHome,DailyOps,DemandCockpit,Hedging,Calendar,Pricing,Scorecards,Playbook,BookOverview,Variability,Radar,Scores,Reconciliation,Dashboard,DataStudio,DataHealth}.tsx   # VarHome = the default landing (route ""); Variability = the two-axis score + deal-book bridge staging (Analyze); Hedging = Demand Hedging (Operate); Calendar = Working-Day Calendar (Data)
     components/{ConnectionBanner,ProfileBadge,CapabilityGrid,VolumeChart,MarketPriceChart,Panel,DataCapabilityPanel,RegimeSelector}.tsx
     components/scores/{BaseRangeChart,QuadrantScatter,VarBreakdown,ForwardProjection,LaneBreaks,VarTrendBadge,BehaviorMap,BehaviorProfile,DailyBars}.tsx   # BaseRangeChart draws the dotted forward projection; ForwardProjection/LaneBreaks/VarTrendBadge = VAR-as-forecast UI; BehaviorMap (2-axis freq×size map) / BehaviorProfile (presence/size split + stats panel + window toggle) / DailyBars (daily presence+size bars) = the presence-aware behavioral profile UI
     components/demand/{DemandForecastChart,BurnDownChart}.tsx

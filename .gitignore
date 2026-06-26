@@ -24,3 +24,7 @@ node_modules/
 .DS_Store
 .idea/
 .vscode/
+
+# Real customer book inputs (sensitive: real names/volumes; large) — dropped into sample_data/deals/
+# by the operator and read by the repeatable loaders. Never committed.
+backend/sample_data/deals/
