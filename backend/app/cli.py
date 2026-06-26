@@ -133,6 +133,50 @@ def margin_main() -> None:
     print(json.dumps(rep, indent=2, default=str))
 
 
+def load_barges_main() -> None:
+    """Load barge discharges (inbound supply) from the Trips report into the position store.
+
+    Repeatable & idempotent. Volumes are read in BARRELS and converted to gallons (×42) exactly once.
+    Feeds the Phase-7 position / days-of-cover engine (supply vs. lifts).
+    """
+    from datetime import datetime, timezone
+
+    from . import barges
+    repo_root = Path(__file__).resolve().parent.parent
+    ap = argparse.ArgumentParser(prog="rackiq-load-barges",
+                                 description="Load the barge Trips report (inbound supply) → barge_discharges.")
+    ap.add_argument("--dir", default=str(repo_root / "sample_data" / "deals"),
+                    help="Directory holding the Trips report (*trip*.xls/.xlsx/.csv).")
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=False)
+    try:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        report = barges.load_barges_dir(con, args.dir, now)
+        if report["stores"]["barge_discharges"]:
+            db.set_meta(con, "last_barge_import_at", now)
+    finally:
+        con.close()
+    print(json.dumps(report, indent=2, default=str))
+
+
+def position_main() -> None:
+    """Print the Phase-7 position / days-of-cover readout on the loaded book (validated on synthetic)."""
+    from . import hedging
+    ap = argparse.ArgumentParser(prog="rackiq-position",
+                                 description="Per terminal×product net position + days-of-cover + barge-cure.")
+    ap.add_argument("--terminal", default=None)
+    ap.add_argument("--product", default=None)
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=False)
+    try:
+        rep = hedging.compute_position(con, terminal=args.terminal, product=args.product)
+    finally:
+        con.close()
+    print(json.dumps(rep, indent=2, default=str))
+
+
 def variability_main() -> None:
     """Print the two-axis variability validation readout (the real-book gate)."""
     from . import variability
