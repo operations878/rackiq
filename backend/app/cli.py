@@ -192,6 +192,21 @@ def variability_main() -> None:
     print(json.dumps(rep, indent=2, default=str))
 
 
+def opportunity_main() -> None:
+    """Print the Phase-6 modeled missing-volume / opportunity validation readout (the gut-check)."""
+    from . import opportunity
+    ap = argparse.ArgumentParser(prog="rackiq-opportunity",
+                                 description="Modeled missing-volume / opportunity readout (peak ≈ wallet).")
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=False)
+    try:
+        rep = opportunity.validation_readout(con)
+    finally:
+        con.close()
+    print(json.dumps(rep, indent=2, default=str))
+
+
 def load_hdd_main() -> None:
     """Load an HDD workbook (the 'HDD'S' sheet) into the re-uploadable weather store. Idempotent."""
     from datetime import datetime, timezone

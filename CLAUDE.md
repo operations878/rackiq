@@ -653,6 +653,47 @@ The full written modeling decision lives in **`docs/margin/MODELING_DECISION.md`
   canonical field matrix (its sell/cost stores aren't canonical fields). CLI: **`rackiq-load-prices`**
   (load the grid + Trips) and **`rackiq-margin`** (print the readout).
 
+## Missing volume & opportunity (Phase 6) — peak ≈ wallet · winnability · three rankings
+
+`backend/app/opportunity.py` (engine, `OpportunityConfig`) estimates, per **master customer × product
+family**, the GAP between what a customer *could* pull from us and what they actually pull — the **real
+modeled engine** the convergence layer's INTERIM opportunity tile (which rides the channel-mismatch
+volume in `api/profile._opportunity`) will later swap to. A SCORING-side layer that **reuses, never
+re-derives**: the Phase-1 two-axis **quadrant + channel** (`variability`), the heating-fuel **β·HDD
+residual** (`weather_model`), and the Phase-2 **margin ¢/gal** (`margin`). Gallons are canonical (no
+barrels). Master-keyed (ids already resolved at commit). Backend/API only — no frontend page.
+
+> **PREMISE — surfaced everywhere, never presented as fact:** True demand ≈ a customer's
+> weather-normalized PEAK with us ("peak ≈ wallet"). Every output is labelled **MODELED**, not measured.
+
+- **True-demand proxy** (per customer × family). On **ACTIVE days only** (never zero-diluted — that was
+  the all-spot bug), take the **top decile** of highest-volume days (floored to 2 for thin lifters so an
+  ~18-lift account still yields a *guarded* read, capped for frequent ones), **weather-adjust** them with
+  `weather_model.adjusted_sizes` (the re-centred β·HDD residual — a cold-snap peak doesn't overstate true
+  demand; heating families `ULSHO/HO4` only, others kept raw), and average → the proxy.
+- **Gap.** Actual = the normal weather-adjusted average active-day volume; gap = proxy − actual, scaled
+  per active day and **annualized** (per family AND total). A typical day within `min_gap_frac` of the
+  peak (0.30, or 0.38 for a consistent-size account where the spread is mostly sampling noise) is the
+  **NOISE FLOOR** — below it we claim no missing volume (keeps a steady metronome from phantom upside).
+- **Winnability** (the load-bearing judgment) — `0–100` = `0.5·trend_freshness + 0.5·peak_freshness`,
+  splitting **shrunk** (declining **year-over-year** — seasonally fair — AND a stale peak: the wallet
+  really shrank → down-weighted, *never silently suppressed*; the facet says "looks shrunk, not winnable")
+  from **under-served** (steady/growing but consistently below their own weather-adjusted peak → the real
+  upside). A flag + plain reason come out; **low confidence FLAGS** (provisional), never changes the call.
+- **Three independent rankings:** (1) raw **gallons** (size of gap), (2) **gap × margin** (dollar value;
+  margin is **ranking-only**, honors whatever basis the margin engine reports incl. lift-price fallback,
+  **never flips a channel**), (3) **gap × winnability** (realistic). Each row is **tagged spot/rack** via
+  the reused quadrant. Anchored to the **data date** (not `today`) so a uniformly-stale book doesn't make
+  everyone look shrunk.
+- **Facet-ready.** Each customer carries a `facet` that is a **drop-in superset** of the interim
+  `api/profile._opportunity` shape (`available · kind · winnable_gal_per_yr · winnable_dollars_per_yr ·
+  chase_channel · note · interim_note · …`) so the fan-out can pull it and the interim tile can swap data
+  source without a redesign; `opportunity.facets_by_master` returns `{master_id: facet}` for that pull.
+- **Validated on SYNTHETIC data** (real Excel is local-only): gut-checks **FuelExpress Retail** (steady
+  metronome → *near-peak, no winnable upside*) and **Narragansett Marine Fuels** (18 lifts → *Low-
+  confidence, flagged, not suppressed*). Real-book confirmation (Rastall / Super Quality / Van Varick) is
+  a separate local run. CLI **`rackiq-opportunity`**; validation gate at `GET /api/opportunity/validation`.
+
 ## API endpoints
 
 All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
@@ -720,6 +761,9 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/margin/gap?terminal=&product=&quantity=` | the **margin-priced gap helper** — \$ margin at stake for a demand quantity, split **committed/must-serve** vs **spot upside** (the contract Phase-3's hedge calls in-process via `margin.margin_for_gap`) |
 | `GET /api/margin/config` · `POST /api/margin/recompute` | the margin config (cost-basis window, units heuristics, plausibility gate, term basis assumption) · recompute with `{overrides, window, terminal}` (busts the cache) |
 | `POST /api/margin/upload` (multipart) · `GET /api/margin/unmapped-customers` · `POST /api/margin/load-samples` | re-uploadable **price/cost** source (kind=prices\|trips, auto-detected, idempotent) · raw grid customer names not yet mapped to a master · load the bundled wholesale grid + Trips report |
+| `GET /api/opportunity` | the **Phase-6 modeled missing-volume layer**: per master customer **total + per-product** demand gap (peak ≈ wallet, MODELED), the **winnability** score/flag + reason (shrunk vs under-served), the **spot/rack tag** (reused quadrant), **three rankings** (raw gallons · gap × margin · gap × winnability), a per-customer **facet** (drop-in for the interim opportunity tile), + the premise/margin/weather honesty blocks |
+| `GET /api/opportunity/rankings` · `GET /api/opportunity/validation` | the three ranked worklists + headline summary (lighter payload) · the gut-check gate (synthetic-honest; real-book is a separate local run) |
+| `GET /api/opportunity/customer/{id}` · `GET /api/opportunity/config` | one customer's full modeled gap + per-product breakdown + winnability + headline · the opportunity config (top-decile/floor, noise floor, winnability weights, trend/stale thresholds) |
 
 Interactive docs at `http://localhost:8000/docs`.
 
@@ -1086,6 +1130,7 @@ uv run rackiq-load-prices                 # load the Phase-2 price/cost book: wh
 uv run rackiq-margin                      # print the margin readout (coverage, plausibility, deal-type
                                           #   margins, forward mark-to-market) — ranks the book by VALUE
 uv run rackiq-variability                 # print the two-axis variability + spot/rack validation readout (the real-book gate)
+uv run rackiq-opportunity                 # print the Phase-6 modeled missing-volume / opportunity readout (peak ≈ wallet; gut-checks the exemplars)
 uv run rackiq-load-hdd [file]             # load the HDD book (the "HDD'S" sheet) into the re-uploadable weather store
 uv run rackiq-weather                     # print the Stage-1 weather readout (station coverage, HDD→demand β/OOS, anchor, raw-vs-adjusted size axis)
 uv run rackiq-load-barges                 # load the barge Trips report (inbound supply) → barge_discharges (barrels→gal ×42 once, idempotent)
@@ -1144,6 +1189,7 @@ backend/
     pricegrid.py            # ★ Phase-2 price/cost ingestion: format-aware parsers (Matrix concat keys, per-terminal multi-row headers, Benchmarks diffs, Trips barge landed cost — barrels→gal, mb heuristic, cargo-flat sanity gate) → idempotent price_grid / landed_costs / price_differentials stores (survive reset like deals); crosswalk + product-family resolution
     margin.py               # ★ Phase-2 margin engine (reads deals+lifts+pricegrid; never imports hedging): per-lift BOOK & REPLACEMENT margin w/ sell/cost provenance, deal-type margins (term flat-cancel / forward locked−landed / spot realized−landed), value-vs-volume roll-ups, forward mark-to-market, margin_for_gap (committed vs spot — the P3 contract), coverage + plausibility gate
     margin_config.py        # ★ MarginConfig — cost-basis window, units/mb + cargo-flat heuristics, plausibility gate (¢/gal), term basis assumption, Matrix product prefixes as parameters
+    opportunity.py          # ★ Phase-6 modeled missing-volume engine (OpportunityConfig; reuses variability quadrant + weather_model β·HDD residual + margin, never re-derives): per customer×family true-demand proxy (top-decile ACTIVE days, weather-adjusted; peak ≈ wallet, MODELED) → gap (noise-floored, annualized) → winnability (shrunk=down+stale-peak YoY vs under-served; low-conf flagged not suppressed) → three rankings (gallons / gap×margin / gap×winnability) + spot-rack tag + drop-in facet (facets_by_master); validation_readout gut-checks the exemplars
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping (BOL/EDI aliases, 2-tier threshold), inspect (+profiling), validate, coerce (mixed + Excel-serial dates)
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -1151,7 +1197,7 @@ backend/
     validation.py           # rule engine: required-only gating (+ EDI-control-row junk), negatives-as-corrections, drill-down + quarantine index
     hygiene.py              # configurable cleaning pipeline (HygieneOptions, apply_fixes, group_by_bol, ASTM D1250 vcf)
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
-    cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook / -load-realbook / -load-prices / -margin / -variability / -load-barges / -position
+    cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook / -load-realbook / -load-prices / -margin / -variability / -opportunity / -load-barges / -position
     config.py               # settings (db path, CORS, host/port)
     main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + pricing + calendar + hedging + deals + variability + margin routers)
     api/{routes,queries}.py # read endpoints + SQL
@@ -1167,8 +1213,9 @@ backend/
     api/weather.py          # /api/weather/hdd/* (re-uploadable HDD source: upload/summary/load-samples) + /api/weather (Stage-1 model readout: coverage/β/OOS/anchor/axis adjustment, cached)
     api/deals.py            # /api/deals/* deal-book Data Studio source (upload/idempotent) + crosswalk bridge (summary / bridge / confirm / load-samples)
     api/margin.py           # /api/margin/* Phase-2 margin layer (value ranking, deal-type margins, forward MTM, gap helper, coverage) + the re-uploadable price/cost source (cached per data-sig/window/terminal)
+    api/opportunity.py      # /api/opportunity/* Phase-6 modeled missing-volume layer (per customer×family gap, winnability, spot/rack tag, three rankings, drop-in facet) / rankings / validation / customer / config (cached per lifts+deals+prices+weather+day signature)
     api/position.py         # /api/position/* Phase-7 net position & days-of-cover (gauge-vs-proxy, working-day cover, nominate-a-barge cure, facet-ready) + summary/config/recompute + the re-uploadable Trips supply source (cached per data-sig/terminal/product)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability + test_pricegrid + test_margin + test_weather_hdd + test_weather_model + test_position
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability + test_pricegrid + test_margin + test_weather_hdd + test_weather_model + test_position + test_opportunity
   sample_data/deals/        # (gitignored) the operator's real book: account_reference_chart.xlsx, *bols*.csv, deal workbooks, 1__Wholesale_Prices___Costs_V1.xlsx, Trips report — read by the repeatable loaders
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
@@ -1250,6 +1297,22 @@ CLAUDE.md
   surfaced as an assumption, never silently absorbed. `margin_for_gap` is the one-way **hedge → margin**
   contract (margin never imports hedging), so Phase-3 can price a demand gap (committed/must-serve vs
   spot upside) without a circular import. The price/cost stores survive reset/demo like `deals`.
+- **Phase-6 opportunity is a MODELED PROXY (peak ≈ wallet), surfaced as a premise, never as fact —
+  and it REUSES, never re-derives.** `opportunity.py` is a one-way SCORING-side consumer of the Phase-1
+  quadrant/channel (`variability` → the spot/rack tag), the heating-fuel β·HDD residual (`weather_model`
+  → the peak adjustment) and the Phase-2 margin ¢/gal (`margin` → the dollar rank); none of them import
+  it (acyclic). The true-demand proxy is the **top decile of ACTIVE days, weather-adjusted** — never
+  zero-diluted (zero-dilution was the all-spot bug), floored to 2 for thin lifters, capped for frequent
+  ones. The **noise floor** (`min_gap_frac` 0.30, 0.38 for consistent-size accounts where the peak-vs-mean
+  spread is mostly sampling noise) is what keeps a steady metronome showing **no phantom upside** — the
+  FuelExpress gut-check. **Winnability** splits *shrunk* (declining **year-over-year** — seasonally fair —
+  AND a stale peak → down-weighted, never silently zeroed) from *under-served*; **low confidence FLAGS
+  (provisional), never suppresses** — the Narragansett gut-check. **Margin is RANKING-ONLY and never flips
+  the channel** (the tag is the reused quadrant's). Trend/staleness anchor to the **data date**, not
+  `today`, so a uniformly-stale book doesn't make everyone look shrunk. Gallons are canonical (no barrels).
+  The per-customer `facet` is a **drop-in superset of `api/profile._opportunity`** so the interim
+  channel-mismatch tile swaps to this engine as a data-source change, not a redesign. **Validated on
+  SYNTHETIC data only** — real-book confirmation is a separate local run.
 - **The VAR statistics layer is diagnostics only — the headline score is frozen.** Components,
   base/variability ranges, cadence lane, steadiness-trend test, plain-English read, and the advanced
   diagnostics (forecastability, predictability skill, Mann–Kendall, residual white-noise, bootstrap
