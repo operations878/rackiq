@@ -16,6 +16,7 @@ import DataCapabilityPanel from "../components/DataCapabilityPanel";
 import Stepper from "../components/studio/Stepper";
 import QuickFeeds from "../components/studio/QuickFeeds";
 import NameMapPanel from "../components/studio/NameMapPanel";
+import SpecialSources from "../components/studio/SpecialSources";
 import ProductMapPanel from "../components/studio/ProductMapPanel";
 import UploadStep from "../components/studio/UploadStep";
 import MappingStep from "../components/studio/MappingStep";
@@ -268,6 +269,9 @@ export default function DataStudio({
           </Panel>
           <Panel>
             <ProductMapPanel onState={onState} />
+          </Panel>
+          <Panel>
+            <SpecialSources />
           </Panel>
           <Panel>
             <QuickFeeds summary={summary} onState={onState} />

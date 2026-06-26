@@ -18,6 +18,7 @@ from .api.routes import router
 from .api.scores import router as scores_router
 from .api.studio import router as studio_router
 from .api.variability import router as variability_router
+from .api.weather import router as weather_router
 from .config import settings
 
 
@@ -42,6 +43,7 @@ def create_app() -> FastAPI:
     app.include_router(deals_router)
     app.include_router(variability_router)
     app.include_router(margin_router)
+    app.include_router(weather_router)
 
     @app.get("/")
     def root():

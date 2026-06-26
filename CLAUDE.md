@@ -568,6 +568,36 @@ upsert (scope-replace on (source, month); dedupe on the stable `deal_key` = cust
 month×source×deal_date). Product families via `product_family()` (ULSD/ULSHO/DYED/HO4/RD; blend
 numbers like B5/B10/B20/B99 are a sub-attribute, NOT a separate family; **"GEC 10"/"GEC 20" → GEC**).
 
+### Weather + spot/rack rebuild (heating-fuel variability)
+
+**The 2×2 is read off the two SCORES, not the frequency class — and that was the all-spot bug.** The
+timing axis used the behavioral `frequency_class` (active-day RATE over all working days, zeros
+included), so on a real book where customers lift weekly/biweekly NOBODY cleared "frequent" → every
+regular lifter bunched into the infrequent rows → spot. The fix: build the quadrant on
+`regular_timing = cadence_consistency ≥ cadence_regular_cutoff` (60) × `consistent_size = size ≥
+size_consistent_cutoff` (65) — both `VariabilityConfig` params. A perfectly regular lifter earns ~72
+from the regularity term alone, so it's a metronome at ANY frequency. Quadrants →
+metronome/predictable_timing/predictable_size/unpredictable → **channel** (rack/term vs spot). Don't
+revert the timing axis to a frequency measure.
+
+**Channel is set by quadrant + confidence ONLY — margin is a ranking note that NEVER moves a channel.**
+`variability.channel_recommendation` reads `recommended_channel` straight off the quadrant; the
+`confidence` tier (High ≥200 lifts/365 d · Medium ≥100 lifts/180 d · else Low) only flags a rec as
+`provisional` (low-confidence accounts are STILL recommended, never suppressed). The Phase-2 margin
+rank attaches a `margin_note` where margin and channel are in tension; `validation_readout.margin_audit`
+asserts `channels_flipped_by_margin == 0`. The **current channel** comes from the deal book
+(term/forward = contract, spot, mixed); the current-vs-recommended **mismatch** is the headline.
+
+**Heating-fuel SIZE axis is measured on the HDD residual (`weather_model.py`).** For ULSHO/#2/HO4 with
+a stable positive per-lift HDD→size β (its own, else the terminal pool), the size axis uses
+`size − β·(HDD − HDD̄)` — kept ONLY if it lowers the size CV (no over-smoothing; gasoline never
+touched). The β is anchored against **BX HO SOLD** (sign agreement) before it's trusted, and the demand
+β per terminal×heating-product is reported with in-sample R² **and** out-of-sample vs weather-blind. HDD
+comes from the uploaded `weather_hdd` for a terminal's OWN station (**modeled**) or the Open-Meteo/
+climatology proxy (**proxy**) — **LGA is never cross-applied to Baltimore**. Forward HDD is a Normal/
+5-yr baseline seam labelled `is_live:false` (swappable for a live NOAA/CPC feed). Weather **must settle
+the size axis before** spot/rack reads it (the build order is load-bearing).
+
 **The join is the whole ball game.** `backend/app/bookload.py` loads the **Account Reference Chart**
 (`raw BOL account → coded master`) as the customer crosswalk, the raw **BOLs** into `lifts` (group
 compartments by BOL → one lift, sum gross+net, drop 0/0/0 control rows, **Ship Date**, product→family,
@@ -675,9 +705,11 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/calendar/config` · `POST /api/calendar/recompute` | the calendar config (holiday country/subdiv, Saturday default/min-obs, weights) · recompute with `{overrides}` |
 | `GET /api/hedging?terminal=&window=&service_level=` | the **operational demand-hedging readout** (Phase 2): per-terminal expected demand band (P10/P50/P90) over the next 3 & 5 **working** days, the FLOOR vs UPSIDE split, the **behavior-aware dynamic buffer** (statistical safety + overdue-burst coil), the risk watch-list, the morning readout, and the operational customer view (honest "inventory not connected" note when absent) |
 | `GET /api/hedging/overview` · `GET /api/hedging/config` · `POST /api/hedging/recompute` | every terminal's readout (shared scoring) · the hedging config · recompute with `{overrides, window, terminal, service_level}` |
-| `GET /api/variability` | the **two-axis variability score** per master: **cadence consistency** + **size consistency** (separate), the frequency×size **2×2** quadrant, the commitment **annotation**, and per-axis distributions + coverage |
-| `GET /api/variability/validation` | the **real-book validation gate**: both axis histograms + spread verdict, named-account 2×2 gut check, the split proof, annotation sanity, conformance anomalies, coverage, and the deal-book→master bridge match rate |
-| `GET /api/variability/customer/{id}` · `GET /api/variability/config` | one customer's two axes + full behavioral drill-down (all windows + daily bars) · the variability config |
+| `GET /api/variability` | the **two-axis variability score** + the **rebuilt spot/rack channel rec** per master: **cadence consistency** + **size consistency** (separate; size weather-adjusted for heating fuels), the regularity×size **2×2** quadrant, the **recommended channel** (rack/term vs spot — set by quadrant + confidence ONLY), the **confidence tier** (High/Med/Low; low = provisional, never suppressed), the **current channel** (from the deal book) + **mismatch**, a **margin ranking note** (never moves a channel), the commitment **annotation**, `channel_summary`, `mismatches`, and per-axis distributions + coverage |
+| `GET /api/variability/validation` | the **real-book validation gate**: both axis histograms + spread verdict, the **all-spot fix proof** (post-fix quadrant spread), the **four-quadrant walk** (one named account per quadrant, end-to-end), confidence distribution + a low-confidence exemplar, the **channel mismatch** headline, the **margin-never-flipped audit**, the weather raw-vs-adjusted summary, annotation sanity, coverage, and the deal-book→master bridge match rate |
+| `GET /api/variability/customer/{id}` · `GET /api/variability/config` | one customer's two axes + channel rec + full behavioral drill-down (all windows + daily bars) · the variability config |
+| `GET /api/weather` | the **Stage-1 weather model**: station coverage (modeled/proxy), per terminal×heating-product **HDD→demand β** + baseload + R² + **out-of-sample** vs weather-blind, the **BX HO SOLD anchor** agreement, and the **raw-vs-weather-adjusted size axis** per heating customer |
+| `GET /api/weather/hdd/summary` · `POST /api/weather/hdd/upload` (multipart) · `POST /api/weather/hdd/load-samples` | re-uploadable **HDD** source (the "HDD'S" sheet → `station × day → HDD` + Normal/5yr/10yr baselines + the BX HO SOLD anchor; empirical header/axis detection; idempotent on station×day) |
 | `GET /api/deals/summary` · `GET /api/deals/bridge` | deal-book row/master counts by source · the **crosswalk bridge** (mapped / fuzzy candidates / unmapped + the committed-volume match rate) |
 | `POST /api/deals/upload` (multipart) · `POST /api/deals/bridge/confirm` · `POST /api/deals/load-samples` | re-uploadable **Deals** source (term/forward/spot, auto-detected, idempotent) · confirm staged bridges (never auto-merged) · load the bundled real book (chart→BOLs→deals) |
 | `GET /api/margin?terminal=&window=` | the **Phase-2 margin layer** (rank by VALUE not volume): per-master **BOOK & REPLACEMENT** margin (¢/gal + $) with the **margin rank vs volume rank** contrast, by product family / terminal, the **deal-type margins** (term flat-cancel / forward locked−landed / spot realized−landed), the **forward mark-to-market**, **coverage** (% of volume with a defensible margin), a **plausibility gate** (¢/gal sanity; the "$1/gal" units bug is flagged), and a **worked one-customer example** (`available:false` + missing sell/cost when locked) |
@@ -1000,7 +1032,9 @@ uv run rackiq-load-prices                 # load the Phase-2 price/cost book: wh
                                           #   1__Wholesale_Prices___Costs_V1.xlsx + the Trips report)
 uv run rackiq-margin                      # print the margin readout (coverage, plausibility, deal-type
                                           #   margins, forward mark-to-market) — ranks the book by VALUE
-uv run rackiq-variability                 # print the two-axis variability validation readout (the real-book gate)
+uv run rackiq-variability                 # print the two-axis variability + spot/rack validation readout (the real-book gate)
+uv run rackiq-load-hdd [file]             # load the HDD book (the "HDD'S" sheet) into the re-uploadable weather store
+uv run rackiq-weather                     # print the Stage-1 weather readout (station coverage, HDD→demand β/OOS, anchor, raw-vs-adjusted size axis)
 uv run pytest                             # run the test suite (units + e2e API flow)
 # rackiq-info  -> print row counts + enabled capability count
 ```
@@ -1036,6 +1070,8 @@ backend/
     scoring_config.py       # ★ ScoringConfig — every weight/threshold/window/forecast param (model selection, backtest, shrinkage, today-anchoring) as a parameter
     calendar_days.py        # ★ working-day calendar (Phase 1): 3 day-types (Sun+US-holiday excluded · Saturday data-driven partial weight per terminal · Mon–Fri full), holidays lib, learns the per-terminal day-of-week rhythm, O(1) working-day counting (CalendarConfig)
     weather.py              # ★ HDD/CDD feed: live NOAA/ERA5 auto-fetch (no key) → weather_daily cache → seasonal proxy fallback (explains lane breaks)
+    weather_hdd.py          # ★ HDD ingestion (Stage 0): the "HDD'S" sheet → weather_hdd (station×day → HDD + Normal/5yr/10yr) + hdd_demand_anchor (BX HO SOLD); empirical header/axis detection (tidy + year-matrix), idempotent upsert, HDD=max(0,65−tmean) verify
+    weather_model.py        # ★ Weather model (Stage 1): station→terminal map (modeled vs proxy, never cross-applies LGA), HDD→demand β per terminal×heating-product (β/baseload/R²/OOS, sign+overfit guard), BX HO SOLD anchor, forward-HDD seam, and the SIZE-AXIS rewrite (per-lift residual after β·HDD; kept only if it lowers CV — no over-smoothing). Heating fuels only
     reconciliation.py       # ★ P8 loss-control engine: book vs physical, BOL-grouped disbursements,
                             #   net-recon cross-check, mechanism split, meter-drift control charts, $loss
     reconciliation_config.py# ★ ReconConfig — control limits / thresholds / period grain as parameters
@@ -1046,7 +1082,7 @@ backend/
     pricing.py              # ★ Pricing Sandbox + Engine (Blueprint I): spread what-if (per-customer vol/margin curves via β, margin-maximizing post), acceptance model (per-segment logistic from quotes + elasticity proxy), GP-maximizing quote price with shadow-price floor
     pricing_config.py       # ★ PricingConfig — spread/price grids, shadow-price schedule, acceptance priors, elasticity-class thresholds as parameters
     hedging.py              # ★ Operational demand-hedging (Phase 2, on the working-day calendar): per-terminal expected band (P10/P50/P90 w/ customer correlation), FLOOR vs UPSIDE, behavior-aware dynamic buffer (statistical safety + overdue-burst coil), risk concentration, morning readout (HedgingConfig)
-    variability.py          # ★ TWO-AXIS variability (Phase-1 score): cadence consistency (working-day gap regularity + presence) × size consistency (raw per-lift CV; weather-adjust SEAM for heating fuels), separate axes + frequency×size 2×2 + commitment annotation; validation_readout (the real-book gate). Reuses behavioral/calendar; never collapses to one grade
+    variability.py          # ★ TWO-AXIS variability + the SPOT/RACK channel rec (Stage 2): cadence consistency (working-day gap regularity) × size consistency (active-day per-lift CV; weather-adjusted for heating fuels via weather_model). The 2×2 is read off the two SCORES with regularity cutoffs (FIXES the all-spot bug: timing was frequency, not regularity) → metronome/predictable_timing/predictable_size/unpredictable → channel (rack/term vs spot, set by quadrant + confidence ONLY). Confidence tier (lift count+span; low=provisional, never suppressed); current-vs-recommended mismatch (from the deal book); margin = ranking note only (audited, never flips a channel). validation_readout = the real-book gate
     dealbook.py             # ★ Deal-book parsers + canonical deals table: product_family() normalization (blends are product not identity, GEC 10/20→GEC), three format-aware parsers (term pivot / forward-fixed Active-Deals / spot monthly), stable deal_key, crosswalk bridge_candidates + confirm_bridge (propose, never auto-merge)
     bookload.py             # ★ Repeatable real-book loaders: Account Reference Chart → crosswalk, raw BOLs → lifts (group-by-BOL, drop 0/0/0, Ship Date, product→family, consignee→master), deal book → deals (idempotent); multi-year BOL concat; load_real_book one-shot
     pricegrid.py            # ★ Phase-2 price/cost ingestion: format-aware parsers (Matrix concat keys, per-terminal multi-row headers, Benchmarks diffs, Trips barge landed cost — barrels→gal, mb heuristic, cargo-flat sanity gate) → idempotent price_grid / landed_costs / price_differentials stores (survive reset like deals); crosswalk + product-family resolution
@@ -1071,10 +1107,11 @@ backend/
     api/pricing.py          # /api/pricing (sandbox + recommendations) / recommendations / config / recompute (cached base)
     api/calendar.py         # /api/calendar (measured day-of-week rhythm + Saturday weights + exclusions) / config / recompute
     api/hedging.py          # /api/hedging (per-terminal staging readout) / overview / config / recompute (heavy scoring cached per data/window/day)
-    api/variability.py      # /api/variability (two-axis score) / validation (the real-book gate) / customer / config (cached per data+deal signature)
+    api/variability.py      # /api/variability (two-axis score + spot/rack channel rec) / validation (the real-book gate) / customer / config (cached per data+deal signature)
+    api/weather.py          # /api/weather/hdd/* (re-uploadable HDD source: upload/summary/load-samples) + /api/weather (Stage-1 model readout: coverage/β/OOS/anchor/axis adjustment, cached)
     api/deals.py            # /api/deals/* deal-book Data Studio source (upload/idempotent) + crosswalk bridge (summary / bridge / confirm / load-samples)
     api/margin.py           # /api/margin/* Phase-2 margin layer (value ranking, deal-type margins, forward MTM, gap helper, coverage) + the re-uploadable price/cost source (cached per data-sig/window/terminal)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability + test_pricegrid + test_margin
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability + test_pricegrid + test_margin + test_weather_hdd + test_weather_model
   sample_data/deals/        # (gitignored) the operator's real book: account_reference_chart.xlsx, *bols*.csv, deal workbooks, 1__Wholesale_Prices___Costs_V1.xlsx, Trips report — read by the repeatable loaders
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
