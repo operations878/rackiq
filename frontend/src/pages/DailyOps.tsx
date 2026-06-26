@@ -210,7 +210,7 @@ export default function DailyOps({
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         {data.panels.map((p) => (
-          <PanelCard key={p.key} panel={p} onSelect={(id) => navigate(`scorecard/${id}`)} />
+          <PanelCard key={p.key} panel={p} onSelect={(id) => navigate(`scorecard/${encodeURIComponent(id)}`)} />
         ))}
       </div>
     </div>

@@ -151,7 +151,7 @@ export default function Customers({ navigate, initialFilter }: {
             <tbody>
               {rows.map((c) => (
                 <tr key={c.customer_id}
-                  onClick={() => navigate(`customer/${c.customer_id}`)}
+                  onClick={() => navigate(`customer/${encodeURIComponent(c.customer_id)}`)}
                   className="cursor-pointer border-b border-slate-100 last:border-0 hover:bg-indigo-50/40">
                   {/* customer */}
                   <td className="px-3 py-2.5">

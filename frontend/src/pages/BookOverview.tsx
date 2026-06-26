@@ -256,7 +256,7 @@ export default function BookOverview({ summary, navigate }: { summary: Summary; 
           <>
             <DrillDown id={selected} window={window} />
             <div className="mt-3 text-right">
-              <button onClick={() => navigate(`scorecard/${selected}`)} className="text-xs font-medium text-indigo-600 hover:underline">
+              <button onClick={() => navigate(`scorecard/${encodeURIComponent(selected)}`)} className="text-xs font-medium text-indigo-600 hover:underline">
                 Open full scorecard →
               </button>
             </div>

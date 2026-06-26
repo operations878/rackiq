@@ -205,7 +205,7 @@ export default function TerminalProfile({ name, navigate }: { name: string; navi
                 </thead>
                 <tbody>
                   {hedge.watch_list.slice(0, 8).map((w) => (
-                    <tr key={w.customer_id} onClick={() => navigate(`customer/${w.customer_id}`)}
+                    <tr key={w.customer_id} onClick={() => navigate(`customer/${encodeURIComponent(w.customer_id)}`)}
                       className="cursor-pointer border-b border-slate-100 last:border-0 hover:bg-indigo-50/40">
                       <td className="px-3 py-2.5 font-medium text-slate-800">
                         {w.name}{w.overdue && <span className="ml-1.5 rounded bg-amber-100 px-1 py-0.5 text-[9px] font-semibold text-amber-700">overdue</span>}

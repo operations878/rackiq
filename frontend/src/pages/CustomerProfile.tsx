@@ -38,7 +38,7 @@ export default function CustomerProfile({ id, navigate }: { id: string; navigate
       .then(setScore).catch(() => setScore(null)).finally(() => setScoreLoading(false));
   }, [id]);
 
-  if (error) return <div className="text-sm text-rose-600">Could not load customer: {error}</div>;
+  if (error) return <LoadError error={error} onBack={() => navigate("customers")} />;
   if (!c) return <LoadingDossier />;
 
   const opp = opportunitySignal(c);
@@ -268,6 +268,26 @@ function LoadingDossier() {
 }
 function ChartSkeleton() {
   return <div className="flex h-72 items-center justify-center rounded-lg bg-slate-50 text-xs text-slate-400">Loading the lane…</div>;
+}
+function LoadError({ error, onBack }: { error: string; onBack: () => void }) {
+  const notFound = /\b404\b/.test(error);
+  return (
+    <div className="mx-auto max-w-2xl py-16 text-center">
+      <h2 className="text-lg font-semibold text-slate-800">
+        {notFound ? "We couldn't find this customer" : "Couldn't load this customer"}
+      </h2>
+      <p className="mt-2 text-sm text-slate-500">
+        {notFound
+          ? "This account isn't in the current book — the link may be stale, or the data was reset since it was opened."
+          : "The backend didn't return this account. Make sure it's running, then try again."}
+      </p>
+      <button onClick={onBack}
+        className="mt-5 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">
+        ← Back to all customers
+      </button>
+      <div className="mt-4 font-mono text-[11px] text-slate-300">{error}</div>
+    </div>
+  );
 }
 function fmt(x: number | string | null | undefined): string {
   if (x == null) return "—";
