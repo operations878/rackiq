@@ -31,6 +31,16 @@ import Radar from "./pages/Radar";
 import Scorecards from "./pages/Scorecards";
 import Playbook from "./pages/Playbook";
 
+// Decode a percent-encoded route segment, falling back to the raw value if it is malformed
+// (a bare "%" makes decodeURIComponent throw) — a broken id should still render, not crash the app.
+function safeDecode(seg: string): string {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg;
+  }
+}
+
 function Centered({ children }: { children: ReactNode }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-50 px-6 text-center text-slate-600">
@@ -157,7 +167,10 @@ export default function App() {
   if (!summary || !caps) return <Centered>Loading RackIQ…</Centered>;
 
   const base = route.split("/")[0];
-  const after = (prefix: string) => (route.startsWith(prefix) ? route.slice(prefix.length) : undefined);
+  // Dynamic segments are percent-encoded when navigated (a customer named "ENERGO LLC" becomes
+  // "customer/ENERGO%20LLC"), so decode them exactly once here — the API client re-encodes the id
+  // before the request. Guarded so a stray "%" in a name can never throw and blank the page.
+  const after = (prefix: string) => (route.startsWith(prefix) ? safeDecode(route.slice(prefix.length)) : undefined);
   const customerId = after("customer/");
   const terminalName = after("terminal/");
   const scorecardId = after("scorecard/");
@@ -196,7 +209,7 @@ export default function App() {
         {base === "customers" && <Customers navigate={navigate} />}
         {base === "customer" && customerId && <CustomerProfile id={customerId} navigate={navigate} />}
         {base === "terminals" && <Terminals navigate={navigate} />}
-        {base === "terminal" && terminalName && <TerminalProfile name={decodeURIComponent(terminalName)} navigate={navigate} />}
+        {base === "terminal" && terminalName && <TerminalProfile name={terminalName} navigate={navigate} />}
         {base === "opportunity" && <Opportunity navigate={navigate} />}
         {base === "data" && <DataSources navigate={navigate} />}
         {base === "glossary" && <Glossary />}
