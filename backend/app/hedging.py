@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from . import calendar_days, db, demand, scoring
+from . import barges, calendar_days, db, dealbook, demand, scoring
 from .scoring_config import DEFAULT_CONFIG as SCORING_DEFAULT
 from .scoring_config import WINDOWS
 
@@ -485,3 +485,402 @@ def all_terminals(con, window: str = "all", service_level: float | None = None,
     return {"window": window, "as_of": score_res.get("as_of"),
             "forecast_anchor": score_res.get("forecast_anchor"),
             "terminals": [t for t in terminals if t], "readouts": out}
+
+
+# ============================================================================
+# Phase 7 — Position / days-of-cover engine
+# ----------------------------------------------------------------------------
+# A per-terminal × per-product (family) running net position and days-of-cover that reconciles
+# INBOUND barge supply against OUTBOUND lifts, with a "nominate a barge" cure when cover runs short.
+# This is a self-contained section: it reads barge_discharges (Trips supply, gallons already), the
+# canonical receipts / inventory_snapshots, and lifts — it does NOT touch the scoring chain.
+#
+# UNITS: every volume here is GALLONS. The only barrels→gallons (×42) conversion lives in
+# barges.parse_trips_supply (delivered_gallons is already gallons); this engine never re-multiplies.
+# The barge NOMINATION is expressed back in barrels (gallons ÷ 42) because barges are nominated in bbl.
+#
+# TWO MODES, always honestly labeled:
+#   • GAUGE-ANCHORED ("verified") — a terminal-verified physical_inventory snapshot exists, so
+#       position = gauge_level + inbound_since − outbound_since. A TRUE tank level.
+#   • NET-FLOW PROXY — no gauge, so position = cumulative inbound − outbound since start of data.
+#       A FLOW DELTA, not a tank level (opening stock isn't in the flow) — labeled as such everywhere.
+# Days-of-cover is counted in WORKING days (the Phase-1 calendar): position ÷ avg outbound per
+# working day over a trailing window (the window is exposed).
+# ============================================================================
+GALLONS_PER_BARREL = 42.0
+
+
+@dataclass(frozen=True)
+class PositionConfig:
+    cover_lookback_days: int = 45             # trailing CALENDAR span for the burn-rate average
+    target_cover_working_days: float = 10.0   # cover we want to hold (the cure restores this)
+    reorder_cover_working_days: float = 3.0   # nominate-by lead time + the hard "short" floor
+    short_cover_working_days: float = 7.0     # cover below this ⇒ short (cure fires)
+    watch_cover_working_days: float = 12.0    # cover below this ⇒ "watch" (amber) tile
+    planning_horizon_working_days: float = 14.0  # how far ahead a drawdown counts as "trending short"
+    min_window_outbound_gallons: float = 1.0  # trailing outbound below this ⇒ no burn rate / cover
+    trend_band_frac: float = 0.05             # |net flow/day| within this × burn ⇒ "balanced"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def with_overrides(self, overrides: dict | None) -> "PositionConfig":
+        if not overrides:
+            return self
+        known = set(self.__dataclass_fields__)  # type: ignore[attr-defined]
+        return replace(self, **{k: v for k, v in overrides.items() if k in known})
+
+
+DEFAULT_POSITION_CONFIG = PositionConfig()
+
+
+def _fmt_cover(c) -> str:
+    if c is None:
+        return "—"
+    return f"{round(c)}" if c >= 10 else f"{c:.1f}"
+
+
+def _norm_terminal(x) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s or None
+
+
+def _cell_flows(df: pd.DataFrame | None, date_col: str, gal_col: str) -> dict:
+    """Group a flow frame into ``{(terminal, product_family): (sorted dates ndarray, gallons ndarray)}``.
+
+    Terminal is trimmed; product is normalized to a canonical family so inbound (barge/receipt) and
+    outbound (lift) join on the same product key. Rows missing terminal/family/date/gallons are
+    dropped (they can't be placed on a tank's ledger)."""
+    if df is None or not len(df):
+        return {}
+    df = df.copy()
+    df["_t"] = df["terminal"].map(_norm_terminal)
+    prods = [p for p in df["product"].dropna().unique()]
+    fam_map = {p: dealbook.product_family(p) for p in prods}
+    df["_f"] = df["product"].map(lambda p: fam_map.get(p) if p is not None else None)
+    df["_d"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+    df["_g"] = pd.to_numeric(df[gal_col], errors="coerce")
+    df = df.dropna(subset=["_t", "_f", "_d", "_g"])
+    out: dict = {}
+    for (t, f), g in df.groupby(["_t", "_f"]):
+        gg = g.sort_values("_d")
+        out[(t, f)] = (gg["_d"].to_numpy(), gg["_g"].to_numpy(dtype=float))
+    return out
+
+
+def _sum_after(dates, gals, lo, hi) -> float:
+    """Sum gallons for dates in (lo, hi] (lo exclusive, hi inclusive). lo/hi are pd.Timestamp or None."""
+    if not len(dates):
+        return 0.0
+    mask = np.ones(len(dates), dtype=bool)
+    if lo is not None:
+        mask &= dates > np.datetime64(lo)
+    if hi is not None:
+        mask &= dates <= np.datetime64(hi)
+    return float(gals[mask].sum())
+
+
+def _sum_within(dates, gals, lo, hi) -> float:
+    """Sum gallons for dates in [lo, hi] (both inclusive)."""
+    if not len(dates):
+        return 0.0
+    mask = (dates >= np.datetime64(lo)) & (dates <= np.datetime64(hi))
+    return float(gals[mask].sum())
+
+
+def _outbound_flows(con) -> dict:
+    df = con.execute(
+        "SELECT terminal, product, lift_datetime, net_gallons FROM lifts "
+        "WHERE lift_datetime IS NOT NULL").df()
+    return _cell_flows(df, "lift_datetime", "net_gallons")
+
+
+def _inbound_flows(con) -> tuple[dict, str | None, str | None]:
+    """Inbound supply, source-aware. Priority: Trips barge_discharges (real book) → canonical receipts
+    → inventory_snapshots.receipts. Returns (cells, source_key, source_label)."""
+    barges.ensure_tables(con)
+    if int(con.execute("SELECT count(*) FROM barge_discharges").fetchone()[0]) > 0:
+        df = con.execute(
+            "SELECT terminal, product_family AS product, discharge_date, delivered_gallons "
+            "FROM barge_discharges WHERE delivered_gallons IS NOT NULL").df()
+        return (_cell_flows(df, "discharge_date", "delivered_gallons"),
+                "trips_barges", "Trips barge discharges (delivered gallons, bbl×42)")
+    if db.row_count(con, "receipts") > 0:
+        df = con.execute(
+            "SELECT terminal, product, receipt_datetime, "
+            "       coalesce(receipt_net_gallons, receipt_gross_gallons) AS gal "
+            "FROM receipts WHERE receipt_datetime IS NOT NULL").df()
+        if df["gal"].notna().any():
+            return (_cell_flows(df, "receipt_datetime", "gal"),
+                    "receipts", "Receipt detail (net gallons, canonical)")
+    if db.row_count(con, "inventory_snapshots") > 0:
+        df = con.execute(
+            "SELECT terminal, product, snapshot_datetime, receipts AS gal "
+            "FROM inventory_snapshots WHERE receipts IS NOT NULL AND receipts > 0").df()
+        if len(df):
+            return (_cell_flows(df, "snapshot_datetime", "gal"),
+                    "inventory_receipts", "Inventory snapshot receipts (gallons)")
+    return {}, None, None
+
+
+def _gauge_anchors(con) -> dict:
+    """Latest terminal-verified physical gauge per (terminal, family): {(t,f): {date, level}}."""
+    if db.row_count(con, "inventory_snapshots") == 0:
+        return {}
+    df = con.execute(
+        "SELECT terminal, product, snapshot_datetime, physical_inventory FROM inventory_snapshots "
+        "WHERE physical_inventory IS NOT NULL AND terminal IS NOT NULL AND product IS NOT NULL").df()
+    if not len(df):
+        return {}
+    prods = [p for p in df["product"].dropna().unique()]
+    fam_map = {p: dealbook.product_family(p) for p in prods}
+    df["_t"] = df["terminal"].map(_norm_terminal)
+    df["_f"] = df["product"].map(lambda p: fam_map.get(p) if p is not None else None)
+    df["_d"] = pd.to_datetime(df["snapshot_datetime"], errors="coerce").dt.normalize()
+    df["_p"] = pd.to_numeric(df["physical_inventory"], errors="coerce")
+    df = df.dropna(subset=["_t", "_f", "_d", "_p"])
+    if not len(df):
+        return {}
+    latest = df["_d"] == df.groupby(["_t", "_f"])["_d"].transform("max")
+    out: dict = {}
+    for (t, f), g in df[latest].groupby(["_t", "_f"]):
+        out[(t, f)] = {"date": pd.Timestamp(g["_d"].max()), "level": float(g["_p"].sum())}
+    return out
+
+
+def _max_cell_date(cells: dict):
+    return max((dts.max() for dts, _ in cells.values() if len(dts)), default=None)
+
+
+def _position_cell(cell, out_cell, in_cell, gauge, as_of, cal, pcfg: PositionConfig) -> dict:
+    """One (terminal, family) position record: mode, position, days-of-cover (working days), trend, cure."""
+    terminal, product = cell
+    dts_o, g_o = out_cell
+    dts_i, g_i = in_cell if in_cell is not None else (np.array([], dtype="datetime64[ns]"), np.array([]))
+
+    # ---- position + mode ----
+    if gauge is not None and gauge.get("level") is not None and gauge.get("date") is not None:
+        anchor_date = gauge["date"]
+        anchor_level = gauge["level"]
+        if anchor_date >= as_of:
+            inbound_since = outbound_since = 0.0
+            position = anchor_level
+        else:
+            inbound_since = _sum_after(dts_i, g_i, anchor_date, as_of)
+            outbound_since = _sum_after(dts_o, g_o, anchor_date, as_of)
+            position = anchor_level + inbound_since - outbound_since
+        mode = "gauge"
+        anchor = {"date": str(anchor_date.date()), "level": round(anchor_level, 1),
+                  "inbound_since": round(inbound_since, 1), "outbound_since": round(outbound_since, 1)}
+        start_date = None
+    else:
+        total_in = float(g_i.sum()) if len(g_i) else 0.0
+        total_out = float(g_o.sum()) if len(g_o) else 0.0
+        position = total_in - total_out
+        mode = "proxy"
+        sd = min([d for d in (dts_o.min() if len(dts_o) else None,
+                              dts_i.min() if len(dts_i) else None) if d is not None], default=None)
+        start_date = pd.Timestamp(sd) if sd is not None else None
+        anchor = {"cumulative_inbound": round(total_in, 1), "cumulative_outbound": round(total_out, 1),
+                  "since": str(start_date.date()) if start_date is not None else None}
+
+    # ---- burn rate over a trailing working-day window ----
+    win_start = as_of - pd.Timedelta(days=pcfg.cover_lookback_days - 1)
+    out_window = max(0.0, _sum_within(dts_o, g_o, win_start, as_of))
+    in_window = _sum_within(dts_i, g_i, win_start, as_of)
+    wd_window = cal.window_working_days(win_start, as_of + pd.Timedelta(days=1), terminal)
+    has_burn = out_window >= pcfg.min_window_outbound_gallons and wd_window > 0
+    burn = (out_window / wd_window) if has_burn else None  # gallons per WORKING day
+
+    cover = max(0.0, position / burn) if (burn and burn > 0) else None
+    run_out_date = (str(cal.add_working_days(as_of, cover, terminal).date())
+                    if (cover is not None and position > 0) else None)
+
+    # ---- trend (is the position drawing down toward a shortfall?) ----
+    net_window = in_window - out_window
+    net_per_wd = (net_window / wd_window) if wd_window > 0 else 0.0
+    band = pcfg.trend_band_frac * burn if burn else pcfg.min_window_outbound_gallons
+    direction = "building" if net_per_wd > band else "drawing" if net_per_wd < -band else "balanced"
+    trending_short = False
+    projected_short_date = None
+    if burn and net_per_wd < 0 and cover is not None:
+        reorder_level = pcfg.reorder_cover_working_days * burn
+        wd_to_reorder = max(0.0, (position - reorder_level) / (-net_per_wd))
+        trending_short = wd_to_reorder <= pcfg.planning_horizon_working_days
+        projected_short_date = str(cal.add_working_days(as_of, wd_to_reorder, terminal).date())
+
+    # ---- cure: nominate a barge ----
+    short = bool((cover is not None and cover < pcfg.short_cover_working_days) or trending_short)
+    cure = {"short": short, "target_cover_working_days": pcfg.target_cover_working_days}
+    if burn:
+        target_level = pcfg.target_cover_working_days * burn
+        gallons_short = max(0.0, target_level - position)
+        implied_bbl = gallons_short / GALLONS_PER_BARREL
+        nominate_wd = max(0.0, (cover - pcfg.reorder_cover_working_days)) if cover is not None else 0.0
+        nominate_by = cal.add_working_days(as_of, nominate_wd, terminal)
+        cure.update({
+            "gallons_short": round(gallons_short, 0),
+            "implied_barge_bbl": round(implied_bbl, 0),
+            "nominate_by": str(nominate_by.date()),
+            "to_hold_working_days": pcfg.target_cover_working_days,
+        })
+    else:
+        nominate_by = None
+
+    # ---- plain-English sentence + facet tile ----
+    mode_phrase = "gauge-verified" if mode == "gauge" else "net-flow proxy"
+    if cover is None:
+        sentence = (f"{product} at {terminal}: position ≈ {_gal(position)} gal ({mode_phrase}); "
+                    f"no recent outbound to size days-of-cover.")
+        status = "unknown"
+    else:
+        base = (f"≈ {_fmt_cover(cover)} working {_plural(cover, 'day')} of {product} cover "
+                f"at {terminal}, {mode_phrase}")
+        if short and burn and cure.get("gallons_short", 0) > 0 and nominate_by is not None:
+            sentence = (base + f" — nominate ~{_gal(cure['implied_barge_bbl'])} bbl by "
+                        f"{nominate_by.strftime('%a %b %d')} to hold "
+                        f"{pcfg.target_cover_working_days:g} working days.")
+        else:
+            sentence = base + "."
+        status = ("short" if short else
+                  "watch" if cover < pcfg.watch_cover_working_days else "ok")
+
+    proxy_note = None
+    if mode == "proxy":
+        proxy_note = ("Net-flow proxy: cumulative inbound − outbound"
+                      + (f" since {anchor.get('since')}" if anchor.get("since") else "")
+                      + " — a flow delta, NOT a tank gauge. "
+                      + ("Negative = more lifted than received over the span (opening stock isn't in the "
+                         "flow). " if position < 0 else "")
+                      + "Load a verified inventory snapshot for a true level.")
+
+    return {
+        "terminal": terminal, "product": product,
+        "mode": mode, "mode_label": ("Gauge-anchored (verified tank level)" if mode == "gauge"
+                                     else "Net-flow proxy (flow delta, not a tank level)"),
+        "position_gallons": round(position, 1),
+        "anchor": anchor, "proxy_note": proxy_note,
+        "days_of_cover": round(cover, 2) if cover is not None else None,
+        "burn_gallons_per_working_day": round(burn, 1) if burn else None,
+        "cover_window": {"lookback_days": pcfg.cover_lookback_days,
+                         "from": str(win_start.date()), "to": str(as_of.date()),
+                         "working_days": round(float(wd_window), 2),
+                         "outbound_gallons": round(out_window, 1),
+                         "inbound_gallons": round(in_window, 1)},
+        "run_out_date": run_out_date,
+        "trend": {"direction": direction,
+                  "net_flow_gallons_per_working_day": round(net_per_wd, 1),
+                  "trending_short": trending_short, "projected_short_date": projected_short_date},
+        "cure": cure,
+        "facet": {"headline_gallons": round(position, 1), "headline": f"{_gal(position)} gal",
+                  "mode_label": mode_phrase, "days_of_cover": round(cover, 1) if cover is not None else None,
+                  "status": status, "sentence": sentence},
+        "status": status,
+    }
+
+
+def compute_position(con, terminal: str | None = None, product: str | None = None,
+                     pcfg: PositionConfig | None = None, today=None, cal=None) -> dict:
+    """Per terminal × product running net position + days-of-cover (+ nominate-a-barge cure).
+
+    Validated on SYNTHETIC data (the real Trips .xls is local-only): on the demo ``full`` book the
+    inbound side comes from the canonical ``receipts`` table and the gauge from
+    ``inventory_snapshots.physical_inventory`` — there is no Trips file in the cloud DB. Real-book
+    accuracy is a separate local run."""
+    pcfg = pcfg or DEFAULT_POSITION_CONFIG
+    today_ts = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp(datetime.now()).normalize()
+
+    out_cells = _outbound_flows(con)
+    in_cells, in_source, in_source_label = _inbound_flows(con)
+    gauges = _gauge_anchors(con)
+
+    if cal is None:
+        cal, _ = calendar_days.from_connection(con, calendar_days.DEFAULT_CONFIG)
+
+    availability = {"available": bool(out_cells),
+                    "reason": ("Per terminal×product net position from inbound supply vs. outbound lifts."
+                               if out_cells else
+                               "No outbound lifts with terminal+product loaded — map terminal & product "
+                               "on the lifts import to compute position.")}
+
+    # as-of = the latest data point across outbound / inbound / gauges (the operational "now").
+    as_of = _max_cell_date(out_cells)
+    for cand in (_max_cell_date(in_cells),
+                 max((v["date"] for v in gauges.values()), default=None)):
+        if cand is not None and (as_of is None or cand > as_of):
+            as_of = cand
+    if as_of is not None:
+        as_of = pd.Timestamp(as_of).normalize()
+
+    inbound_block = {
+        "source": in_source, "source_label": in_source_label,
+        "connected": in_source is not None,
+        "note": (in_source_label if in_source is not None else
+                 "No inbound supply loaded — upload the Trips report (or load receipts) to reconcile "
+                 "supply against lifts; until then only outbound burn is known."),
+    }
+
+    base = {
+        "as_of": str(as_of.date()) if as_of is not None else None,
+        "today": str(today_ts.date()),
+        "data_lag_days": int((today_ts - as_of).days) if as_of is not None else None,
+        "recency_note": (None if as_of is None or (today_ts - as_of).days <= 2 else
+                         f"Position is as of the last data date ({as_of.date()}), "
+                         f"{int((today_ts - as_of).days)} days before today — days-of-cover counts forward "
+                         f"from that date."),
+        "inbound": inbound_block,
+        "config": pcfg.to_dict(), "availability": availability,
+        "working_day_note": "Days-of-cover is counted in WORKING days (Sun/holidays excluded, "
+                            "Saturday a data-driven partial weight).",
+    }
+
+    if not out_cells or as_of is None:
+        return {**base, "positions": [], "facets": [], "terminals": [], "products": [],
+                "summary": {"n_cells": 0}}
+
+    # filter cells by terminal / product (product accepts a raw label or a family)
+    want_term = _norm_terminal(terminal)
+    want_fam = None
+    if product is not None:
+        want_fam = product if product in dealbook.FAMILIES else dealbook.product_family(product)
+
+    records = []
+    for cell in sorted(out_cells.keys()):
+        t, f = cell
+        if want_term is not None and t != want_term:
+            continue
+        if want_fam is not None and f != want_fam:
+            continue
+        records.append(_position_cell(cell, out_cells[cell], in_cells.get(cell),
+                                      gauges.get(cell), as_of, cal, pcfg))
+
+    # urgency sort: shortest cover first (None last), then terminal/product
+    def _key(r):
+        c = r["days_of_cover"]
+        return (0, c) if c is not None else (1, 0.0)
+    records.sort(key=lambda r: (_key(r), r["terminal"], r["product"]))
+
+    short = [r for r in records if r["status"] == "short"]
+    watch = [r for r in records if r["status"] == "watch"]
+    total_short_gal = round(sum((r["cure"].get("gallons_short") or 0.0) for r in short), 0)
+    shortest = next((r for r in records if r["days_of_cover"] is not None), None)
+
+    return {
+        **base,
+        "terminals": sorted({t for t, _ in out_cells.keys()}),
+        "products": sorted({f for _, f in out_cells.keys()}),
+        "positions": records,
+        "facets": [r["facet"] | {"terminal": r["terminal"], "product": r["product"]} for r in records],
+        "summary": {
+            "n_cells": len(records), "n_short": len(short), "n_watch": len(watch),
+            "gauge_cells": sum(1 for r in records if r["mode"] == "gauge"),
+            "proxy_cells": sum(1 for r in records if r["mode"] == "proxy"),
+            "total_gallons_short": total_short_gal,
+            "total_barrels_to_nominate": round(total_short_gal / GALLONS_PER_BARREL, 0),
+            "shortest_cover": ({"terminal": shortest["terminal"], "product": shortest["product"],
+                                "days_of_cover": shortest["days_of_cover"],
+                                "sentence": shortest["facet"]["sentence"]} if shortest else None),
+        },
+    }

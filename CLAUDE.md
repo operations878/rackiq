@@ -705,6 +705,9 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/calendar/config` · `POST /api/calendar/recompute` | the calendar config (holiday country/subdiv, Saturday default/min-obs, weights) · recompute with `{overrides}` |
 | `GET /api/hedging?terminal=&window=&service_level=` | the **operational demand-hedging readout** (Phase 2): per-terminal expected demand band (P10/P50/P90) over the next 3 & 5 **working** days, the FLOOR vs UPSIDE split, the **behavior-aware dynamic buffer** (statistical safety + overdue-burst coil), the risk watch-list, the morning readout, and the operational customer view (honest "inventory not connected" note when absent) |
 | `GET /api/hedging/overview` · `GET /api/hedging/config` · `POST /api/hedging/recompute` | every terminal's readout (shared scoring) · the hedging config · recompute with `{overrides, window, terminal, service_level}` |
+| `GET /api/position?terminal=&product=` | the **Phase-7 position & days-of-cover** readout: per terminal×product (family) **running net position** (gallons) + **mode** (gauge-anchored "verified" vs net-flow proxy, honestly labeled), **days-of-cover in WORKING days** (+ the exposed trailing window), the drawdown **trend**, the **nominate-a-barge cure** (gallons short / implied **bbl** / nominate-by date) when short, and a **facet** tile (headline · mode label · cover · plain-English sentence) per cell for the converged terminal view |
+| `GET /api/position/summary` · `GET /api/position/config` · `POST /api/position/recompute` | the inbound barge-supply store counts + which inbound source is in use (barges → receipts → inventory) · the position config (cover thresholds / lookback / nominate target) · recompute with `{overrides, terminal, product}` |
+| `POST /api/position/upload` (multipart) · `POST /api/position/load-samples` | re-uploadable **Trips report** (inbound barge supply; barrels→gallons **×42** once, VEF/transit gain-loss applied, idempotent on a stable key) · load any Trips report from `sample_data/deals/` (no-op on the synthetic cloud DB) |
 | `GET /api/variability` | the **two-axis variability score** + the **rebuilt spot/rack channel rec** per master: **cadence consistency** + **size consistency** (separate; size weather-adjusted for heating fuels), the regularity×size **2×2** quadrant, the **recommended channel** (rack/term vs spot — set by quadrant + confidence ONLY), the **confidence tier** (High/Med/Low; low = provisional, never suppressed), the **current channel** (from the deal book) + **mismatch**, a **margin ranking note** (never moves a channel), the commitment **annotation**, `channel_summary`, `mismatches`, and per-axis distributions + coverage |
 | `GET /api/variability/validation` | the **real-book validation gate**: both axis histograms + spread verdict, the **all-spot fix proof** (post-fix quadrant spread), the **four-quadrant walk** (one named account per quadrant, end-to-end), confidence distribution + a low-confidence exemplar, the **channel mismatch** headline, the **margin-never-flipped audit**, the weather raw-vs-adjusted summary, annotation sanity, coverage, and the deal-book→master bridge match rate |
 | `GET /api/variability/customer/{id}` · `GET /api/variability/config` | one customer's two axes + channel rec + full behavioral drill-down (all windows + daily bars) · the variability config |
@@ -897,6 +900,56 @@ Per terminal, over horizons in **working days** (default 3 & 5, config), anchore
 
 ---
 
+## Position & days-of-cover (Phase 7) — supply vs lifts · gauge-vs-proxy · nominate a barge
+
+A per-terminal × per-product (family) **running net position** + **days-of-cover** engine that
+reconciles **inbound barge supply** against **outbound lifts**, plus a "**nominate a barge**" cure when
+cover runs short. Engine is `backend/app/hedging.py` (`compute_position` + `PositionConfig`); the
+inbound **Trips report** ingestion is `backend/app/barges.py`; the API is `backend/app/api/position.py`
+(`/api/position/*`). Backend/API only — no frontend page; the endpoint is shaped as a **facet-ready
+summary** (each cell carries a plain-English `facet` tile) for the converged terminal view to pull.
+
+- **INBOUND — `barges.py` (NEW format-aware Trips parser).** The Trips report is a messy `.xls` of barge
+  discharges. **Trips volumes are in BARRELS** → the barrels→gallons **`×42`** conversion happens
+  **exactly once** here (`nominal_gallons = volume_bbl × 42`, asserted, reported in the load audit); the
+  engine reads `delivered_gallons` (already gallons) and never re-multiplies — this is the #1
+  silent-error source. Per discharge: terminal · product (→ family) · discharge/ETA date · barrels
+  (→ gal, reusing pricegrid's "mb" thousand-barrel heuristic) · **VEF** (vessel experience factor) +
+  derived **transit gain/loss** · landed cost ¢/gal (**metadata only**). `delivered_gallons` = nominal ×
+  VEF when a plausible VEF is present (`volume_basis="vef_adjusted"`), else nominal (`"nominal"`). Lands
+  in the `barge_discharges` store — **idempotent** upsert on a stable `discharge_key`, **survives
+  reset/demo** (created by `barges.ensure_tables`, NOT in `schema.ALL_TABLES`), **re-uploadable** via
+  `POST /api/position/upload` like the deal/price sources.
+- **OUTBOUND — reuse the BOL `lifts`.** Outbound = `lifts.net_gallons` (compartments already grouped by
+  BOL → one lift, control rows dropped, Ship Date, master names via the crosswalk). Position grains on
+  **product family** (`dealbook.product_family`) so inbound and outbound join on one product key.
+- **TWO MODES, both honestly labeled.** **GAUGE-ANCHORED ("verified")** — a terminal-verified
+  `physical_inventory` snapshot exists, so `position(t) = gauge_level + inbound_since − outbound_since`
+  (a TRUE tank level). **NET-FLOW PROXY** — no gauge, so `position = cumulative inbound − outbound since
+  start of data` — a **flow delta, NOT a tank level** (opening stock isn't in the flow), labeled as such
+  everywhere; never presented as a gauge reading.
+- **Inbound source priority** (so it runs on real AND synthetic data): `barge_discharges` (real Trips) →
+  canonical `receipts` (net gallons) → `inventory_snapshots.receipts`. The source is reported.
+- **Days-of-cover in WORKING days** (reuses the Phase-1 calendar): `position ÷ avg outbound per working
+  day` over a trailing window (default 45 calendar days; the window's working-day denominator + outbound
+  are exposed). A Fri→Mon gap is ~1 working day; a lift on a Sun/holiday is an exception (volume kept,
+  not a working day). **Trend** = net flow per working day (building / drawing / balanced) + a
+  `trending_short` projection.
+- **CURE — nominate a barge.** When cover < the short floor (or trends below within the planning
+  horizon), surface `gallons_short` to restore target cover and the **implied barge size in BARRELS**
+  (gallons ÷ 42) + a `nominate_by` working-day date. Advisory only. The facet sentence reads e.g.
+  *"≈ 3.8 working days of ULSD cover at Linden, gauge-verified — nominate ~1,647 bbl by Sat Jun 27 to
+  hold 10 working days."*
+- **Validation.** Proven on **SYNTHETIC** data (the real Trips `.xls` is local-only/gitignored): on the
+  demo `full` book inbound = canonical `receipts`, gauge = `inventory_snapshots.physical_inventory`
+  (there is no Trips file in the cloud DB). Real-book accuracy is a separate local run. Tests
+  (`test_position.py`) assert `×42` runs exactly once, the net flow ties out on a hand-checked
+  terminal×product (proxy = in−out; gauge = anchor + roll-forward), cover is in working days, and the
+  barrel cure ties out. CLI: **`rackiq-position`** (print the readout) and **`rackiq-load-barges`** (load
+  the Trips supply locally).
+
+---
+
 ## Frontend
 
 Vite + React 19 + TypeScript + **Tailwind v4 (CSS-first)** + Recharts. A **left-nav dashboard
@@ -1035,6 +1088,8 @@ uv run rackiq-margin                      # print the margin readout (coverage, 
 uv run rackiq-variability                 # print the two-axis variability + spot/rack validation readout (the real-book gate)
 uv run rackiq-load-hdd [file]             # load the HDD book (the "HDD'S" sheet) into the re-uploadable weather store
 uv run rackiq-weather                     # print the Stage-1 weather readout (station coverage, HDD→demand β/OOS, anchor, raw-vs-adjusted size axis)
+uv run rackiq-load-barges                 # load the barge Trips report (inbound supply) → barge_discharges (barrels→gal ×42 once, idempotent)
+uv run rackiq-position                    # print the Phase-7 position / days-of-cover readout (supply vs lifts, gauge-vs-proxy, barge-cure)
 uv run pytest                             # run the test suite (units + e2e API flow)
 # rackiq-info  -> print row counts + enabled capability count
 ```
@@ -1081,7 +1136,8 @@ backend/
     demand.py               # ★ Demand Cockpit: per-customer HW/seasonal-naive forecast → terminal P10/P50/P90 band, days-of-cover/burn-down, order-up-to action, persisted distributions (DemandConfig)
     pricing.py              # ★ Pricing Sandbox + Engine (Blueprint I): spread what-if (per-customer vol/margin curves via β, margin-maximizing post), acceptance model (per-segment logistic from quotes + elasticity proxy), GP-maximizing quote price with shadow-price floor
     pricing_config.py       # ★ PricingConfig — spread/price grids, shadow-price schedule, acceptance priors, elasticity-class thresholds as parameters
-    hedging.py              # ★ Operational demand-hedging (Phase 2, on the working-day calendar): per-terminal expected band (P10/P50/P90 w/ customer correlation), FLOOR vs UPSIDE, behavior-aware dynamic buffer (statistical safety + overdue-burst coil), risk concentration, morning readout (HedgingConfig)
+    hedging.py              # ★ Operational demand-hedging (Phase 2, on the working-day calendar): per-terminal expected band (P10/P50/P90 w/ customer correlation), FLOOR vs UPSIDE, behavior-aware dynamic buffer (statistical safety + overdue-burst coil), risk concentration, morning readout (HedgingConfig). ALSO Phase-7 POSITION engine (compute_position + PositionConfig): per terminal×product net position (gauge-anchored vs net-flow proxy), days-of-cover in WORKING days, drawdown trend, nominate-a-barge cure, facet-ready summary
+    barges.py               # ★ Phase-7 inbound supply ingestion: format-aware Trips parser (barrels→gallons ×42 EXACTLY ONCE + asserted, mb heuristic, VEF/transit gain-loss → delivered gallons w/ labeled basis, landed cost ¢/gal metadata) → idempotent barge_discharges store (survives reset like deals/landed_costs); product→family via dealbook
     variability.py          # ★ TWO-AXIS variability + the SPOT/RACK channel rec (Stage 2): cadence consistency (working-day gap regularity) × size consistency (active-day per-lift CV; weather-adjusted for heating fuels via weather_model). The 2×2 is read off the two SCORES with regularity cutoffs (FIXES the all-spot bug: timing was frequency, not regularity) → metronome/predictable_timing/predictable_size/unpredictable → channel (rack/term vs spot, set by quadrant + confidence ONLY). Confidence tier (lift count+span; low=provisional, never suppressed); current-vs-recommended mismatch (from the deal book); margin = ranking note only (audited, never flips a channel). validation_readout = the real-book gate
     dealbook.py             # ★ Deal-book parsers + canonical deals table: product_family() normalization (blends are product not identity, GEC 10/20→GEC), three format-aware parsers (term pivot / forward-fixed Active-Deals / spot monthly), stable deal_key, crosswalk bridge_candidates + confirm_bridge (propose, never auto-merge)
     bookload.py             # ★ Repeatable real-book loaders: Account Reference Chart → crosswalk, raw BOLs → lifts (group-by-BOL, drop 0/0/0, Ship Date, product→family, consignee→master), deal book → deals (idempotent); multi-year BOL concat; load_real_book one-shot
@@ -1095,7 +1151,7 @@ backend/
     validation.py           # rule engine: required-only gating (+ EDI-control-row junk), negatives-as-corrections, drill-down + quarantine index
     hygiene.py              # configurable cleaning pipeline (HygieneOptions, apply_fixes, group_by_bol, ASTM D1250 vcf)
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
-    cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook / -load-realbook / -load-prices / -margin / -variability
+    cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook / -load-realbook / -load-prices / -margin / -variability / -load-barges / -position
     config.py               # settings (db path, CORS, host/port)
     main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + pricing + calendar + hedging + deals + variability + margin routers)
     api/{routes,queries}.py # read endpoints + SQL
@@ -1111,7 +1167,8 @@ backend/
     api/weather.py          # /api/weather/hdd/* (re-uploadable HDD source: upload/summary/load-samples) + /api/weather (Stage-1 model readout: coverage/β/OOS/anchor/axis adjustment, cached)
     api/deals.py            # /api/deals/* deal-book Data Studio source (upload/idempotent) + crosswalk bridge (summary / bridge / confirm / load-samples)
     api/margin.py           # /api/margin/* Phase-2 margin layer (value ranking, deal-type margins, forward MTM, gap helper, coverage) + the re-uploadable price/cost source (cached per data-sig/window/terminal)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability + test_pricegrid + test_margin + test_weather_hdd + test_weather_model
+    api/position.py         # /api/position/* Phase-7 net position & days-of-cover (gauge-vs-proxy, working-day cover, nominate-a-barge cure, facet-ready) + summary/config/recompute + the re-uploadable Trips supply source (cached per data-sig/terminal/product)
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability + test_pricegrid + test_margin + test_weather_hdd + test_weather_model + test_position
   sample_data/deals/        # (gitignored) the operator's real book: account_reference_chart.xlsx, *bols*.csv, deal workbooks, 1__Wholesale_Prices___Costs_V1.xlsx, Trips report — read by the repeatable loaders
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
@@ -1155,6 +1212,19 @@ CLAUDE.md
   accounts past their working-day cadence. It never fabricates inventory — absent supply data ⇒ TARGET
   staging + a note. The heavy scoring is cached per `(data-sig, window, day)` so the service-level
   slider/terminal selector stay snappy.
+- **Position / days-of-cover (Phase 7, also `hedging.py`) — UNITS ARE THE WHOLE GAME.** Gallons are
+  canonical everywhere; the barrels→gallons **×42** lives in **exactly one place** (`barges.parse_trips_supply`,
+  asserted + reported), and `compute_position` reads `delivered_gallons` (already gallons) — it never
+  re-multiplies. The barge **nomination** is the only place gallons go back to barrels (÷42). Two modes
+  are **honestly labeled and never conflated**: **gauge-anchored** (a verified `physical_inventory`
+  snapshot → a true tank level) vs **net-flow proxy** (cumulative inbound − outbound since start = a flow
+  delta, NOT a tank level; can be negative because opening stock isn't in the flow). Days-of-cover is in
+  **WORKING days** (the Phase-1 calendar), never calendar days. Inbound source priority is `barge_discharges`
+  → `receipts` → `inventory_snapshots.receipts` (so it runs on the real Trips book AND the synthetic
+  demo). VALIDATED ON SYNTHETIC DATA ONLY (no Trips `.xls` in the cloud DB) — real-book accuracy is a
+  separate local run. `barge_discharges` survives reset/demo (outside `schema.ALL_TABLES`) like
+  `deals`/`landed_costs`. This is **physical position/cover**, distinct from Phase-2 financial margin and
+  from the Phase-2 operational *staging* buffer above — it reconciles a tank ledger, it doesn't score.
 - **Customer identity vs. display.** The Consignee **Number** stays the internal stable key /
   crosswalk variant key; the UI **always shows the coded (master) Name**, falling back to the raw
   name only when unmapped (never a bare number). The hand-built **name map** (`raw → coded`) is the

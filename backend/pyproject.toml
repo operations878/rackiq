@@ -27,6 +27,8 @@ rackiq-load-realbook = "app.cli:load_realbook_main"
 rackiq-load-prices = "app.cli:load_prices_main"
 rackiq-load-hdd = "app.cli:load_hdd_main"
 rackiq-margin = "app.cli:margin_main"
+rackiq-load-barges = "app.cli:load_barges_main"
+rackiq-position = "app.cli:position_main"
 rackiq-variability = "app.cli:variability_main"
 rackiq-weather = "app.cli:weather_main"
 
