@@ -30,6 +30,7 @@ rackiq-margin = "app.cli:margin_main"
 rackiq-load-barges = "app.cli:load_barges_main"
 rackiq-position = "app.cli:position_main"
 rackiq-variability = "app.cli:variability_main"
+rackiq-opportunity = "app.cli:opportunity_main"
 rackiq-weather = "app.cli:weather_main"
 
 [dependency-groups]
