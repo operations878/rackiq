@@ -11,6 +11,7 @@ from .api.daily import router as daily_router
 from .api.deals import router as deals_router
 from .api.demand import router as demand_router
 from .api.hedging import router as hedging_router
+from .api.margin import router as margin_router
 from .api.pricing import router as pricing_router
 from .api.reconciliation import router as reconciliation_router
 from .api.routes import router
@@ -40,6 +41,7 @@ def create_app() -> FastAPI:
     app.include_router(hedging_router)
     app.include_router(deals_router)
     app.include_router(variability_router)
+    app.include_router(margin_router)
 
     @app.get("/")
     def root():
