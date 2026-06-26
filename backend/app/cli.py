@@ -88,6 +88,51 @@ def load_realbook_main() -> None:
     print(json.dumps(report, indent=2, default=str))
 
 
+def load_prices_main() -> None:
+    """Load the Phase-2 price/cost book (wholesale sell grid + barge Trips landed cost).
+
+    Repeatable & idempotent: drop ``1__Wholesale_Prices___Costs_V1.xlsx`` and the Trips report into
+    the deals dir and re-run. Feeds the margin layer (rank by value, mark forward to market).
+    """
+    from datetime import datetime, timezone
+
+    from . import pricegrid
+    repo_root = Path(__file__).resolve().parent.parent
+    ap = argparse.ArgumentParser(prog="rackiq-load-prices",
+                                 description="Load the wholesale sell grid + barge Trips landed cost.")
+    ap.add_argument("--dir", default=str(repo_root / "sample_data" / "deals"),
+                    help="Directory holding the wholesale price workbook and the Trips report.")
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=False)
+    try:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        pricegrid.ensure_tables(con)
+        report = pricegrid.load_price_book(con, args.dir, now)
+        db.set_meta(con, "last_price_import_at", now)
+        report["stores"] = pricegrid.store_counts(con)
+    finally:
+        con.close()
+    print(json.dumps(report, indent=2, default=str))
+
+
+def margin_main() -> None:
+    """Print the margin readout (coverage, plausibility, deal-type margins, forward MTM, verdict)."""
+    from . import margin
+    ap = argparse.ArgumentParser(prog="rackiq-margin",
+                                 description="Phase-2 margin readout on the loaded book.")
+    ap.add_argument("--window", default="all", choices=margin.WINDOWS)
+    ap.add_argument("--terminal", default=None)
+    ap.add_argument("--db", default=None)
+    args = ap.parse_args()
+    con = db.get_connection(args.db, read_only=False)
+    try:
+        rep = margin.compute_margin(con, window=args.window, terminal=args.terminal)
+    finally:
+        con.close()
+    print(json.dumps(rep, indent=2, default=str))
+
+
 def variability_main() -> None:
     """Print the two-axis variability validation readout (the real-book gate)."""
     from . import variability

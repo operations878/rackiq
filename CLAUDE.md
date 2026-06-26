@@ -579,6 +579,50 @@ real BOL customer) loudly. The commitment annotation attaches ONLY to masters th
 else shows "no commitment data". On the real book the chart maps ~100% of BOL volume; ~60% of committed
 deal volume auto-bridges, the rest staged for confirmation.
 
+## Margin layer (Phase 2) — rank by VALUE · index-on-index margins · mark-to-market · price the gap
+
+A layer ON TOP of the Phase-1 book that ranks the desk by **value, not volume**, marks the
+**forward-fixed book to market**, and prices any **demand gap in dollars** (the helper Phase-3's hedge
+calls). It **reads** the `deals` spine (term/forward/spot as deal-TYPE metadata for margin math — NOT a
+scoring split) and the BOL `lifts` (the volume spine); it **never** touches the VAR score, ingestion,
+inventory/position (Phase 3), or `hedging.py`, and **never imports `hedging`** (one-way dependency:
+hedge → margin). Self-contained modules so it and Phase-3 run in parallel without fighting shared files.
+The full written modeling decision lives in **`docs/margin/MODELING_DECISION.md`**.
+
+- **`backend/app/pricegrid.py`** — the SELL + COST ingestion (the two operator workbooks). **Format-
+  aware parsers** (no generic mapper): the wholesale grid's **Matrix** sheet (`PRODUCT+CUSTOMER` concat
+  keys with no delimiter — split by the longest known product prefix; an unmatched key is **flagged**,
+  never guessed), the **per-terminal sheets** (multi-row header: a weekday-number row, then a
+  `Customer`+dates row — cleaner, so PREFERRED; Matrix only fills gaps), the **Benchmarks** named
+  differentials (DD/RACK/GEC/ASHBY by blend), and the barge **Trips report** (per-gallon logistics legs,
+  `Product Vol` barrels→gallons ×42 with an **"mb" magnitude heuristic**, and the **cargo-flat sanity
+  gate**: `Estimated Trip Value ÷ gal` is trusted as an all-in flat only inside a plausible $/gal band,
+  else logistics-only + a flagged gap). Three idempotent stores (`price_grid`, `landed_costs`,
+  `price_differentials`) created by `ensure_tables` and surviving reset/demo like `deals`; grid customers
+  resolve through the **same** `customer_crosswalk`, products via `dealbook.product_family` (blends are
+  attributes, not identity). Re-uploadable & idempotent (delete-then-insert on a stable key).
+- **`backend/app/margin.py`** + **`margin_config.py`** — the engine. Margin is computed **per BOL lift**
+  with sell/cost sourced by a **priority chain that records provenance + confidence** (sell: deal price →
+  grid → lift `unit_price`; cost: Trips running WAC → lift `unit_cost`), so it runs on BOTH the real book
+  and the synthetic/sample book. Two cost views everywhere: **BOOK** (vs the running volume-weighted
+  landed cost of recent barges = inventory cost basis at *t*) and **REPLACEMENT** (vs the most-recent
+  landed cost). **Deal-type margins** respect index-on-index physics: **TERM** = `sell_diff − cargo_diff
+  − logistics − basis` (the flat **cancels** — recoverable with NO market level; `basis` defaults 0 =
+  same index and is flagged), **FORWARD** = `locked − landed`, **SPOT** = `realized − landed`. Roll-ups
+  to customer / product family / terminal (¢/gal + $) **explicitly contrast the margin rank vs the volume
+  rank** (a high-volume/thin-margin and a low-volume/fat-margin account are both visible — this is a
+  VALUE ranking, it never alters the VAR score). **Forward MTM** marks every OPEN (future-month) locked
+  deal to current replacement cost → $ exposure + underwater/thin flags. **`margin_for_gap(con,
+  terminal, product, quantity)`** returns the $ margin at stake split **committed/must-serve vs spot
+  upside** — the Phase-3 contract. **Coverage** reports % of lifted volume with a defensible margin vs
+  flagged incomplete; a **plausibility gate** flags the "$1/gal" units/basis bug (margins read
+  single-to-low-double-digit ¢/gal) instead of shipping it.
+- **`backend/app/api/margin.py`** — the `/api/margin/*` endpoints + the re-uploadable price/cost Data
+  Studio source. Live-computed with a data-signature cache (heavy per-lift base cached per
+  `(data-sig, window, terminal)`). Self-describes availability + coverage rather than going through the
+  canonical field matrix (its sell/cost stores aren't canonical fields). CLI: **`rackiq-load-prices`**
+  (load the grid + Trips) and **`rackiq-margin`** (print the readout).
+
 ## API endpoints
 
 All return JSON over the shared connection (`db.lock()` serializes access). Read endpoints
@@ -636,6 +680,11 @@ spread slider, customer toggles, and regime selector re-derive only the cheap pa
 | `GET /api/variability/customer/{id}` · `GET /api/variability/config` | one customer's two axes + full behavioral drill-down (all windows + daily bars) · the variability config |
 | `GET /api/deals/summary` · `GET /api/deals/bridge` | deal-book row/master counts by source · the **crosswalk bridge** (mapped / fuzzy candidates / unmapped + the committed-volume match rate) |
 | `POST /api/deals/upload` (multipart) · `POST /api/deals/bridge/confirm` · `POST /api/deals/load-samples` | re-uploadable **Deals** source (term/forward/spot, auto-detected, idempotent) · confirm staged bridges (never auto-merged) · load the bundled real book (chart→BOLs→deals) |
+| `GET /api/margin?terminal=&window=` | the **Phase-2 margin layer** (rank by VALUE not volume): per-master **BOOK & REPLACEMENT** margin (¢/gal + $) with the **margin rank vs volume rank** contrast, by product family / terminal, the **deal-type margins** (term flat-cancel / forward locked−landed / spot realized−landed), the **forward mark-to-market**, **coverage** (% of volume with a defensible margin), a **plausibility gate** (¢/gal sanity; the "$1/gal" units bug is flagged), and a **worked one-customer example** (`available:false` + missing sell/cost when locked) |
+| `GET /api/margin/customers` · `GET /api/margin/mtm` · `GET /api/margin/coverage` | the margin-ranked customer list + value-vs-volume movers · the forward-fixed **mark-to-market** on the open committed book ($ exposure, underwater/thin) · the coverage + plausibility + worked-example honesty block |
+| `GET /api/margin/gap?terminal=&product=&quantity=` | the **margin-priced gap helper** — \$ margin at stake for a demand quantity, split **committed/must-serve** vs **spot upside** (the contract Phase-3's hedge calls in-process via `margin.margin_for_gap`) |
+| `GET /api/margin/config` · `POST /api/margin/recompute` | the margin config (cost-basis window, units heuristics, plausibility gate, term basis assumption) · recompute with `{overrides, window, terminal}` (busts the cache) |
+| `POST /api/margin/upload` (multipart) · `GET /api/margin/unmapped-customers` · `POST /api/margin/load-samples` | re-uploadable **price/cost** source (kind=prices\|trips, auto-detected, idempotent) · raw grid customer names not yet mapped to a master · load the bundled wholesale grid + Trips report |
 
 Interactive docs at `http://localhost:8000/docs`.
 
@@ -946,6 +995,11 @@ uv run rackiq-export-playbook             # (re)generate ../docs/playbook.md fro
 uv run rackiq-load-realbook               # load the real book: Account Reference Chart → raw BOLs → deal book
                                           #   (reads backend/sample_data/deals/: account_reference_chart.xlsx,
                                           #    *bols*.csv [multi-year ok], deals_summary/forward_fixed/spot workbooks)
+uv run rackiq-load-prices                 # load the Phase-2 price/cost book: wholesale sell grid + barge
+                                          #   Trips landed cost (reads backend/sample_data/deals/:
+                                          #   1__Wholesale_Prices___Costs_V1.xlsx + the Trips report)
+uv run rackiq-margin                      # print the margin readout (coverage, plausibility, deal-type
+                                          #   margins, forward mark-to-market) — ranks the book by VALUE
 uv run rackiq-variability                 # print the two-axis variability validation readout (the real-book gate)
 uv run pytest                             # run the test suite (units + e2e API flow)
 # rackiq-info  -> print row counts + enabled capability count
@@ -995,6 +1049,9 @@ backend/
     variability.py          # ★ TWO-AXIS variability (Phase-1 score): cadence consistency (working-day gap regularity + presence) × size consistency (raw per-lift CV; weather-adjust SEAM for heating fuels), separate axes + frequency×size 2×2 + commitment annotation; validation_readout (the real-book gate). Reuses behavioral/calendar; never collapses to one grade
     dealbook.py             # ★ Deal-book parsers + canonical deals table: product_family() normalization (blends are product not identity, GEC 10/20→GEC), three format-aware parsers (term pivot / forward-fixed Active-Deals / spot monthly), stable deal_key, crosswalk bridge_candidates + confirm_bridge (propose, never auto-merge)
     bookload.py             # ★ Repeatable real-book loaders: Account Reference Chart → crosswalk, raw BOLs → lifts (group-by-BOL, drop 0/0/0, Ship Date, product→family, consignee→master), deal book → deals (idempotent); multi-year BOL concat; load_real_book one-shot
+    pricegrid.py            # ★ Phase-2 price/cost ingestion: format-aware parsers (Matrix concat keys, per-terminal multi-row headers, Benchmarks diffs, Trips barge landed cost — barrels→gal, mb heuristic, cargo-flat sanity gate) → idempotent price_grid / landed_costs / price_differentials stores (survive reset like deals); crosswalk + product-family resolution
+    margin.py               # ★ Phase-2 margin engine (reads deals+lifts+pricegrid; never imports hedging): per-lift BOOK & REPLACEMENT margin w/ sell/cost provenance, deal-type margins (term flat-cancel / forward locked−landed / spot realized−landed), value-vs-volume roll-ups, forward mark-to-market, margin_for_gap (committed vs spot — the P3 contract), coverage + plausibility gate
+    margin_config.py        # ★ MarginConfig — cost-basis window, units/mb + cargo-flat heuristics, plausibility gate (¢/gal), term basis assumption, Matrix product prefixes as parameters
     generator.py            # parameterized Soundview synthetic data + profiles (+ BOL/seeded losses)
     ingest.py               # Data Studio: parse, fuzzy mapping (BOL/EDI aliases, 2-tier threshold), inspect (+profiling), validate, coerce (mixed + Excel-serial dates)
     profiling.py            # data-quality scorecard (type/null/distinct/min-max/outliers/flags + score)
@@ -1002,9 +1059,9 @@ backend/
     validation.py           # rule engine: required-only gating (+ EDI-control-row junk), negatives-as-corrections, drill-down + quarantine index
     hygiene.py              # configurable cleaning pipeline (HygieneOptions, apply_fixes, group_by_bol, ASTM D1250 vcf)
     data_health.py          # standing quality score + drift alerts + quarantine/crosswalk/audit summary
-    cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook
+    cli.py                  # rackiq-generate / -serve / -info / -export-samples (+dirty) / -export-playbook / -load-realbook / -load-prices / -margin / -variability
     config.py               # settings (db path, CORS, host/port)
-    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + pricing + calendar + hedging routers)
+    main.py                 # FastAPI app factory (routes + studio + scores + reconciliation + daily + demand + pricing + calendar + hedging + deals + variability + margin routers)
     api/{routes,queries}.py # read endpoints + SQL
     api/studio.py           # /api/studio/* inspect / crosswalk / validate / commit / quarantine / data-health / feeds
     api/scores.py           # /api/scores/* ranked / customer drill-down / quadrant / backtest / forecast-backtest (new-vs-old-vs-naive) / config / recompute (+ data-recency block)
@@ -1016,11 +1073,13 @@ backend/
     api/hedging.py          # /api/hedging (per-terminal staging readout) / overview / config / recompute (heavy scoring cached per data/window/day)
     api/variability.py      # /api/variability (two-axis score) / validation (the real-book gate) / customer / config (cached per data+deal signature)
     api/deals.py            # /api/deals/* deal-book Data Studio source (upload/idempotent) + crosswalk bridge (summary / bridge / confirm / load-samples)
-  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability
-  sample_data/deals/        # (gitignored) the operator's real book: account_reference_chart.xlsx, *bols*.csv, deal workbooks — read by the repeatable loaders
+    api/margin.py           # /api/margin/* Phase-2 margin layer (value ranking, deal-type margins, forward MTM, gap helper, coverage) + the re-uploadable price/cost source (cached per data-sig/window/terminal)
+  tests/                    # pytest: test_hygiene_studio + test_studio_api + test_data_studio_robustness + test_bol_ingest + test_early_feeds + test_scoring + test_forecasting + test_behavioral + test_calendar + test_hedging + test_name_map + test_product_map + test_regime + test_reconciliation + test_demand + test_pricing + test_dealbook + test_variability + test_pricegrid + test_margin
+  sample_data/deals/        # (gitignored) the operator's real book: account_reference_chart.xlsx, *bols*.csv, deal workbooks, 1__Wholesale_Prices___Costs_V1.xlsx, Trips report — read by the repeatable loaders
   data/rackiq.duckdb        # runtime store, gitignored (regenerable / re-feedable)
 samples/                    # sample CSV/XLSX incl. lifts_dirty.csv / lifts_barrels.csv (rackiq-export-samples)
 docs/hygiene-studio/        # worked screenshots of the merge + fix flow and Data Health page
+docs/margin/                # MODELING_DECISION.md — the written Phase-2 margin discovery + model
 docs/playbook.md            # generated Sales Playbook (rackiq-export-playbook)
 frontend/
   vite.config.ts            # react + tailwindcss plugins; /api dev proxy
@@ -1068,6 +1127,22 @@ CLAUDE.md
   **all raw spellings of one customer roll up into one master** and VAR/forecasts/charts recompute on
   it. The upload bumps `last_import_at`, busting the scores/demand/pricing/reconciliation caches.
   "Unmapped" = a customer whose `name == customer_id` and is not a confirmed master.
+- **The Phase-2 margin layer is value accounting, NOT the elasticity Pricing Sandbox — keep them
+  distinct.** `pricing.py` (Blueprint I) is the forward-looking what-if/acceptance-model engine in
+  *contemporaneous spread space* against the rack benchmark; `margin.py` is the *realized & committed
+  margin valuation* against actual **landed cost** (Trips) and **sell** (the wholesale grid / deal
+  prices). They never share state. Margin ranks the book by VALUE — it **never alters the VAR score**
+  (a customer can be stable AND thin-margin, or variable AND fat-margin; both are shown). **Units
+  discipline is the whole game:** per-gallon cost legs are already `$/gal`, so the running cost basis is
+  unit-robust; the `Estimated Trip Value` all-in cargo flat is trusted ONLY inside a $/gal sanity band
+  (else logistics-only + a flagged cargo gap, because the index flat is NOT loaded); Trips `Product Vol`
+  barrels→gal ×42 with an "mb" magnitude heuristic. The **plausibility gate** flags any margin near
+  $1/gal as a units/basis error instead of shipping it (rack diesel reads single-to-low-double-digit
+  ¢/gal). **TERM margin is recoverable with NO market level** — when sell and cargo reference the same
+  index the flat cancels (`sell_diff − cargo_diff − logistics`); `basis` defaults 0 (same-index) and is
+  surfaced as an assumption, never silently absorbed. `margin_for_gap` is the one-way **hedge → margin**
+  contract (margin never imports hedging), so Phase-3 can price a demand gap (committed/must-serve vs
+  spot upside) without a circular import. The price/cost stores survive reset/demo like `deals`.
 - **The VAR statistics layer is diagnostics only — the headline score is frozen.** Components,
   base/variability ranges, cadence lane, steadiness-trend test, plain-English read, and the advanced
   diagnostics (forecastability, predictability skill, Mann–Kendall, residual white-noise, bootstrap
